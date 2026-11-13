@@ -167,13 +167,16 @@ class DynamicLimit(unittest.TestCase):
         return core.plan(procs, core.classify(procs), tickets, snapshot_ts=now - 1, now=now, pressure=pressure,
                          busy_daemons=set(), idle_since={}, last_grant_ts=None, live_claude_pids={100},
                          limit=limit, prev_holders=set(prev), last_raise_ts=last_raise, avail_gb=avail,
-                         estimates={i: ("gradle-check", est) for i in waiting})
+                         estimates={i: ("gradle-check", est) for i in waiting}, ceiling=core.max_slots(24.0))
 
     def test_raises_one_slot_when_memory_covers_estimate_plus_headroom(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
         self.assertEqual((pl.grants, pl.limit), ([3], 3))
         self.assertIn("20.0 GB disponíveis − 8.0 GB", pl.raised)
         self.assertIn("próxima vaga extra", pl.blocked)  # gradual: the second raise waits RAISE_GAP_S
+
+    def test_ceiling_follows_ram(self):
+        self.assertEqual([core.max_slots(gb) for gb in (8.0, 16.0, 24.0, 32.0, 48.0, 64.0)], [2, 3, 4, 6, 8, 11])
 
     def test_used_counts_this_ticks_grants(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)

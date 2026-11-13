@@ -3,6 +3,7 @@
 Nothing here touches the system, so every rule is unit-testable with synthetic input.
 """
 
+import math
 import os
 import re
 import shlex
@@ -10,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SLOTS = 2  # base limit, runner included
-MAX_SLOTS = 4  # ceiling when memory allows extra slots
+GB_PER_SLOT = 6  # slot ceiling = RAM / 6 GB, rounded up: 16 GB -> 3, 24 -> 4, 32 -> 6, 48 -> 8
 HEADROOM_GB = 6.0  # available memory that must remain after the next item's estimate
 RAISE_GAP_S = 90  # a new build needs time to reach its peak before memory is judged again
 PEAK_HISTORY = 5  # estimate = largest of the last N measured peaks of the same command type
@@ -218,11 +219,16 @@ class Plan:
     holders: set = field(default_factory=set)  # slot holders after this tick's grants
 
 
-def raise_refusal(*, used, limit, pressure, now, last_raise_ts, avail_gb, est):
+def max_slots(total_gb):
+    """Slot ceiling for a machine with this much RAM, never below the base."""
+    return max(SLOTS, math.ceil(round(total_gb / GB_PER_SLOT, 6)))
+
+
+def raise_refusal(*, used, limit, pressure, now, last_raise_ts, avail_gb, est, ceiling):
     """Why one more slot cannot open now, or "" when it can."""
     ctype, gb = est
-    if used + 1 > MAX_SLOTS:
-        return f"teto de {MAX_SLOTS} vagas"
+    if used + 1 > ceiling:
+        return f"teto de {ceiling} vagas"
     if pressure != PRESSURE_NORMAL:
         return "vaga extra só com pressão normal"
     if last_raise_ts is not None and now - last_raise_ts < RAISE_GAP_S:
@@ -235,7 +241,7 @@ def raise_refusal(*, used, limit, pressure, now, last_raise_ts, avail_gb, est):
 
 def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idle_since, last_grant_ts,
          live_claude_pids, limit=SLOTS, prev_holders=frozenset(), last_raise_ts=None, avail_gb=0.0,
-         estimates=None):
+         estimates=None, ceiling=SLOTS):
     """One scheduling tick. Pure: the caller applies the result under its lock.
 
     The limit rises one slot at a time above SLOTS when memory allows the head item, and drops one slot
@@ -329,7 +335,7 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if used >= limit:
             est = estimates.get(t.id, ("other", DEFAULT_GB["other"]))
             why = raise_refusal(used=used, limit=limit, pressure=pressure, now=now, last_raise_ts=last_raise_ts,
-                                avail_gb=avail_gb, est=est)
+                                avail_gb=avail_gb, est=est, ceiling=ceiling)
             if why:
                 out.blocked = f"sem vaga ({used}/{limit} em uso); {why}"
                 break

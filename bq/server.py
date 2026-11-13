@@ -312,7 +312,8 @@ class Queue:
             pl = core.plan(procs, roots, tickets, snapshot_ts=snap_ts, now=now, pressure=mem["pressure"],
                            busy_daemons=busy, idle_since=self.idle_since, last_grant_ts=self.last_grant,
                            live_claude_pids=live_claude, limit=self.limit, prev_holders=self.holders,
-                           last_raise_ts=self.last_raise, avail_gb=avail, estimates=self.estimates())
+                           last_raise_ts=self.last_raise, avail_gb=avail, estimates=self.estimates(),
+                           ceiling=core.max_slots(mem["total_gb"]))
             if pl.lowered and pl.limit < self.limit:
                 self.event("limite", f"limite {self.limit}→{pl.limit}: {pl.lowered} execução(ões) terminou(aram)")
             if pl.raised:
@@ -478,7 +479,7 @@ class Queue:
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
         return {
             "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "slots": pl.limit, "used": pl.used,
-            "base_slots": core.SLOTS, "max_slots": core.MAX_SLOTS, "headroom_gb": core.HEADROOM_GB,
+            "base_slots": core.SLOTS, "max_slots": core.max_slots(mem["total_gb"]), "headroom_gb": core.HEADROOM_GB,
             "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1),
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": pl.blocked, "memory": mem, "would_kill": would_kill,

@@ -10,7 +10,8 @@ process cleanup and a page at http://127.0.0.1:8787.
 - **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot). The runner never
   waits: if it arrives with 2 local builds running, the count goes to 3 until one ends, and nobody new gets in.
 - **Strict FIFO**: only the head of the queue may start.
-- **Dynamic limit, 2 to 4 slots**. With every slot taken, the limit rises by 1 slot for the head of the queue
+- **Dynamic limit, from 2 slots up to a ceiling set by the machine's RAM**: RAM / 6 GB, rounded up
+  (16 GB → 3, 24 GB → 4, 32 GB → 6, 48 GB → 8; never below 2). With every slot taken, the limit rises by 1 slot for the head of the queue
   only if: memory pressure is normal, 90 s have passed since the last raise, and macOS available memory minus
   the item's estimate leaves ≥ 6 GB of headroom. Each run that ends lowers the limit by 1 (never below 2);
   the next raise goes through the same analysis.
