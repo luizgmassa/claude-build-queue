@@ -27,6 +27,7 @@
 <h2>Agentes</h2><table id="agents"></table>
 <h2>Processos</h2><table id="procs"></table>
 <h2 id="wk-title">Limpeza</h2><table id="would"></table>
+<h2>Estimativa por tipo (maior pico das últimas 5 execuções, ou tabela inicial)</h2><table id="est"></table>
 <h2>Eventos</h2><table id="events"></table>
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -46,7 +47,8 @@ async function refresh() {
   document.getElementById("ts").textContent = "atualizado " + v.ts;
   const swapCls = m.swap_used_gb / Math.max(m.swap_total_gb, 1) > .8 ? "bad" : "ok";
   document.getElementById("cards").innerHTML = [
-    ["Vagas", `${v.used}/${v.slots}`, v.used >= v.slots ? "warn" : "ok"],
+    ["Vagas", `${v.used}/${v.slots} (base ${v.base_slots}, teto ${v.max_slots})`, v.used >= v.slots ? "warn" : "ok"],
+    ["Disponível p/ vaga extra", `${v.avail_gb} GB (folga ${v.headroom_gb} GB)`, v.avail_gb < v.headroom_gb ? "bad" : "ok"],
     ["Runner GitHub", v.counts.runner ? "ocupado" : "livre", v.counts.runner ? "warn" : "ok"],
     ["Pressão de memória", pl, pc],
     ["Memória livre", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
@@ -55,9 +57,10 @@ async function refresh() {
     ["Limpeza", v.enforce ? "ligada" : "simulação", v.enforce ? "ok" : "warn"],
   ].map(([k, val, c]) => `<div class="card">${k}<b class="${c}">${esc(val)}</b></div>`).join("");
   document.getElementById("blocked").textContent = v.blocked ? "Fila parada: " + v.blocked : "";
-  table("tickets", ["#", "estado", "agente", "pid", "espera/rodando", "comando", "fim"],
+  table("tickets", ["#", "estado", "agente", "pid", "espera/rodando", "tipo", "estimativa", "pico", "comando", "fim"],
     v.tickets.slice().reverse().map(t => `<tr><td>${t.id}</td><td>${esc(t.state)}</td><td>${esc(t.agent)}</td>
       <td>${t.pid}</td><td>${t.state === "waiting" ? age(t.created) : t.state === "granted" ? age(t.granted) : ""}</td>
+      <td>${esc(t.ctype)}</td><td class="num">${t.estimate_gb} GB</td><td class="num">${t.peak_gb != null ? t.peak_gb + " GB" : ""}</td>
       <td><code>${esc(t.cwd)}$ ${esc(t.cmd)}</code></td>
       <td>${esc(t.end_reason ?? "")}${t.exit_code != null ? " (exit " + t.exit_code + ")" : ""}</td></tr>`));
   table("agents", ["agente", "PID claude", "RSS total", "processos"],
@@ -70,6 +73,8 @@ async function refresh() {
       <td><code>${esc(p.cmd)}</code></td></tr>`));
   document.getElementById("wk-title").textContent = v.enforce ? "Limpeza (ligada: ver eventos)" : "Limpeza em simulação: mataria";
   table("would", ["PID", "motivo"], v.would_kill.map(k => `<tr><td>${k.pid}</td><td>${esc(k.reason)}</td></tr>`));
+  table("est", ["tipo", "estimativa"], Object.entries(v.estimates).map(([k, gb]) =>
+    `<tr><td>${esc(k)}</td><td class="num">${gb} GB</td></tr>`));
   table("events", ["hora", "tipo", "detalhe"],
     v.events.map(e => `<tr><td>${e.ts}</td><td>${esc(e.kind)}</td><td>${esc(e.text)}</td></tr>`));
 }

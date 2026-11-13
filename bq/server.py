@@ -87,7 +87,7 @@ def tcp_links():
 def busy_daemons(procs, listen, est):
     """A daemon is busy while a client of the right kind holds a connection to one of its listen ports."""
     port_owner = {port: pid for pid, ports in listen.items() for port in ports}
-    busy, serving = set(), {}
+    busy, serving, kotlin_of = set(), {}, {}
     for pid, _local, remote in est:
         client, server = procs.get(pid), procs.get(port_owner.get(remote))
         if not client or not server or client.pid == server.pid:
@@ -97,7 +97,20 @@ def busy_daemons(procs, listen, est):
             serving[server.pid] = client.pid
         elif server.kind == "kotlin_daemon" and client.kind == "gradle_daemon":
             busy.add(server.pid)
-    return busy, serving
+            kotlin_of.setdefault(client.pid, set()).add(server.pid)
+    return busy, serving, kotlin_of
+
+
+def ticket_rss_gb(gq_pid, tid, procs, serving, kotlin_of):
+    """Memory of one queued build: its own tree, the Gradle daemon serving it with that daemon's workers,
+    and the Kotlin daemon that daemon talks to."""
+    own = {gq_pid, *core.descendants(gq_pid, procs)} | {p.pid for p in procs.values()
+                                                       if p.env.get("BQ_TICKET") == str(tid)}
+    daemons = {d for d, client in serving.items() if client in own}
+    pids = set(own) | daemons
+    for d in daemons:
+        pids |= set(core.descendants(d, procs)) | kotlin_of.get(d, set())
+    return sum(procs[x].rss_kb for x in pids if x in procs) / 1024 ** 2
 
 
 def memory():
@@ -177,6 +190,12 @@ class Queue:
             id integer primary key autoincrement, pid int, pid_start text, claude_pid int, ralphy text,
             session_id text, cwd text, cmd text, state text, created real, granted real, ended real,
             end_reason text, exit_code int)""")
+        if "ctype" not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
+            self.db.execute("alter table tickets add column ctype text")
+            self.db.execute("alter table tickets add column peak_gb real")
+        self.db.execute("create table if not exists peaks (ctype text, peak_gb real, ts real, ticket int)")
+        for tid, cmd in self.db.execute("select id, cmd from tickets where ctype is null and state!='done'").fetchall():
+            self.db.execute("update tickets set ctype=? where id=?", (core.command_type(cmd or ""), tid))
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.wake = threading.Event()
@@ -186,6 +205,10 @@ class Queue:
         self.last_grant = None
         self.view = {}
         self.blocked = ""
+        self.limit = core.SLOTS  # restarts at the base: running builds above it just block new ones
+        self.holders = set()
+        self.last_raise = None
+        self.peak = {}  # granted ticket id -> largest memory seen, GB
         self.titles = Titles()
 
     def event(self, kind, text):
@@ -204,8 +227,24 @@ class Queue:
         return [core.Ticket(*r) for r in rows]
 
     def finish(self, tid, reason, exit_code=None):
-        self.db.execute("update tickets set state='done', ended=?, end_reason=?, exit_code=? "
-                        "where id=? and state!='done'", (time.time(), reason, exit_code, tid))
+        peak = self.peak.pop(tid, None)
+        cur = self.db.execute("update tickets set state='done', ended=?, end_reason=?, exit_code=?, peak_gb=? "
+                              "where id=? and state!='done'", (time.time(), reason, exit_code, peak, tid))
+        if cur.rowcount and peak and reason == "released":  # a reaped gq died mid-run: its peak is partial
+            ctype = self.db.execute("select ctype from tickets where id=?", (tid,)).fetchone()[0]
+            if ctype:
+                self.db.execute("insert into peaks values (?,?,?,?)", (ctype, round(peak, 2), time.time(), tid))
+
+    def peaks(self):
+        out = {}
+        for ctype, gb in self.db.execute("select ctype, peak_gb from peaks order by ts"):
+            out.setdefault(ctype, []).append(gb)
+        return out
+
+    def estimates(self):
+        peaks = self.peaks()
+        rows = self.db.execute("select id, coalesce(ctype, 'other') from tickets where state='waiting'")
+        return {tid: (ctype, core.estimate_gb(ctype, peaks)) for tid, ctype in rows}
 
     # ------------------------------------------------------------ scheduler tick
 
@@ -215,7 +254,7 @@ class Queue:
         listen, est = tcp_links()
         mem = memory()
         roots = core.classify(procs, protected_pids={os.getpid()})
-        busy, serving = busy_daemons(procs, listen, est)
+        busy, serving, kotlin_of = busy_daemons(procs, listen, est)
         now = time.time()
         for p in procs.values():
             if p.kind in ("gradle_daemon", "kotlin_daemon"):
@@ -230,9 +269,21 @@ class Queue:
         enforce = self.enforce()
         with self.lock:
             tickets = self.active_tickets()
+            for t in tickets:
+                if t.state == "granted" and t.pid in procs:
+                    gb = ticket_rss_gb(t.pid, t.id, procs, serving, kotlin_of)
+                    self.peak[t.id] = max(self.peak.get(t.id, 0.0), gb)
+            avail = mem["total_gb"] * mem["free_pct"] / 100
             pl = core.plan(procs, roots, tickets, snapshot_ts=snap_ts, now=now, pressure=mem["pressure"],
                            busy_daemons=busy, idle_since=self.idle_since, last_grant_ts=self.last_grant,
-                           live_claude_pids=live_claude, slots=core.SLOTS)
+                           live_claude_pids=live_claude, limit=self.limit, prev_holders=self.holders,
+                           last_raise_ts=self.last_raise, avail_gb=avail, estimates=self.estimates())
+            if pl.lowered and pl.limit < self.limit:
+                self.event("limite", f"limite {self.limit}→{pl.limit}: {pl.lowered} execução(ões) terminou(aram)")
+            if pl.raised:
+                self.last_raise = now
+                self.event("limite", pl.raised)
+            self.limit, self.holders = pl.limit, pl.holders
             for tid, start in pl.pid_starts.items():
                 self.db.execute("update tickets set pid_start=? where id=?", (start, tid))
             for tid, reason in pl.reaps:
@@ -322,15 +373,22 @@ class Queue:
                                  "serving": serving.get(p.pid), "cmd": p.args[:220]})
         relevant.sort(key=lambda r: -r["rss_mb"])
         rows = self.db.execute("select id, pid, claude_pid, ralphy, cwd, cmd, state, created, granted, ended, "
-                               "end_reason, exit_code from tickets where state!='done' or ended>? "
+                               "end_reason, exit_code, ctype, peak_gb from tickets where state!='done' or ended>? "
                                "order by id", (time.time() - 3600,)).fetchall()
         cols = ["id", "pid", "claude_pid", "ralphy", "cwd", "cmd", "state", "created", "granted", "ended",
-                "end_reason", "exit_code"]
+                "end_reason", "exit_code", "ctype", "peak_gb"]
         tickets = [dict(zip(cols, r)) for r in rows]
+        peaks = self.peaks()
         for t in tickets:
             t["agent"] = self.agent_label(t["claude_pid"], procs) if t["claude_pid"] else "?"
+            t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
+            if t["state"] == "granted":
+                t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
         return {
-            "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "slots": core.SLOTS, "used": pl.used,
+            "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "slots": pl.limit, "used": pl.used,
+            "base_slots": core.SLOTS, "max_slots": core.MAX_SLOTS, "headroom_gb": core.HEADROOM_GB,
+            "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1),
+            "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": pl.blocked, "memory": mem, "would_kill": would_kill,
             "agents": sorted(({"pid": k, "label": self.agent_label(k, procs), "rss_mb": v["rss"] // 1024,
                                "procs": v["procs"], "alive": k in procs} for k, v in agents.items()),
@@ -352,10 +410,11 @@ class Queue:
     def enqueue(self, body):
         with self.lock:
             cur = self.db.execute(
-                "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created) "
-                "values (?,?,?,?,?,?, 'waiting', ?)",
+                "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created, ctype) "
+                "values (?,?,?,?,?,?, 'waiting', ?, ?)",
                 (int(body["pid"]), body.get("claude_pid"), body.get("ralphy"), body.get("session_id"),
-                 str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], time.time()))
+                 str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], time.time(),
+                 core.command_type(str(body.get("cmd", "")))))
             tid = cur.lastrowid
         self.event("enqueue", f"ticket #{tid} pid {body['pid']}: {str(body.get('cmd', ''))[:100]}")
         self.wake.set()

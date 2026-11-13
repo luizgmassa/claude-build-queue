@@ -8,7 +8,15 @@ import re
 import shlex
 from dataclasses import dataclass, field
 
-SLOTS = 2
+SLOTS = 2  # base limit, runner included
+MAX_SLOTS = 4  # ceiling when memory allows extra slots
+HEADROOM_GB = 6.0  # available memory that must remain after the next item's estimate
+RAISE_GAP_S = 90  # a new build needs time to reach its peak before memory is judged again
+PEAK_HISTORY = 5  # estimate = largest of the last N measured peaks of the same command type
+# Starting estimates (GB of the whole build: client, daemon, workers, Kotlin daemon) before any measurement.
+DEFAULT_GB = {"gradle-check": 8.0, "gradle-backend": 6.0, "gradle-ios": 6.0, "gradle-test": 5.0,
+              "gradle-lint": 3.0, "gradle": 4.0, "xcodebuild": 6.0, "java": 2.0, "pod": 1.0, "uv": 1.0,
+              "other": 4.0}
 IDLE_GRACE_S = 20
 KOTLIN_IDLE_S = 60  # idle Kotlin daemon dies even mid-build: KGP falls back to in-process compile
 GRANT_QUIET_S = 20
@@ -77,6 +85,46 @@ def kind_of(args):
     if exe == "postgres" and "embedded-pg" in args:
         return "embedded_pg"
     return "other"
+
+
+def command_type(cmd):
+    """Memory class of a queued command line, used to pick its estimate."""
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        words = cmd.split()
+    names = [os.path.basename(w) for w in words]
+    if "xcodebuild" in names:
+        return "xcodebuild"
+    if "pod" in names and names[names.index("pod") + 1:][:1] in (["install"], ["update"]):
+        return "pod"
+    if "gradlew" in names or "gradle" in names:
+        i = names.index("gradlew") if "gradlew" in names else names.index("gradle")
+        args = words[i + 1:]
+        if any(a == "-p" and args[k + 1:k + 2] == ["backend"] or a in ("-pbackend", "--project-dir=backend")
+               for k, a in enumerate(args)):
+            return "gradle-backend"
+        tasks = [a.rsplit(":", 1)[-1] for a in args if not a.startswith("-")]
+        if any("ios" in t.lower() for t in tasks):
+            return "gradle-ios"
+        if not tasks or any(t in ("check", "build", "koverXmlReport", "koverVerify") for t in tasks):
+            return "gradle-check"
+        if any("test" in t.lower() for t in tasks):
+            return "gradle-test"
+        if all(t.startswith(("ktlint", "detekt")) for t in tasks):
+            return "gradle-lint"
+        return "gradle"
+    if "uv" in names and names[names.index("uv") + 1:][:1] == ["run"]:
+        return "uv"
+    if any(n in ("java", "kotlinc", "kotlinc-jvm", "kotlin") for n in names):
+        return "java"
+    return "other"
+
+
+def estimate_gb(ctype, peaks):
+    """Largest recent measured peak of this command type, or the starting table value."""
+    recent = peaks.get(ctype, [])[-PEAK_HISTORY:]
+    return max(recent) if recent else DEFAULT_GB.get(ctype, DEFAULT_GB["other"])
 
 
 def ancestors(pid, procs):
@@ -159,12 +207,37 @@ class Plan:
     used: int = 0
     runner_busy: bool = False
     counts: dict = field(default_factory=dict)
+    limit: int = SLOTS
+    raised: str = ""  # explanation of this tick's raise, if any
+    lowered: int = 0  # slot holders that ended since the last tick
+    holders: set = field(default_factory=set)  # slot holders after this tick's grants
+
+
+def raise_refusal(*, used, limit, pressure, now, last_raise_ts, avail_gb, est):
+    """Why one more slot cannot open now, or "" when it can."""
+    ctype, gb = est
+    if used + 1 > MAX_SLOTS:
+        return f"teto de {MAX_SLOTS} vagas"
+    if pressure != PRESSURE_NORMAL:
+        return "vaga extra só com pressão normal"
+    if last_raise_ts is not None and now - last_raise_ts < RAISE_GAP_S:
+        return f"próxima vaga extra em {int(RAISE_GAP_S - (now - last_raise_ts))}s"
+    if avail_gb - gb < HEADROOM_GB:
+        return (f"vaga extra recusada: {avail_gb:.1f} GB disponíveis − {gb:.1f} GB estimados ({ctype}) "
+                f"< {HEADROOM_GB:.0f} GB de folga")
+    return ""
 
 
 def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idle_since, last_grant_ts,
-         live_claude_pids, slots=SLOTS):
-    """One scheduling tick. Pure: the caller applies the result under its lock."""
+         live_claude_pids, limit=SLOTS, prev_holders=frozenset(), last_raise_ts=None, avail_gb=0.0,
+         estimates=None):
+    """One scheduling tick. Pure: the caller applies the result under its lock.
+
+    The limit rises one slot at a time above SLOTS when memory allows the head item, and drops one slot
+    per slot holder that ended, never below SLOTS.
+    """
     out = Plan()
+    estimates = estimates or {}
     live = []
     for t in tickets:
         p = procs.get(t.pid)
@@ -229,14 +302,16 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         killed_daemon = True
 
     out.used = int(out.runner_busy) + local_active
+    holders = {f"t{t.id}" for t in granted} | {f"p{r.pid}@{r.lstart}" for r in nonagent + unqueued}
+    if out.runner_busy:
+        holders.add("runner")
+    out.lowered = len(set(prev_holders) - holders)
+    limit = max(SLOTS, limit - out.lowered)
     out.counts = {"granted": len(granted), "nonagent": len(nonagent), "unqueued": len(unqueued),
                   "runner": int(out.runner_busy), "local_active": local_active}
     waiting = sorted((t for t in live if t.state == "waiting"), key=lambda t: t.id)
     used = out.used
     for t in waiting:  # strict FIFO: only the head may enter, so stop at the first refusal
-        if used >= slots:
-            out.blocked = f"sem vaga ({used}/{slots} em uso)"
-            break
         if pressure >= PRESSURE_CRITICAL:
             out.blocked = "pressão de memória crítica"
             break
@@ -246,9 +321,23 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if killed_daemon:
             out.blocked = "aguardando daemon ocioso encerrar"
             break
+        if used >= limit:
+            est = estimates.get(t.id, ("other", DEFAULT_GB["other"]))
+            why = raise_refusal(used=used, limit=limit, pressure=pressure, now=now, last_raise_ts=last_raise_ts,
+                                avail_gb=avail_gb, est=est)
+            if why:
+                out.blocked = f"sem vaga ({used}/{limit} em uso); {why}"
+                break
+            out.raised = (f"limite {limit}→{used + 1}: {avail_gb:.1f} GB disponíveis − {est[1]:.1f} GB "
+                          f"estimados ({est[0]}) ≥ {HEADROOM_GB:.0f} GB de folga")
+            limit = used + 1
+            last_raise_ts = now  # one raise per RAISE_GAP_S, so at most one per tick
         out.grants.append(t.id)
+        holders.add(f"t{t.id}")
         used += 1
         local_active += 1
+    out.limit = limit
+    out.holders = holders
     return out
 
 

@@ -121,7 +121,8 @@ def run(cmd):
 def status():
     v = call("/api/state", timeout=5)
     m = v["memory"]
-    print(f"slots {v['used']}/{v['slots']}  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
+    print(f"slots {v['used']}/{v['slots']} (base {v.get('base_slots')}, max {v.get('max_slots')}, "
+          f"avail {v.get('avail_gb')} GB)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
           f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
           f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB")
     if v["blocked"]:

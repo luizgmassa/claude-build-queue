@@ -155,5 +155,73 @@ class Hook(unittest.TestCase):
         self.assertIsNone(decide({"command": "gq enforce on"}))
 
 
+class DynamicLimit(unittest.TestCase):
+    def gqs(self, *ids):
+        return [P(200 + i, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for i in ids]
+
+    def run_tick(self, granted, waiting, *, limit=2, avail=20.0, est=8.0, last_raise=None, prev=(), pressure=1):
+        procs = world(*self.gqs(*granted, *waiting))
+        tickets = [core.Ticket(id=i, pid=200 + i, state="granted", created=0) for i in granted] + \
+                  [core.Ticket(id=i, pid=200 + i, state="waiting", created=0) for i in waiting]
+        now = 1000.0
+        return core.plan(procs, core.classify(procs), tickets, snapshot_ts=now - 1, now=now, pressure=pressure,
+                         busy_daemons=set(), idle_since={}, last_grant_ts=None, live_claude_pids={100},
+                         limit=limit, prev_holders=set(prev), last_raise_ts=last_raise, avail_gb=avail,
+                         estimates={i: ("gradle-check", est) for i in waiting})
+
+    def test_raises_one_slot_when_memory_covers_estimate_plus_headroom(self):
+        pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
+        self.assertEqual((pl.grants, pl.limit), ([3], 3))
+        self.assertIn("20.0 GB disponíveis − 8.0 GB", pl.raised)
+        self.assertIn("próxima vaga extra", pl.blocked)  # gradual: the second raise waits RAISE_GAP_S
+
+    def test_no_raise_when_headroom_would_drop_below_6_gb(self):
+        pl = self.run_tick([1, 2], [3], avail=13.9, est=8)
+        self.assertEqual((pl.grants, pl.limit), ([], 2))
+        self.assertIn("< 6 GB de folga", pl.blocked)
+
+    def test_no_raise_within_gap_or_above_ceiling_or_without_normal_pressure(self):
+        self.assertEqual(self.run_tick([1, 2], [3], last_raise=950).grants, [])
+        self.assertEqual(self.run_tick([1, 2], [3], last_raise=900).grants, [3])
+        pl = self.run_tick([1, 2, 3, 4], [5], limit=4, avail=40)
+        self.assertEqual(pl.grants, [])
+        self.assertIn("teto de 4", pl.blocked)
+        self.assertEqual(self.run_tick([], [3], pressure=2, avail=0, limit=2).grants, [3])  # base slot, warn
+
+    def test_limit_drops_one_per_finished_holder_and_rises_again_only_by_analysis(self):
+        pl = self.run_tick([1, 2], [4], limit=3, prev={"t1", "t2", "t3"}, avail=10)
+        self.assertEqual((pl.lowered, pl.limit, pl.grants), (1, 2, []))
+        pl = self.run_tick([1, 2], [4], limit=3, prev={"t1", "t2", "t3"}, avail=20)
+        self.assertEqual((pl.limit, pl.grants), (3, [4]))
+        self.assertEqual(self.run_tick([1], [], limit=3, prev={"t1", "t2", "t3"}).limit, 2)  # floor is SLOTS
+
+    def test_command_type_and_learned_estimate(self):
+        cases = {"perl -e 'alarm 3000; exec @ARGV' ./gradlew check --continue": "gradle-check",
+                 "./gradlew -p backend :runtime:test --tests *X*": "gradle-backend",
+                 "./gradlew :shared:compileTestKotlinIosSimulatorArm64": "gradle-ios",
+                 "./gradlew :shared:testAndroidHostTest --tests *Y*": "gradle-test",
+                 "./gradlew ktlintFormat :shared:detektMetadataMain": "gradle-lint",
+                 "./gradlew :androidApp:assembleDebug": "gradle",
+                 "xcodebuild test -workspace a": "xcodebuild", "uv run scripts/t.py": "uv",
+                 "pod install": "pod", "java -jar x.jar": "java"}
+        for cmd, want in cases.items():
+            self.assertEqual(core.command_type(cmd), want, cmd)
+        self.assertEqual(core.estimate_gb("gradle-lint", {}), 3.0)
+        peaks = {"gradle-lint": [9.0, 1.0, 2.0, 1.5, 1.2, 1.1]}  # 9.0 left the 5-run window
+        self.assertEqual(core.estimate_gb("gradle-lint", peaks), 2.0)
+
+
+class TicketMemory(unittest.TestCase):
+    def test_counts_own_tree_serving_daemon_its_workers_and_kotlin_daemon_only(self):
+        from bq.server import ticket_rss_gb
+        procs = world(P(201, 101, "python3 gq run -- ./gradlew x", CLAUDE_PID=100),
+                      P(400, 201, CLIENT, CLAUDE_PID=100, BQ_TICKET=1),
+                      P(700, 1, DAEMON, CLAUDE_PID=100), P(710, 700, "java GradleWorkerMain", CLAUDE_PID=100),
+                      P(800, 1, KOTLIN, CLAUDE_PID=100),
+                      P(900, 1, DAEMON, CLAUDE_PID=100), P(910, 900, "java GradleWorkerMain", CLAUDE_PID=100))
+        gb = ticket_rss_gb(201, 1, procs, serving={700: 400, 900: 555}, kotlin_of={700: {800}, 900: {800}})
+        self.assertEqual(round(gb * 1024), 5)  # 201, 400, 700, 710, 800 at 1 MB each; 900 and 910 excluded
+
+
 if __name__ == "__main__":
     unittest.main()
