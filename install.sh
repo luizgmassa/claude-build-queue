@@ -3,7 +3,7 @@
 # The Claude Code hook is added to ~/.claude/settings.json separately (see README).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-label=com.luizmassa.build-queue
+label=com.massa.build-queue
 plist="$HOME/Library/LaunchAgents/$label.plist"
 python=/opt/homebrew/bin/python3
 

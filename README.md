@@ -1,66 +1,68 @@
 # build-queue
 
-Fila FIFO de máquina para execuções Gradle/JVM dos agentes Claude neste Mac, com monitor de memória,
-limpeza de processos e página em http://127.0.0.1:8787.
+**English** · [Português](README.pt-BR.md)
 
-## Regras
+Machine-wide FIFO queue for the Gradle/JVM runs of the Claude agents on this Mac, with a memory monitor,
+process cleanup and a page at http://127.0.0.1:8787.
 
-- **2 vagas**, contando o runner self-hosted do GitHub (`Runner.Worker` vivo = 1 vaga). O runner nunca
-  espera: se chega com 2 builds locais rodando, fica 3 até um terminar, e ninguém novo entra.
-- **FIFO estrito**: só o primeiro da fila pode entrar.
-- **Limite dinâmico, 2 a 4 vagas**. Com a fila cheia, o limite sobe 1 vaga para o primeiro da fila só se:
-  a pressão está normal, passaram 90 s desde a última subida, e a memória disponível do macOS menos a
-  estimativa do item deixa ≥ 6 GB de folga. Cada execução que termina baixa o limite em 1 (nunca abaixo de 2);
-  a próxima subida passa pela mesma análise.
-- **Estimativa por tipo de comando** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
-  `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`): maior pico das últimas 5 execuções liberadas
-  do mesmo tipo; antes disso, a tabela `DEFAULT_GB` de `bq/core.py`. O pico soma a árvore do `gq`, o daemon
-  Gradle que atende o cliente, os workers dele e o daemon Kotlin ligado a ele.
-- **Memória**: pressão do macOS `warn` só deixa entrar com zero builds locais; `critical` não deixa ninguém.
-- Contam como execução: `./gradlew`, `xcodebuild`, `pod install`, `java`/`kotlinc` direto, `uv run`.
-- Builds fora de agente (seu terminal, Android Studio) contam vaga, mas nunca são mortos.
-- Nunca tocados: runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), backend do staging
-  (`~/.health-hub-local`), processos `claude`, o próprio servidor.
+## Rules
 
-## Uso pelos agentes
+- **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot). The runner never
+  waits: if it arrives with 2 local builds running, the count goes to 3 until one ends, and nobody new gets in.
+- **Strict FIFO**: only the head of the queue may start.
+- **Dynamic limit, 2 to 4 slots**. With every slot taken, the limit rises by 1 slot for the head of the queue
+  only if: memory pressure is normal, 90 s have passed since the last raise, and macOS available memory minus
+  the item's estimate leaves ≥ 6 GB of headroom. Each run that ends lowers the limit by 1 (never below 2);
+  the next raise goes through the same analysis.
+- **Estimate per command type** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
+  `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`): the largest peak of the last 5 released runs
+  of the same type; before that, the `DEFAULT_GB` table in `bq/core.py`. The peak adds up the `gq` tree, the
+  Gradle daemon serving the client, its workers and the Kotlin daemon attached to it.
+- **Memory**: macOS pressure `warn` admits only with zero local builds; `critical` admits nobody.
+- These count as a run: `./gradlew`, `xcodebuild`, `pod install`, direct `java`/`kotlinc`, `uv run`.
+- Builds outside an agent (your terminal, Android Studio) take a slot, but are never killed.
+- Never touched: the runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), the staging backend
+  (`~/.health-hub-local`), `claude` processes, the server itself.
+
+## Use by the agents
 
 ```
-cd ../worktree && gq run -- ./gradlew :shared:check      # Bash com run_in_background: true
+cd ../worktree && gq run -- ./gradlew :shared:check      # Bash with run_in_background: true
 gq status
 ```
 
-`gq` pega um ticket, espera a vaga sem gastar token, roda o comando e libera a vaga ao sair (inclusive em
-crash: o servidor recolhe o ticket quando o PID do `gq` morre). `gq` dentro de um `gq` reaproveita a vaga.
+`gq` takes a ticket, waits for a slot without spending tokens, runs the command and frees the slot on exit
+(crashes included: the server reaps the ticket when the `gq` PID dies). `gq` inside a `gq` reuses the slot.
 
-O gancho `PreToolUse` global (`bq/hook.py`) nega todo Bash que rode esses comandos fora de `gq run`,
-e todo `gq run` sem `run_in_background`.
+The global `PreToolUse` hook (`bq/hook.py`) denies every Bash call that runs these commands outside
+`gq run`, and every `gq run` without `run_in_background`.
 
-## Limpeza (`gq enforce on|off`)
+## Cleanup (`gq enforce on|off`)
 
-Em `off` (simulação) a página só lista o que mataria. Em `on`:
+In `off` (dry run) the page only lists what it would kill. In `on`:
 
-- build de agente sem vaga: SIGTERM na árvore, SIGKILL após 10 s;
-- processo de agente cuja sessão `claude` já morreu;
-- daemon Gradle de agente ocioso há 20 s (sem cliente conectado) e sem concessão nos últimos 20 s;
-- daemon Kotlin de agente ocioso há 60 s, mesmo com builds rodando (o KGP cai no compilador dentro do Gradle);
-- worker Gradle cujo daemon pai morreu (ppid 1).
+- agent build without a slot: SIGTERM on the tree, SIGKILL after 10 s;
+- agent process whose `claude` session has already died;
+- agent Gradle daemon idle for 20 s (no client connected) and no grant in the last 20 s;
+- agent Kotlin daemon idle for 60 s, even with builds running (KGP falls back to the compiler inside Gradle);
+- Gradle worker whose parent daemon died (ppid 1).
 
-O dono de cada processo vem das variáveis `CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID` e `RALPHY_STATUS_FILE`,
-que todo processo criado por um agente herda, inclusive daemons soltos.
+The owner of each process comes from the `CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID` and `RALPHY_STATUS_FILE`
+variables, which every process an agent creates inherits, detached daemons included.
 
-## Instalação
+## Installation
 
 ```
-./install.sh                       # gq em ~/.local/bin, agente do launchd
+./install.sh                       # gq in ~/.local/bin, launchd agent
 python3 -m unittest tests/test_core.py
-python3 tests/live_check.py        # fila real isolada na porta 8788
+python3 tests/live_check.py        # real queue, isolated on port 8788
 ```
 
-Gancho em `~/.claude/settings.json`, `hooks.PreToolUse`:
+Hook in `~/.claude/settings.json`, `hooks.PreToolUse`:
 
 ```json
 {"matcher": "Bash", "hooks": [{"type": "command",
   "command": "/opt/homebrew/bin/python3 $HOME/Projects/claude-build-queue/bq/hook.py"}]}
 ```
 
-Estado: `~/.local/share/build-queue/` (`queue.db`, `config.json`). Log: `~/Library/Logs/build-queue.log`.
+State: `~/.local/share/build-queue/` (`queue.db`, `config.json`). Log: `~/Library/Logs/build-queue.log`.
