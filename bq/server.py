@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bq import core  # noqa: E402
 
 PORT = int(os.environ.get("BQ_PORT", "8787"))
-DATA = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue"))
+DATA = core.DATA
 CONFIG = DATA / "config.json"
 PAGE = Path(__file__).with_name("page.html")
 TICK_S = 2.0
@@ -151,6 +151,29 @@ def cwd_of(pid):
     return ""
 
 
+def read_calls():
+    """The hook's recent `gq run` records; trims the file once it passes 1 MB."""
+    try:
+        with open(core.CALLS, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - 65536))
+            lines = f.read().decode(errors="ignore").splitlines()[1:] if size > 65536 else \
+                f.read().decode(errors="ignore").splitlines()
+    except OSError:
+        return []
+    if size > 1 << 20:  # shortcut: a hook append racing this rewrite is lost; it only costs one label
+        tmp = core.CALLS.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, core.CALLS)
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
 class Titles:
     """Agent labels: ralphy session number and the Claude session title, cached by transcript size."""
 
@@ -164,7 +187,7 @@ class Titles:
                 f.seek(max(0, path.stat().st_size - 8192))
                 for line in reversed(f.read().decode(errors="ignore").splitlines()):
                     m = re.search(r'"session_id":"([0-9a-f-]{36})"', line)
-                    if m and '"agent_id":null' in line:
+                    if m:  # subagent lines carry the parent session id too
                         return m.group(1)
         except OSError:
             pass
@@ -200,6 +223,8 @@ class Queue:
         if "ctype" not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
             self.db.execute("alter table tickets add column ctype text")
             self.db.execute("alter table tickets add column peak_gb real")
+        if "subagent" not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
+            self.db.execute("alter table tickets add column subagent text")
         self.db.execute("create table if not exists peaks (ctype text, peak_gb real, ts real, ticket int)")
         for tid, cmd in self.db.execute("select id, cmd from tickets where ctype is null and state!='done'").fetchall():
             self.db.execute("update tickets set ctype=? where id=?", (core.command_type(cmd or ""), tid))
@@ -216,6 +241,8 @@ class Queue:
         self.holders = set()
         self.last_raise = None
         self.peak = {}  # granted ticket id -> largest memory seen, GB
+        self.taken_calls = set()  # hook records already matched to a ticket
+        self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
         self.procs, self.mem = {}, {"total_gb": 0, "free_pct": 0}  # last snapshot, for the detail dialogs
         self.titles = Titles()
 
@@ -348,21 +375,24 @@ class Queue:
 
     # ------------------------------------------------------------ view
 
-    def agent_label(self, claude_pid, procs):
+    def agent_label(self, claude_pid, procs, subagent=None):
+        sub = " subagent" if subagent else ""
         p = procs.get(claude_pid)
         if not p:
-            return f"claude {claude_pid} (encerrado)"
+            return f"claude {claude_pid}{sub} (encerrado)"
         m = re.search(r"/sessions/(\d+)\.settings\.json", p.args)
         if not m:
-            return f"claude {claude_pid}"
+            return f"claude {claude_pid}{sub}"
         sid = self.titles.session_of(m.group(1))
         title = self.titles.title_of(sid) if sid else ""
-        return f"ralphy #{m.group(1)}" + (f" · {title}" if title else "")
+        return f"ralphy #{m.group(1)}{sub}" + (f" · {title}" if title else "")
 
     def proc_row(self, p, procs, total_kb, serving=None):
         cp = p.env.get("CLAUDE_PID", "")
         agent_pid = p.pid if p.kind == "claude" else int(cp) if p.owner == "agent" and cp.isdigit() else None
-        owner = self.agent_label(agent_pid, procs) if agent_pid else p.owner
+        tid = p.env.get("BQ_TICKET", "")
+        sub = self.sub_tickets.get(int(tid)) if tid.isdigit() and p.kind != "claude" else None
+        owner = self.agent_label(agent_pid, procs, sub) if agent_pid else p.owner
         return {"pid": p.pid, "ppid": p.ppid, "kind": p.kind, "owner": owner, "agent_pid": agent_pid,
                 "rss_mb": p.rss_kb // 1024, "ram_pct": round(100 * p.rss_kb / total_kb, 2) if total_kb else 0,
                 "cpu": p.cpu, "etime": p.etime, "status": p.status, "ticket": p.env.get("BQ_TICKET", ""),
@@ -370,7 +400,7 @@ class Queue:
 
     def ticket_rows(self, where, args):
         cols = ["id", "pid", "claude_pid", "ralphy", "cwd", "cmd", "state", "created", "granted", "ended",
-                "end_reason", "exit_code", "ctype", "peak_gb"]
+                "end_reason", "exit_code", "ctype", "peak_gb", "subagent"]
         rows = self.db.execute(f"select {', '.join(cols)} from tickets where {where} order by id", args)
         return [dict(zip(cols, r)) for r in rows.fetchall()]
 
@@ -426,6 +456,8 @@ class Queue:
             if p.kind == "claude":
                 agents.setdefault(p.pid, {"rss": 0, "procs": 0})["rss"] += p.rss_kb
         relevant = []
+        self.sub_tickets = dict(self.db.execute(
+            "select id, subagent from tickets where state!='done' and subagent is not null").fetchall())
         total_kb = mem["total_gb"] * 1024 ** 2
         for p in procs.values():
             cp = p.env.get("CLAUDE_PID", "")
@@ -440,7 +472,7 @@ class Queue:
         tickets = self.ticket_rows("state!='done' or ended>?", (time.time() - 3600,))
         peaks = self.peaks()
         for t in tickets:
-            t["agent"] = self.agent_label(t["claude_pid"], procs) if t["claude_pid"] else "?"
+            t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] else "?"
             t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
             if t["state"] == "granted":
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
@@ -469,13 +501,19 @@ class Queue:
     # ------------------------------------------------------------ API
 
     def enqueue(self, body):
+        now = time.time()
+        records = read_calls()
         with self.lock:
+            call = core.match_call(records, body.get("session_id"), now, self.taken_calls) or {}
+            if call:
+                self.taken_calls.add(call.get("id"))
+            subagent = (call.get("agent_type") or call.get("agent_id")) if call.get("agent_id") else None
             cur = self.db.execute(
-                "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created, ctype) "
-                "values (?,?,?,?,?,?, 'waiting', ?, ?)",
+                "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created, ctype, subagent) "
+                "values (?,?,?,?,?,?, 'waiting', ?, ?, ?)",
                 (int(body["pid"]), body.get("claude_pid"), body.get("ralphy"), body.get("session_id"),
-                 str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], time.time(),
-                 core.command_type(str(body.get("cmd", "")))))
+                 str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], now,
+                 core.command_type(str(body.get("cmd", ""))), subagent))
             tid = cur.lastrowid
         self.event("enqueue", f"ticket #{tid} pid {body['pid']}: {str(body.get('cmd', ''))[:100]}")
         self.wake.set()

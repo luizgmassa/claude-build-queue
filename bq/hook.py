@@ -3,10 +3,11 @@
 
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bq.core import analyze_command  # noqa: E402
+from bq.core import CALLS, analyze_command  # noqa: E402
 
 PAGE = "http://127.0.0.1:8787"
 
@@ -26,12 +27,24 @@ def decide(tool_input):
     return None
 
 
+def record(data):
+    """Notes whether the main session or a subagent issued a `gq run`: only the hook input carries agent_id."""
+    line = json.dumps({"id": data.get("tool_use_id"), "session_id": data.get("session_id"),
+                       "agent_id": data.get("agent_id"), "agent_type": data.get("agent_type"),
+                       "ts": time.time()})
+    with open(CALLS, "a") as f:  # one short O_APPEND write: concurrent hooks do not interleave
+        f.write(line + "\n")
+
+
 def main():
     try:
         data = json.load(sys.stdin)
         if data.get("tool_name") != "Bash":
             return
-        reason = decide(data.get("tool_input") or {})
+        tool_input = data.get("tool_input") or {}
+        reason = decide(tool_input)
+        if not reason and analyze_command(tool_input.get("command") or "")[1]:
+            record(data)
     except Exception:  # a hook bug must never block unrelated work; the server's cleanup still applies
         return
     if reason:

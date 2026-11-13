@@ -249,7 +249,7 @@ function renderAgent(a, body) {
   ]) + `<h3>Processos do agente</h3><div class="wrap"><table id="dlg-procs"></table></div>`
      + `<h3>Tickets (ativos e da última hora)</h3><div class="wrap"><table id="dlg-tickets"></table></div>`;
   grid("dlg-procs", PROC_COLS, a.procs);
-  grid("dlg-tickets", [T_ID, { k: "state", t: "estado", w: 80 }, T_PID, T_TYPE, T_PEAK, T_CMD, T_END], a.tickets);
+  grid("dlg-tickets", [T_ID, { k: "state", t: "estado", w: 80 }, { k: "subagent", t: "subagente", w: 110 }, T_PID, T_TYPE, T_PEAK, T_CMD, T_END], a.tickets);
 }
 
 function renderProc(p, body) {

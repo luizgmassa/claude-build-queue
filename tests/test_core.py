@@ -223,5 +223,21 @@ class TicketMemory(unittest.TestCase):
         self.assertEqual(round(gb * 1024), 5)  # 201, 400, 700, 710, 800 at 1 MB each; 900 and 910 excluded
 
 
+
+class SubagentCall(unittest.TestCase):
+    RECS = [{"id": "a", "session_id": "S", "agent_id": None, "ts": 100.0},
+            {"id": "b", "session_id": "S", "agent_id": "x1", "agent_type": "Explore", "ts": 105.0},
+            {"id": "c", "session_id": "T", "agent_id": None, "ts": 106.0}]
+
+    def test_newest_unclaimed_call_of_the_session(self):
+        self.assertEqual(core.match_call(self.RECS, "S", 110.0, set())["id"], "b")
+        self.assertEqual(core.match_call(self.RECS, "S", 110.0, {"b"})["id"], "a")
+
+    def test_other_session_or_stale_call_never_matches(self):
+        self.assertIsNone(core.match_call(self.RECS, "S", 110.0, {"a", "b"}))
+        self.assertIsNone(core.match_call(self.RECS, "S", 105.0 + core.CALL_WINDOW_S + 1, set()))
+        self.assertIsNone(core.match_call(self.RECS, None, 110.0, set()))
+
+
 if __name__ == "__main__":
     unittest.main()

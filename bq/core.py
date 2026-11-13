@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
+from pathlib import Path
 
 SLOTS = 2  # base limit, runner included
 MAX_SLOTS = 4  # ceiling when memory allows extra slots
@@ -21,6 +22,10 @@ IDLE_GRACE_S = 20
 KOTLIN_IDLE_S = 60  # idle Kotlin daemon dies even mid-build: KGP falls back to in-process compile
 GRANT_QUIET_S = 20
 TERM_GRACE_S = 10
+CALL_WINDOW_S = 60  # a `gq run` reaches the server within this long after the hook saw its Bash call
+
+DATA = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue"))
+CALLS = DATA / "calls.jsonl"  # the hook's record of each `gq run` Bash call: session and subagent
 
 PRESSURE_NORMAL, PRESSURE_WARN, PRESSURE_CRITICAL = 1, 2, 4
 
@@ -404,6 +409,19 @@ def _program(words):
         else:
             return b, words[i + 1:]
     return None, []
+
+
+def match_call(records, session_id, created, taken):
+    """The hook record of the Bash call that started a ticket: newest unclaimed `gq run` call of the session.
+
+    shortcut: a session that launches two `gq run` calls within the window in different agents can swap their
+    labels; upgrade by passing the tool_use_id through the command if that ever matters.
+    """
+    for r in reversed(records):
+        if r.get("session_id") == session_id and r.get("id") not in taken \
+                and 0 <= created - r.get("ts", 0) <= CALL_WINDOW_S:
+            return r
+    return None
 
 
 def analyze_command(cmd, depth=0):
