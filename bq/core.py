@@ -341,6 +341,8 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         holders.add(f"t{t.id}")
         used += 1
         local_active += 1
+    out.used = used  # after this tick's grants, the same count the blocked message shows
+    out.counts["local_active"] = local_active
     out.limit = limit
     out.holders = holders
     return out

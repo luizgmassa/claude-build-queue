@@ -175,6 +175,11 @@ class DynamicLimit(unittest.TestCase):
         self.assertIn("20.0 GB disponíveis − 8.0 GB", pl.raised)
         self.assertIn("próxima vaga extra", pl.blocked)  # gradual: the second raise waits RAISE_GAP_S
 
+    def test_used_counts_this_ticks_grants(self):
+        pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
+        self.assertEqual(pl.used, 3)
+        self.assertIn(f"({pl.used}/{pl.limit} em uso)", pl.blocked)
+
     def test_no_raise_when_headroom_would_drop_below_6_gb(self):
         pl = self.run_tick([1, 2], [3], avail=13.9, est=8)
         self.assertEqual((pl.grants, pl.limit), ([], 2))
