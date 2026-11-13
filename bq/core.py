@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 SLOTS = 2
 IDLE_GRACE_S = 20
+KOTLIN_IDLE_S = 60  # idle Kotlin daemon dies even mid-build: KGP falls back to in-process compile
 GRANT_QUIET_S = 20
 TERM_GRACE_S = 10
 
@@ -221,9 +222,8 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
             continue
         idle = now - idle_since.get(p.pid, now)
         p.status = f"ocioso {int(idle)}s"
-        if idle < IDLE_GRACE_S or recent_grant:
-            continue
-        if p.kind == "kotlin_daemon" and local_active > 0:
+        grace = KOTLIN_IDLE_S if p.kind == "kotlin_daemon" else IDLE_GRACE_S
+        if idle < grace or recent_grant:
             continue
         out.kills.append((p.pid, "daemon ocioso"))
         killed_daemon = True
@@ -330,7 +330,7 @@ def analyze_command(cmd, depth=0):
         if prog is None:
             continue
         if prog == "gq":
-            uses_gq = True
+            uses_gq = uses_gq or rest[:1] == ["run"]  # gq status / enforce return at once
             continue
         if prog in ("bash", "sh", "zsh") and "-c" in rest and depth < 3:
             k = rest.index("-c")

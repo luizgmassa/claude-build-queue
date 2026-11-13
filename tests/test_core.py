@@ -107,13 +107,13 @@ class Cleanup(unittest.TestCase):
         procs = world(P(700, 1, DAEMON, CLAUDE_PID=100))
         self.assertEqual(tick(procs, idle_since={700: 0}, last_grant=990).kills, [])
 
-    def test_kotlin_daemon_waits_for_zero_local_builds(self):
+    def test_kotlin_daemon_dies_after_60s_idle_even_with_builds_running(self):
         gq = P(201, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)
         procs = world(P(800, 1, KOTLIN, CLAUDE_PID=100), gq)
         busy_queue = [core.Ticket(id=1, pid=201, state="granted", created=0)]
-        self.assertEqual(tick(procs, busy_queue, idle_since={800: 0}).kills, [])
-        self.assertEqual(tick(world(P(800, 1, KOTLIN, CLAUDE_PID=100)), idle_since={800: 0}).kills,
-                         [(800, "daemon ocioso")])
+        self.assertEqual(tick(procs, busy_queue, idle_since={800: 950}).kills, [])
+        self.assertEqual(tick(procs, busy_queue, idle_since={800: 900}).kills, [(800, "daemon ocioso")])
+        self.assertEqual(tick(procs, busy_queue, busy={800}, idle_since={800: 0}).kills, [])
 
     def test_test_worker_under_daemon_is_not_a_root_but_orphaned_worker_dies(self):
         procs = world(P(700, 1, DAEMON, CLAUDE_PID=100),
@@ -151,6 +151,8 @@ class Hook(unittest.TestCase):
         self.assertIn("run_in_background", decide({"command": "gq run -- ./gradlew x"}))
         self.assertIsNone(decide({"command": "gq run -- ./gradlew x", "run_in_background": True}))
         self.assertIn("gq run --", decide({"command": "./gradlew x", "run_in_background": True}))
+        self.assertIsNone(decide({"command": "gq status"}))
+        self.assertIsNone(decide({"command": "gq enforce on"}))
 
 
 if __name__ == "__main__":

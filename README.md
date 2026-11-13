@@ -34,7 +34,7 @@ Em `off` (simulação) a página só lista o que mataria. Em `on`:
 - build de agente sem vaga: SIGTERM na árvore, SIGKILL após 10 s;
 - processo de agente cuja sessão `claude` já morreu;
 - daemon Gradle de agente ocioso há 20 s (sem cliente conectado) e sem concessão nos últimos 20 s;
-- daemon Kotlin de agente ocioso há 20 s, só com zero builds locais rodando;
+- daemon Kotlin de agente ocioso há 60 s, mesmo com builds rodando (o KGP cai no compilador dentro do Gradle);
 - worker Gradle cujo daemon pai morreu (ppid 1).
 
 O dono de cada processo vem das variáveis `CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID` e `RALPHY_STATUS_FILE`,
