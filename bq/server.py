@@ -144,6 +144,13 @@ def memory():
     }
 
 
+def cwd_of(pid):
+    for line in run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=5).splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
 class Titles:
     """Agent labels: ralphy session number and the Claude session title, cached by transcript size."""
 
@@ -209,6 +216,7 @@ class Queue:
         self.holders = set()
         self.last_raise = None
         self.peak = {}  # granted ticket id -> largest memory seen, GB
+        self.procs, self.mem = {}, {"total_gb": 0, "free_pct": 0}  # last snapshot, for the detail dialogs
         self.titles = Titles()
 
     def event(self, kind, text):
@@ -303,6 +311,7 @@ class Queue:
                 else:
                     would_kill.append({"pid": pid, "reason": reason})
             self.escalate(procs)
+            self.procs, self.mem, self.serving = procs, mem, serving
             self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill)
 
     def kill(self, root, reason, procs):
@@ -350,12 +359,74 @@ class Queue:
         title = self.titles.title_of(sid) if sid else ""
         return f"ralphy #{m.group(1)}" + (f" · {title}" if title else "")
 
+    def proc_row(self, p, procs, total_kb, serving=None):
+        cp = p.env.get("CLAUDE_PID", "")
+        agent_pid = p.pid if p.kind == "claude" else int(cp) if p.owner == "agent" and cp.isdigit() else None
+        owner = self.agent_label(agent_pid, procs) if agent_pid else p.owner
+        return {"pid": p.pid, "ppid": p.ppid, "kind": p.kind, "owner": owner, "agent_pid": agent_pid,
+                "rss_mb": p.rss_kb // 1024, "ram_pct": round(100 * p.rss_kb / total_kb, 2) if total_kb else 0,
+                "cpu": p.cpu, "etime": p.etime, "status": p.status, "ticket": p.env.get("BQ_TICKET", ""),
+                "serving": (serving or {}).get(p.pid), "cmd": p.args[:220]}
+
+    def ticket_rows(self, where, args):
+        cols = ["id", "pid", "claude_pid", "ralphy", "cwd", "cmd", "state", "created", "granted", "ended",
+                "end_reason", "exit_code", "ctype", "peak_gb"]
+        rows = self.db.execute(f"select {', '.join(cols)} from tickets where {where} order by id", args)
+        return [dict(zip(cols, r)) for r in rows.fetchall()]
+
+    def proc_details(self, pid):
+        """Everything known about one process, for the page's dialog."""
+        with self.lock:
+            procs, mem, serving = self.procs, self.mem, getattr(self, "serving", {})
+            p = procs.get(pid)
+            if p is None:
+                return {"error": f"PID {pid} não existe mais"}
+            total_kb = mem["total_gb"] * 1024 ** 2
+            tree = [p] + [procs[d] for d in core.descendants(pid, procs)]
+            out = self.proc_row(p, procs, total_kb, serving)
+            tree_kb = sum(q.rss_kb for q in tree)
+            out.update(cmd=p.args, lstart=p.lstart, env=p.env, root=p.root,
+                       ancestors=[self.proc_row(a, procs, total_kb, serving) for a in core.ancestors(pid, procs)],
+                       tree=[self.proc_row(q, procs, total_kb, serving) for q in tree],
+                       tree_rss_mb=tree_kb // 1024, tree_ram_pct=round(100 * tree_kb / total_kb, 2) if total_kb else 0,
+                       tickets=self.ticket_rows("id=?", (int(p.env["BQ_TICKET"]),))
+                       if p.env.get("BQ_TICKET", "").isdigit() else [])
+        out["cwd"] = cwd_of(pid)  # lsof outside the lock: it can take a moment
+        return out
+
+    def agent_details(self, claude_pid):
+        """One agent: session, every process it owns with its memory share, and its tickets."""
+        with self.lock:
+            procs, mem = self.procs, self.mem
+            total_kb = mem["total_gb"] * 1024 ** 2
+            mine = {q.pid for q in procs.values() if q.env.get("CLAUDE_PID") == str(claude_pid)}
+            if claude_pid in procs:
+                mine |= {claude_pid, *core.descendants(claude_pid, procs)}
+            rows = sorted((self.proc_row(procs[x], procs, total_kb) for x in mine), key=lambda r: -r["rss_mb"])
+            rss_kb = sum(procs[x].rss_kb for x in mine)
+            avail_kb = total_kb * mem["free_pct"] / 100
+            claude = procs.get(claude_pid)
+            m = re.search(r"/sessions/(\d+)\.settings\.json", claude.args) if claude else None
+            sid = self.titles.session_of(m.group(1)) if m else None
+            tickets = self.ticket_rows("claude_pid=? and (state!='done' or ended>?)",
+                                       (claude_pid, time.time() - 3600))
+            transcript = glob(str(Path.home() / f".claude/projects/*/{sid}.jsonl")) if sid else []
+            return {"pid": claude_pid, "label": self.agent_label(claude_pid, procs), "alive": claude is not None,
+                    "ralphy": m.group(1) if m else None, "session_id": sid,
+                    "transcript": transcript[0] if transcript else None,
+                    "etime": claude.etime if claude else None, "lstart": claude.lstart if claude else None,
+                    "rss_mb": rss_kb // 1024, "ram_pct": round(100 * rss_kb / total_kb, 2) if total_kb else 0,
+                    "avail_pct": round(100 * rss_kb / avail_kb, 1) if avail_kb else 0,
+                    "total_gb": mem["total_gb"], "avail_gb": round(avail_kb / 1024 ** 2, 1),
+                    "procs": rows, "tickets": tickets}
+
     def build_view(self, procs, roots, pl, mem, serving, enforce, would_kill):
         agents = {}
         for p in procs.values():
             if p.kind == "claude":
                 agents.setdefault(p.pid, {"rss": 0, "procs": 0})["rss"] += p.rss_kb
         relevant = []
+        total_kb = mem["total_gb"] * 1024 ** 2
         for p in procs.values():
             cp = p.env.get("CLAUDE_PID", "")
             if p.owner == "agent" and cp.isdigit():
@@ -364,20 +435,9 @@ class Queue:
                 a["procs"] += 1
             if p.kind in core.AGENT_EXEC_KINDS | core.INFRA_KINDS | {"gq", "runner_worker", "embedded_pg"} \
                     or p.root is not None:
-                owner = p.owner
-                if p.owner == "agent" and cp.isdigit():
-                    owner = self.agent_label(int(cp), procs)
-                relevant.append({"pid": p.pid, "ppid": p.ppid, "kind": p.kind, "owner": owner,
-                                 "rss_mb": p.rss_kb // 1024, "cpu": p.cpu, "etime": p.etime,
-                                 "status": p.status, "ticket": p.env.get("BQ_TICKET", ""),
-                                 "serving": serving.get(p.pid), "cmd": p.args[:220]})
+                relevant.append(self.proc_row(p, procs, total_kb, serving))
         relevant.sort(key=lambda r: -r["rss_mb"])
-        rows = self.db.execute("select id, pid, claude_pid, ralphy, cwd, cmd, state, created, granted, ended, "
-                               "end_reason, exit_code, ctype, peak_gb from tickets where state!='done' or ended>? "
-                               "order by id", (time.time() - 3600,)).fetchall()
-        cols = ["id", "pid", "claude_pid", "ralphy", "cwd", "cmd", "state", "created", "granted", "ended",
-                "end_reason", "exit_code", "ctype", "peak_gb"]
-        tickets = [dict(zip(cols, r)) for r in rows]
+        tickets = self.ticket_rows("state!='done' or ended>?", (time.time() - 3600,))
         peaks = self.peaks()
         for t in tickets:
             t["agent"] = self.agent_label(t["claude_pid"], procs) if t["claude_pid"] else "?"
@@ -391,6 +451,7 @@ class Queue:
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": pl.blocked, "memory": mem, "would_kill": would_kill,
             "agents": sorted(({"pid": k, "label": self.agent_label(k, procs), "rss_mb": v["rss"] // 1024,
+                               "ram_pct": round(100 * v["rss"] / total_kb, 1) if total_kb else 0,
                                "procs": v["procs"], "alive": k in procs} for k, v in agents.items()),
                              key=lambda a: -a["rss_mb"]),
             "processes": relevant, "tickets": tickets, "events": list(self.events)[:80],
@@ -480,6 +541,10 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/ticket":
                 with Q.lock:
                     self.reply(Q.status(int(q["id"][0])))
+            elif u.path == "/api/proc":
+                self.reply(Q.proc_details(int(q["pid"][0])))
+            elif u.path == "/api/agent":
+                self.reply(Q.agent_details(int(q["pid"][0])))
             elif u.path == "/api/wake":
                 Q.wake.set()
                 self.reply({"ok": True})

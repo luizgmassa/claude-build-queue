@@ -7,37 +7,162 @@
   body { font: 13px -apple-system, system-ui, sans-serif; margin: 16px; background: #111; color: #ddd; }
   h1 { font-size: 18px; margin: 0 0 8px; }
   h2 { font-size: 14px; margin: 18px 0 6px; color: #9cf; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
-  th { color: #888; font-weight: 600; }
+  h3 { font-size: 13px; margin: 14px 0 4px; color: #9cf; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; table-layout: fixed; }
+  th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #2a2a2a; vertical-align: top;
+           overflow: hidden; overflow-wrap: anywhere; }
+  th { color: #888; font-weight: 600; position: relative; cursor: pointer; user-select: none; white-space: nowrap;
+       text-overflow: ellipsis; }
+  th:hover { color: #bbb; }
+  .rz { position: absolute; right: 0; top: 0; width: 7px; height: 100%; cursor: col-resize; }
+  .rz:hover, .rz.on { background: #456; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .cards { display: flex; gap: 10px; flex-wrap: wrap; }
   .card { background: #1b1b1b; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; min-width: 120px; }
   .card b { display: block; font-size: 20px; }
   .ok { color: #6d6; } .warn { color: #fc4; } .bad { color: #f66; }
-  code { color: #aaa; font-size: 11px; word-break: break-all; }
+  code { color: #aaa; font-size: 11px; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #aaa; font-size: 11px; background: #181818;
+        padding: 6px 8px; border-radius: 4px; margin: 0; }
   .muted { color: #777; }
+  a.lnk { color: #8bf; cursor: pointer; text-decoration: none; }
+  a.lnk:hover { text-decoration: underline; }
+  dialog { background: #161616; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 0;
+           width: min(1300px, 94vw); max-height: 88vh; overflow: auto; }
+  dialog::backdrop { background: rgba(0, 0, 0, .6); }
+  .dh { display: flex; gap: 10px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #333;
+        position: sticky; top: 0; background: #161616; z-index: 1; }
+  .dh b { flex: 1; font-size: 15px; }
+  .dh button { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 10px;
+               cursor: pointer; }
+  .dh button:disabled { opacity: .3; cursor: default; }
+  #dlg-body { padding: 4px 14px 14px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 8px 0; }
+  .kv > div:nth-child(odd) { color: #888; }
 </style>
 </head>
 <body>
 <h1>Fila de builds <span id="ts" class="muted"></span></h1>
 <div class="cards" id="cards"></div>
 <div id="blocked" class="warn"></div>
-<h2>Fila (FIFO)</h2><table id="tickets"></table>
-<h2>Agentes</h2><table id="agents"></table>
-<h2>Processos</h2><table id="procs"></table>
-<h2 id="wk-title">Limpeza</h2><table id="would"></table>
-<h2>Estimativa por tipo (maior pico das últimas 5 execuções, ou tabela inicial)</h2><table id="est"></table>
-<h2>Eventos</h2><table id="events"></table>
+<h2>Executando</h2><div class="wrap"><table id="running"></table></div>
+<h2>Aguardando (FIFO)</h2><div class="wrap"><table id="waiting"></table></div>
+<h2>Agentes</h2><div class="wrap"><table id="agents"></table></div>
+<h2>Processos</h2><div class="wrap"><table id="procs"></table></div>
+<h2 id="wk-title">Limpeza</h2><div class="wrap"><table id="would"></table></div>
+<h2>Terminados na última hora</h2><div class="wrap"><table id="done"></table></div>
+<h2>Estimativa por tipo (maior pico das últimas 5 execuções, ou tabela inicial)</h2>
+<div class="wrap"><table id="est"></table></div>
+<h2>Eventos</h2><div class="wrap"><table id="events"></table></div>
+
+<dialog id="dlg">
+  <div class="dh"><button id="dlg-back" title="voltar">←</button><b id="dlg-title"></b>
+    <button id="dlg-x" title="fechar (Esc)">×</button></div>
+  <div id="dlg-body"></div>
+</dialog>
+
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const table = (id, head, rows) => {
-  document.getElementById(id).innerHTML =
-    "<tr>" + head.map(h => `<th>${h}</th>`).join("") + "</tr>" +
-    (rows.length ? rows.join("") : `<tr><td class="muted" colspan="${head.length}">vazio</td></tr>`);
-};
-const pressure = p => p >= 4 ? ["crítica","bad"] : p >= 2 ? ["alerta","warn"] : ["normal","ok"];
-const age = ts => ts ? Math.round(Date.now()/1000 - ts) + "s" : "";
+const secs = ts => ts ? Math.round(Date.now() / 1000 - ts) : null;
+const dur = s => s == null ? "" : s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s"
+  : Math.floor(s / 3600) + "h" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m";
+const etimeSecs = e => { if (!e) return null; const [d, rest] = e.includes("-") ? e.split("-") : [0, e];
+  return rest.split(":").map(Number).reduce((a, x) => a * 60 + x, 0) + Number(d) * 86400; };
+const procLink = pid => pid ? `<a class="lnk" data-proc="${pid}">${pid}</a>` : "";
+const agentLink = (pid, label) => pid ? `<a class="lnk" data-agent="${pid}">${esc(label || "claude " + pid)}</a>` : esc(label);
+
+// ---------------------------------------------------------------- sortable, resizable tables
+const S = { sort: JSON.parse(localStorage.bqSort || "{}"), widths: JSON.parse(localStorage.bqWidths || "{}") };
+const save = () => { localStorage.bqSort = JSON.stringify(S.sort); localStorage.bqWidths = JSON.stringify(S.widths); };
+const tables = {};  // id -> {cols, rows}, kept to re-render on sort without waiting for the next refresh
+const cmp = (a, b) => (typeof a === "number" && typeof b === "number") ? a - b
+  : String(a ?? "").localeCompare(String(b ?? ""), "pt-BR", { numeric: true, sensitivity: "base" });
+const widthOf = (id, c) => (S.widths[id] || {})[c.k] || c.w || 110;
+
+function grid(id, cols, rows) {
+  tables[id] = { cols, rows };
+  const el = document.getElementById(id);
+  if (!el) return;
+  const st = S.sort[id], col = st && cols.find(c => c.k === st.k);
+  if (col) {
+    const val = r => col.v ? col.v(r) : r[col.k];
+    rows = rows.slice().sort((a, b) => cmp(val(a), val(b)) * st.d);
+  }
+  el.style.width = cols.reduce((sum, c) => sum + widthOf(id, c), 0) + "px";
+  el.innerHTML = "<colgroup>" + cols.map(c => `<col style="width:${widthOf(id, c)}px">`).join("") + "</colgroup>"
+    + "<thead><tr>" + cols.map((c, i) => `<th data-t="${id}" data-k="${c.k}" title="ordenar por ${esc(c.t)}">`
+      + esc(c.t) + (col && st.k === c.k ? (st.d > 0 ? " ▲" : " ▼") : "")
+      + `<span class="rz" data-t="${id}" data-i="${i}"></span></th>`).join("") + "</tr></thead><tbody>"
+    + (rows.length ? rows.map(r => "<tr>" + cols.map(c =>
+        `<td class="${c.num ? "num" : ""}${c.cls ? " " + c.cls(r) : ""}">${c.f ? c.f(r) : esc(r[c.k])}</td>`).join("") + "</tr>").join("")
+      : `<tr><td class="muted" colspan="${cols.length}">vazio</td></tr>`) + "</tbody>";
+}
+
+let drag = null, justDragged = false;
+document.addEventListener("mousedown", e => {
+  const rz = e.target.closest(".rz");
+  if (!rz) return;
+  e.preventDefault(); e.stopPropagation();
+  const id = rz.dataset.t, c = tables[id].cols[+rz.dataset.i];
+  drag = { id, i: +rz.dataset.i, k: c.k, x: e.clientX, w: widthOf(id, c) };
+  rz.classList.add("on");
+});
+document.addEventListener("mousemove", e => {
+  if (!drag) return;
+  const w = Math.max(40, drag.w + e.clientX - drag.x);
+  (S.widths[drag.id] = S.widths[drag.id] || {})[drag.k] = w;
+  const el = document.getElementById(drag.id);  // re-query: a refresh may have rebuilt the table mid-drag
+  const colEl = el && el.querySelectorAll("col")[drag.i];
+  if (!colEl) return;
+  colEl.style.width = w + "px";
+  el.style.width = tables[drag.id].cols.reduce((sum, c) => sum + widthOf(drag.id, c), 0) + "px";
+});
+document.addEventListener("mouseup", () => {
+  if (!drag) return;
+  drag = null; justDragged = true; save();
+  document.querySelectorAll(".rz.on").forEach(x => x.classList.remove("on"));
+  setTimeout(() => justDragged = false, 0);  // the click that ends a drag must not also sort
+});
+
+document.addEventListener("click", e => {
+  const a = e.target.closest("[data-proc],[data-agent]");
+  if (a) { e.preventDefault(); openDetail(a.dataset.agent ? "agent" : "proc", +(a.dataset.agent || a.dataset.proc), true); return; }
+  const th = e.target.closest("th[data-k]");
+  if (!th || justDragged || e.target.closest(".rz")) return;
+  const id = th.dataset.t, k = th.dataset.k, st = S.sort[id];
+  S.sort[id] = { k, d: st && st.k === k ? -st.d : 1 };  // first click A→Z, next click Z→A
+  save();
+  grid(id, tables[id].cols, tables[id].rows);
+});
+
+// ---------------------------------------------------------------- column sets
+const PROC_COLS = [
+  { k: "pid", t: "PID", num: true, w: 70, f: r => procLink(r.pid) },
+  { k: "ppid", t: "PPID", num: true, w: 70, f: r => procLink(r.ppid) },
+  { k: "kind", t: "tipo", w: 110 },
+  { k: "owner", t: "dono", w: 200, f: r => r.agent_pid ? agentLink(r.agent_pid, r.owner) : esc(r.owner) },
+  { k: "status", t: "estado", w: 150, cls: r => r.status === "SEM VAGA" ? "bad" : "",
+    f: r => esc(r.status) + (r.serving ? " → cliente " + procLink(r.serving) : "") },
+  { k: "rss_mb", t: "RSS (MB)", num: true, w: 85 },
+  { k: "ram_pct", t: "% RAM", num: true, w: 70 },
+  { k: "cpu", t: "CPU%", num: true, w: 65 },
+  { k: "etime", t: "idade", w: 90, v: r => etimeSecs(r.etime) },
+  { k: "ticket", t: "ticket", w: 60, num: true, v: r => r.ticket ? +r.ticket : null },
+  { k: "cmd", t: "comando", w: 520, f: r => `<code>${esc(r.cmd)}</code>` },
+];
+const T_ID = { k: "id", t: "#", num: true, w: 50 };
+const T_AGENT = { k: "agent", t: "agente", w: 220, f: t => agentLink(t.claude_pid, t.agent) };
+const T_PID = { k: "pid", t: "PID gq", num: true, w: 70, f: t => procLink(t.pid) };
+const T_TYPE = { k: "ctype", t: "tipo", w: 110 };
+const T_EST = { k: "estimate_gb", t: "estimativa", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
+const T_PEAK = { k: "peak_gb", t: "pico", num: true, w: 75, f: t => t.peak_gb != null ? t.peak_gb + " GB" : "" };
+const T_CMD = { k: "cmd", t: "comando", w: 520, f: t => `<code>${esc(t.cwd)}$ ${esc(t.cmd)}</code>` };
+const T_END = { k: "end_reason", t: "fim", w: 160,
+  f: t => esc(t.end_reason ?? "") + (t.exit_code != null ? " (exit " + t.exit_code + ")" : "") };
+
+// ---------------------------------------------------------------- main view
+const pressure = p => p >= 4 ? ["crítica", "bad"] : p >= 2 ? ["alerta", "warn"] : ["normal", "ok"];
 async function refresh() {
   let v;
   try { v = await (await fetch("/api/state")).json(); } catch (e) {
@@ -57,27 +182,105 @@ async function refresh() {
     ["Limpeza", v.enforce ? "ligada" : "simulação", v.enforce ? "ok" : "warn"],
   ].map(([k, val, c]) => `<div class="card">${k}<b class="${c}">${esc(val)}</b></div>`).join("");
   document.getElementById("blocked").textContent = v.blocked ? "Fila parada: " + v.blocked : "";
-  table("tickets", ["#", "estado", "agente", "pid", "espera/rodando", "tipo", "estimativa", "pico", "comando", "fim"],
-    v.tickets.slice().reverse().map(t => `<tr><td>${t.id}</td><td>${esc(t.state)}</td><td>${esc(t.agent)}</td>
-      <td>${t.pid}</td><td>${t.state === "waiting" ? age(t.created) : t.state === "granted" ? age(t.granted) : ""}</td>
-      <td>${esc(t.ctype)}</td><td class="num">${t.estimate_gb} GB</td><td class="num">${t.peak_gb != null ? t.peak_gb + " GB" : ""}</td>
-      <td><code>${esc(t.cwd)}$ ${esc(t.cmd)}</code></td>
-      <td>${esc(t.end_reason ?? "")}${t.exit_code != null ? " (exit " + t.exit_code + ")" : ""}</td></tr>`));
-  table("agents", ["agente", "PID claude", "RSS total", "processos"],
-    v.agents.map(a => `<tr><td>${esc(a.label)}</td><td>${a.pid}${a.alive ? "" : " (morto)"}</td>
-      <td class="num">${a.rss_mb} MB</td><td class="num">${a.procs}</td></tr>`));
-  table("procs", ["PID", "PPID", "tipo", "dono", "estado", "RSS", "CPU%", "idade", "ticket", "comando"],
-    v.processes.map(p => `<tr><td>${p.pid}</td><td>${p.ppid}</td><td>${esc(p.kind)}</td><td>${esc(p.owner)}</td>
-      <td class="${p.status === "SEM VAGA" ? "bad" : ""}">${esc(p.status)}${p.serving ? " → cliente " + p.serving : ""}</td>
-      <td class="num">${p.rss_mb} MB</td><td class="num">${p.cpu}</td><td>${esc(p.etime)}</td><td>${esc(p.ticket)}</td>
-      <td><code>${esc(p.cmd)}</code></td></tr>`));
+
+  const waiting = v.tickets.filter(t => t.state === "waiting").sort((a, b) => a.id - b.id);
+  waiting.forEach((t, i) => t.position = i + 1);
+  grid("running", [T_ID, T_AGENT, T_PID,
+    { k: "granted", t: "rodando há", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
+    T_TYPE, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
+  grid("waiting", [{ k: "position", t: "posição", num: true, w: 65 }, T_ID, T_AGENT, T_PID,
+    { k: "created", t: "esperando há", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
+    T_TYPE, T_EST, T_CMD], waiting);
+  grid("done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,
+    { k: "ended", t: "terminou há", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD],
+    v.tickets.filter(t => t.state === "done"));
+  grid("agents", [
+    { k: "label", t: "agente", w: 280, f: a => agentLink(a.pid, a.label) },
+    { k: "pid", t: "PID claude", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " (morto)") },
+    { k: "rss_mb", t: "RSS total (MB)", num: true, w: 110 },
+    { k: "ram_pct", t: "% RAM", num: true, w: 70 },
+    { k: "procs", t: "processos", num: true, w: 80 }], v.agents);
+  grid("procs", PROC_COLS, v.processes);
   document.getElementById("wk-title").textContent = v.enforce ? "Limpeza (ligada: ver eventos)" : "Limpeza em simulação: mataria";
-  table("would", ["PID", "motivo"], v.would_kill.map(k => `<tr><td>${k.pid}</td><td>${esc(k.reason)}</td></tr>`));
-  table("est", ["tipo", "estimativa"], Object.entries(v.estimates).map(([k, gb]) =>
-    `<tr><td>${esc(k)}</td><td class="num">${gb} GB</td></tr>`));
-  table("events", ["hora", "tipo", "detalhe"],
-    v.events.map(e => `<tr><td>${e.ts}</td><td>${esc(e.kind)}</td><td>${esc(e.text)}</td></tr>`));
+  grid("would", [{ k: "pid", t: "PID", num: true, w: 80, f: k => procLink(k.pid) }, { k: "reason", t: "motivo", w: 300 }],
+    v.would_kill);
+  grid("est", [{ k: "type", t: "tipo", w: 140 }, { k: "gb", t: "estimativa (GB)", num: true, w: 120 }],
+    Object.entries(v.estimates).map(([type, gb]) => ({ type, gb })));
+  grid("events", [{ k: "ts", t: "hora", w: 75 }, { k: "kind", t: "tipo", w: 75 }, { k: "text", t: "detalhe", w: 700 }],
+    v.events);
+  // keep the open dialog live, except while text is selected in it (a rebuild would drop the selection)
+  if (dlg.open && current && !String(getSelection())) openDetail(current.type, current.pid, false);
 }
+
+// ---------------------------------------------------------------- detail dialog
+const dlg = document.getElementById("dlg");
+let current = null, trail = [];
+const kv = pairs => `<div class="kv">${pairs.filter(p => p[1] !== undefined && p[1] !== null && p[1] !== "")
+  .map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join("")}</div>`;
+
+async function openDetail(type, pid, push) {
+  if (push && dlg.open && current && (current.type !== type || current.pid !== pid)) trail.push(current);
+  current = { type, pid };
+  if (!dlg.open) { trail = []; document.getElementById("dlg-body").innerHTML = "carregando…"; dlg.showModal(); }
+  let d;
+  try { d = await (await fetch(`/api/${type}?pid=${pid}`)).json(); } catch (e) { d = { error: "servidor fora do ar" }; }
+  if (!current || current.type !== type || current.pid !== pid) return;  // the user moved on while this loaded
+  document.getElementById("dlg-back").disabled = !trail.length;
+  const body = document.getElementById("dlg-body"), scroll = dlg.scrollTop;
+  if (d.error) {
+    document.getElementById("dlg-title").textContent = (type === "agent" ? "Agente " : "PID ") + pid;
+    body.innerHTML = `<p class="bad">${esc(d.error)}</p>`;
+  } else if (type === "agent") renderAgent(d, body); else renderProc(d, body);
+  dlg.scrollTop = scroll;
+}
+
+function renderAgent(a, body) {
+  document.getElementById("dlg-title").textContent = a.label;
+  body.innerHTML = kv([
+    ["PID claude", procLink(a.pid) + (a.alive ? "" : ' <span class="bad">(encerrado)</span>')],
+    ["Sessão ralphy", a.ralphy ? "#" + esc(a.ralphy) : ""],
+    ["ID da sessão", esc(a.session_id)],
+    ["Transcrição", a.transcript ? `<code>${esc(a.transcript)}</code>` : ""],
+    ["Início", esc(a.lstart)], ["Idade", esc(a.etime)],
+    ["Processos", a.procs.length],
+    ["Memória (RSS)", `${a.rss_mb} MB`],
+    ["% da RAM total", `${a.ram_pct}% de ${a.total_gb} GB`],
+    ["% da memória disponível agora", `${a.avail_pct}% de ${a.avail_gb} GB`],
+  ]) + `<h3>Processos do agente</h3><div class="wrap"><table id="dlg-procs"></table></div>`
+     + `<h3>Tickets (ativos e da última hora)</h3><div class="wrap"><table id="dlg-tickets"></table></div>`;
+  grid("dlg-procs", PROC_COLS, a.procs);
+  grid("dlg-tickets", [T_ID, { k: "state", t: "estado", w: 80 }, T_PID, T_TYPE, T_PEAK, T_CMD, T_END], a.tickets);
+}
+
+function renderProc(p, body) {
+  document.getElementById("dlg-title").textContent = `PID ${p.pid} · ${p.kind}`;
+  body.innerHTML = kv([
+    ["Agente", p.agent_pid ? agentLink(p.agent_pid, p.owner) : esc(p.owner)],
+    ["PID", p.pid], ["PPID", procLink(p.ppid)],
+    ["Raiz do build", p.root && p.root !== p.pid ? procLink(p.root) : p.root ? "este processo" : ""],
+    ["Tipo", esc(p.kind)], ["Estado", esc(p.status) + (p.serving ? " → cliente " + procLink(p.serving) : "")],
+    ["Memória (RSS)", `${p.rss_mb} MB (${p.ram_pct}% da RAM)`],
+    ["Árvore (ele + descendentes)", `${p.tree.length} processos, ${p.tree_rss_mb} MB (${p.tree_ram_pct}% da RAM)`],
+    ["CPU", p.cpu + "%"], ["Início", esc(p.lstart)], ["Idade", esc(p.etime)],
+    ["Ticket", esc(p.ticket)], ["Diretório", p.cwd ? `<code>${esc(p.cwd)}</code>` : ""],
+    ["Ambiente", Object.keys(p.env).length
+      ? `<code>${Object.entries(p.env).map(([k, v]) => esc(k + "=" + v)).join("<br>")}</code>` : ""],
+  ]) + `<h3>Comando</h3><pre>${esc(p.cmd)}</pre>`
+     + `<h3>Ancestrais</h3><div class="wrap"><table id="dlg-anc"></table></div>`
+     + `<h3>Árvore</h3><div class="wrap"><table id="dlg-tree"></table></div>`
+     + (p.tickets.length ? `<h3>Ticket</h3><div class="wrap"><table id="dlg-tickets"></table></div>` : "");
+  grid("dlg-anc", PROC_COLS, p.ancestors);
+  grid("dlg-tree", PROC_COLS, p.tree);
+  if (p.tickets.length) grid("dlg-tickets", [T_ID, { k: "state", t: "estado", w: 80 }, T_TYPE, T_PEAK, T_CMD, T_END], p.tickets);
+}
+
+document.getElementById("dlg-x").onclick = () => dlg.close();
+document.getElementById("dlg-back").onclick = () => { const prev = trail.pop(); if (prev) openDetail(prev.type, prev.pid, false); };
+dlg.addEventListener("click", e => { if (e.target === dlg) dlg.close(); });  // click on the backdrop
+dlg.addEventListener("close", () => { current = null; trail = []; });
+
+const deep = location.hash.match(/^#(agent|proc)=(\d+)$/);  // direct link to a dialog: #agent=PID or #proc=PID
+if (deep) openDetail(deep[1], +deep[2], true);
 refresh(); setInterval(refresh, 2000);
 </script>
 </body>
