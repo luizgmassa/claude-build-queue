@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Fila de builds</title>
+<style>
+  body { font: 13px -apple-system, system-ui, sans-serif; margin: 16px; background: #111; color: #ddd; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  h2 { font-size: 14px; margin: 18px 0 6px; color: #9cf; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
+  th { color: #888; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .cards { display: flex; gap: 10px; flex-wrap: wrap; }
+  .card { background: #1b1b1b; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; min-width: 120px; }
+  .card b { display: block; font-size: 20px; }
+  .ok { color: #6d6; } .warn { color: #fc4; } .bad { color: #f66; }
+  code { color: #aaa; font-size: 11px; word-break: break-all; }
+  .muted { color: #777; }
+</style>
+</head>
+<body>
+<h1>Fila de builds <span id="ts" class="muted"></span></h1>
+<div class="cards" id="cards"></div>
+<div id="blocked" class="warn"></div>
+<h2>Fila (FIFO)</h2><table id="tickets"></table>
+<h2>Agentes</h2><table id="agents"></table>
+<h2>Processos</h2><table id="procs"></table>
+<h2 id="wk-title">Limpeza</h2><table id="would"></table>
+<h2>Eventos</h2><table id="events"></table>
+<script>
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const table = (id, head, rows) => {
+  document.getElementById(id).innerHTML =
+    "<tr>" + head.map(h => `<th>${h}</th>`).join("") + "</tr>" +
+    (rows.length ? rows.join("") : `<tr><td class="muted" colspan="${head.length}">vazio</td></tr>`);
+};
+const pressure = p => p >= 4 ? ["crítica","bad"] : p >= 2 ? ["alerta","warn"] : ["normal","ok"];
+const age = ts => ts ? Math.round(Date.now()/1000 - ts) + "s" : "";
+async function refresh() {
+  let v;
+  try { v = await (await fetch("/api/state")).json(); } catch (e) {
+    document.getElementById("ts").textContent = "servidor fora do ar"; return; }
+  if (!v.memory) return;
+  const m = v.memory, [pl, pc] = pressure(m.pressure);
+  document.getElementById("ts").textContent = "atualizado " + v.ts;
+  const swapCls = m.swap_used_gb / Math.max(m.swap_total_gb, 1) > .8 ? "bad" : "ok";
+  document.getElementById("cards").innerHTML = [
+    ["Vagas", `${v.used}/${v.slots}`, v.used >= v.slots ? "warn" : "ok"],
+    ["Runner GitHub", v.counts.runner ? "ocupado" : "livre", v.counts.runner ? "warn" : "ok"],
+    ["Pressão de memória", pl, pc],
+    ["Memória livre", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
+    ["RAM", `${m.app_gb} app · ${m.wired_gb} wired · ${m.compressed_gb} comp / ${m.total_gb} GB`, ""],
+    ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
+    ["Limpeza", v.enforce ? "ligada" : "simulação", v.enforce ? "ok" : "warn"],
+  ].map(([k, val, c]) => `<div class="card">${k}<b class="${c}">${esc(val)}</b></div>`).join("");
+  document.getElementById("blocked").textContent = v.blocked ? "Fila parada: " + v.blocked : "";
+  table("tickets", ["#", "estado", "agente", "pid", "espera/rodando", "comando", "fim"],
+    v.tickets.slice().reverse().map(t => `<tr><td>${t.id}</td><td>${esc(t.state)}</td><td>${esc(t.agent)}</td>
+      <td>${t.pid}</td><td>${t.state === "waiting" ? age(t.created) : t.state === "granted" ? age(t.granted) : ""}</td>
+      <td><code>${esc(t.cwd)}$ ${esc(t.cmd)}</code></td>
+      <td>${esc(t.end_reason ?? "")}${t.exit_code != null ? " (exit " + t.exit_code + ")" : ""}</td></tr>`));
+  table("agents", ["agente", "PID claude", "RSS total", "processos"],
+    v.agents.map(a => `<tr><td>${esc(a.label)}</td><td>${a.pid}${a.alive ? "" : " (morto)"}</td>
+      <td class="num">${a.rss_mb} MB</td><td class="num">${a.procs}</td></tr>`));
+  table("procs", ["PID", "PPID", "tipo", "dono", "estado", "RSS", "CPU%", "idade", "ticket", "comando"],
+    v.processes.map(p => `<tr><td>${p.pid}</td><td>${p.ppid}</td><td>${esc(p.kind)}</td><td>${esc(p.owner)}</td>
+      <td class="${p.status === "SEM VAGA" ? "bad" : ""}">${esc(p.status)}${p.serving ? " → cliente " + p.serving : ""}</td>
+      <td class="num">${p.rss_mb} MB</td><td class="num">${p.cpu}</td><td>${esc(p.etime)}</td><td>${esc(p.ticket)}</td>
+      <td><code>${esc(p.cmd)}</code></td></tr>`));
+  document.getElementById("wk-title").textContent = v.enforce ? "Limpeza (ligada: ver eventos)" : "Limpeza em simulação: mataria";
+  table("would", ["PID", "motivo"], v.would_kill.map(k => `<tr><td>${k.pid}</td><td>${esc(k.reason)}</td></tr>`));
+  table("events", ["hora", "tipo", "detalhe"],
+    v.events.map(e => `<tr><td>${e.ts}</td><td>${esc(e.kind)}</td><td>${esc(e.text)}</td></tr>`));
+}
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>
