@@ -31,12 +31,13 @@ CALLS = DATA / "calls.jsonl"  # the hook's record of each `gq run` Bash call: se
 PRESSURE_CRITICAL = 4  # kern.memorystatus_vm_pressure_level; warn (2) does not block
 
 ENV_KEYS = ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "RALPHY_STATUS_FILE", "BQ_TICKET", "GITHUB_ACTIONS")
-_ENV_RE = re.compile(r"(?:^|\s)(" + "|".join(ENV_KEYS) + r")=(\S*)")
 
 AGENT_EXEC_KINDS = {"gradle_client", "xcodebuild", "pod", "uv_run", "kotlinc", "java"}
 NONAGENT_EXEC_KINDS = {"gradle_client", "xcodebuild", "pod"}
 # Processes below these belong to a build already accounted for; they are never roots.
 INFRA_KINDS = {"gradle_daemon", "kotlin_daemon", "gradle_worker"}
+# A worker under anything else lost its parent: init, a Linux subreaper, or a reused Windows pid adopted it.
+WORKER_PARENTS = INFRA_KINDS | {"gradle_client"}
 
 
 @dataclass
@@ -55,13 +56,14 @@ class Proc:
     status: str = ""
 
 
-def parse_env(env_text):
-    return {k: v for k, v in _ENV_RE.findall(env_text)}
+def exe_name(path):
+    """Program name without directory or Windows extension: `C:/jdk/bin/java.exe` and `./gradlew.bat` too."""
+    return re.sub(r"\.(exe|bat|cmd)$", "", re.split(r"[/\\]", path)[-1].lower())
 
 
 def kind_of(args):
     first = args.split(" ", 1)[0]
-    exe = os.path.basename(first)
+    exe = exe_name(first)
     words = args.split()
     if "org.gradle.launcher.daemon.bootstrap.GradleDaemon" in args:
         return "gradle_daemon"
@@ -76,7 +78,7 @@ def kind_of(args):
         return "runner_worker"
     if exe == "claude" or "/.local/share/claude/versions/" in first:
         return "claude"
-    if re.search(r"/gq run(\s|$)", args) or args.startswith("gq run"):
+    if re.search(r"/gq(\.py)? run(\s|$)", args) or args.startswith("gq run"):
         return "gq"
     if exe == "xcodebuild":
         return "xcodebuild"
@@ -95,11 +97,13 @@ def kind_of(args):
 
 def command_type(cmd):
     """Memory class of a queued command line, used to pick its estimate."""
+    if os.name == "nt":
+        cmd = cmd.replace("\\", "/")  # posix shlex would eat the separators of C:\x\gradlew.bat
     try:
         words = shlex.split(cmd)
     except ValueError:
         words = cmd.split()
-    names = [os.path.basename(w) for w in words]
+    names = [exe_name(w) for w in words]
     if "xcodebuild" in names:
         return "xcodebuild"
     if "pod" in names and names[names.index("pod") + 1:][:1] in (["install"], ["update"]):
@@ -302,7 +306,7 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if agent_dead and p.kind in AGENT_EXEC_KINDS | {"gq"} and p.root in (p.pid, None) \
                 and p.pid not in {k[0] for k in out.kills}:
             out.kills.append((p.pid, f"órfão: agente {cp} terminou"))
-        elif p.kind == "gradle_worker" and p.ppid == 1:  # embedded_pg is ppid 1 even while in use: show only
+        elif p.kind == "gradle_worker" and getattr(procs.get(p.ppid), "kind", None) not in WORKER_PARENTS:
             out.kills.append((p.pid, "worker solto (pai morreu)"))
 
     local_active = len(granted) + len(nonagent) + len(unqueued)
@@ -407,7 +411,7 @@ def _program(words):
     """Returns (basename, rest) of the program a segment runs, skipping env assignments and wrappers."""
     i = 0
     while i < len(words):
-        w, b = words[i], os.path.basename(words[i])
+        w, b = words[i], exe_name(words[i])
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
             i += 1
         elif b in ("nohup", "time", "exec", "command", "builtin", "rtk"):
@@ -458,12 +462,16 @@ def analyze_command(cmd, depth=0):
         if prog == "gq":
             uses_gq = uses_gq or rest[:1] == ["run"]  # gq status / enforce return at once
             continue
-        if prog in ("bash", "sh", "zsh") and "-c" in rest and depth < 3:
+        inner = None
+        if prog in ("bash", "sh", "zsh") and "-c" in rest:
             k = rest.index("-c")
-            if k + 1 < len(rest):
-                o, g = analyze_command(rest[k + 1], depth + 1)
-                offending += o
-                uses_gq = uses_gq or g
+            inner = rest[k + 1] if k + 1 < len(rest) else ""
+        elif prog == "cmd" and rest[:1] and rest[0].lower() in ("/c", "//c"):  # Git Bash needs //c
+            inner = " ".join(rest[1:])
+        if inner is not None and depth < 3:
+            o, g = analyze_command(inner, depth + 1)
+            offending += o
+            uses_gq = uses_gq or g
             continue
         trig = prog in TRIGGERS or (prog == "pod" and rest[:1] in (["install"], ["update"])) \
             or (prog == "uv" and rest[:1] == ["run"])

@@ -9,6 +9,7 @@
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,6 +22,7 @@ URL = os.environ.get("BQ_URL", "http://127.0.0.1:8787")
 CONFIG = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue")) / "config.json"
 UNREACHABLE_LIMIT_S = 60
 EX_TEMPFAIL = 75
+SIGNALS = [getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK") if hasattr(signal, n)]
 
 
 def say(msg):
@@ -55,14 +57,31 @@ def agent_identity():
             "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID")}
 
 
+def windows_program(cmd):
+    """CreateProcess runs neither the `gradlew` shell script nor a `.bat` it has to find on PATH."""
+    name = cmd[0]
+    if not os.path.splitext(name)[1]:
+        name = next((name + e for e in (".bat", ".cmd", ".exe") if os.path.isfile(name + e)), name)
+    return [shutil.which(name) or name] + cmd[1:]
+
+
 def run(cmd):
+    if os.name == "nt":
+        cmd = windows_program(cmd)
     parent = os.environ.get("BQ_TICKET", "")
     if parent.isdigit():
         try:
-            if call(f"/api/ticket?id={parent}", timeout=5).get("state") == "granted":
-                os.execvp(cmd[0], cmd)  # nested call inside a granted run: same slot, no new ticket
+            granted = call(f"/api/ticket?id={parent}", timeout=5).get("state") == "granted"
         except (urllib.error.URLError, OSError, ValueError):
-            pass
+            granted = False
+        if granted:  # nested call inside a granted run: same slot, no new ticket
+            if os.name == "nt":  # Windows exec spawns and exits at once, so the caller would stop waiting
+                sys.exit(subprocess.call(cmd))
+            try:
+                os.execvp(cmd[0], cmd)
+            except OSError as e:
+                say(f"cannot start {cmd[0]}: {e}")
+                sys.exit(127)
     tid = call_retrying("/api/enqueue", {"pid": os.getpid(), "cwd": os.getcwd(), "cmd": " ".join(cmd),
                                          **agent_identity()})["id"]
     released = False
@@ -80,7 +99,7 @@ def run(cmd):
         release(128 + signum)
         sys.exit(128 + signum)
 
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for s in SIGNALS:
         signal.signal(s, abort)
 
     last, started = None, time.time()
@@ -105,12 +124,14 @@ def run(cmd):
         sys.exit(127)
 
     def forward(signum, _frame):
+        if os.name == "nt" and signum != signal.SIGTERM:
+            return  # Ctrl+C and Ctrl+Break already reach the child through the shared console
         try:
             child.send_signal(signum)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
 
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for s in SIGNALS:
         signal.signal(s, forward)
     code = child.wait()
     code = code if code >= 0 else 128 - code
@@ -120,11 +141,11 @@ def run(cmd):
 
 def status():
     v = call("/api/state", timeout=5)
-    m = v["memory"]
+    m = v.get("memory") or {}  # empty until the server's first tick
     print(f"slots {v['used']}/{v['slots']} (base {v.get('base_slots')}, max {v.get('max_slots')}, "
           f"avail {v.get('avail_gb')} GB)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
-          f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
-          f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB")
+          f"enforce={'on' if v['enforce'] else 'off'}  pressure={m.get('pressure', '?')}  "
+          f"free={m.get('free_pct', '?')}%  swap={m.get('swap_used_gb', '?')}/{m.get('swap_total_gb', '?')} GB")
     if v["blocked"]:
         print(f"blocked: {v['blocked']}")
     for t in v["tickets"]:

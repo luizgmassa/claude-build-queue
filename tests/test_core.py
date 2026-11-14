@@ -132,6 +132,40 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(pl.kills, [(712, "worker solto (pai morreu)")])
 
 
+class CrossPlatform(unittest.TestCase):
+    def test_exe_name_drops_directory_case_and_windows_extension(self):
+        for path, name in [("C:/jdk/bin/java.exe", "java"), ("./gradlew.bat", "gradlew"), ("C:\\u\\uv.EXE", "uv"),
+                           ("/usr/bin/java", "java"), ("gradlew", "gradlew"), ("x.cmd", "x")]:
+            self.assertEqual(core.exe_name(path), name, path)
+
+    def test_windows_command_lines_get_the_same_kinds(self):
+        for args, kind in [("C:/Users/u/.local/bin/claude.exe --resume", "claude"),
+                           ("C:/py/python.exe C:/r/bq/gq.py run -- ./gradlew.bat x", "gq"),
+                           ("C:/uv/uv.exe run x.py", "uv_run"), ("C:/jdk/bin/java.exe -jar x.jar", "java"),
+                           ("C:/jdk/bin/java.exe -cp x org.gradle.wrapper.GradleWrapperMain check", "gradle_client"),
+                           ("C:/pg/bin/postgres.exe -D C:/t/embedded-pg/x", "embedded_pg")]:
+            self.assertEqual(core.kind_of(args), kind, args)
+
+    def test_windows_gradle_wrapper_gets_its_command_type(self):
+        self.assertEqual(core.command_type("./gradlew.bat :shared:check"), "gradle-check")
+        self.assertEqual(core.command_type("gradlew.bat ktlintFormat"), "gradle-lint")
+
+    def test_hook_catches_windows_spellings_and_cmd_wrapper(self):
+        for cmd in ["./gradlew.bat check", "gradlew.bat build", "java.exe -jar x.jar", "cmd //c gradlew.bat build",
+                    "cmd /c \"gradlew.bat test\""]:
+            self.assertTrue(core.analyze_command(cmd)[0], cmd)
+        self.assertEqual(core.analyze_command("gq run -- ./gradlew.bat x"), ([], True))
+        self.assertEqual(core.analyze_command("cmd //c gq run -- gradlew.bat x"), ([], True))
+
+    def test_worker_whose_parent_is_not_gradle_is_orphaned_wherever_it_was_adopted(self):
+        worker = "/jdk/bin/java worker.org.gradle.process.internal.worker.GradleWorkerMain"
+        procs = world(P(50, 1, "/usr/lib/systemd/systemd --user"),  # Linux subreaper
+                      P(60, 101, CLIENT, CLAUDE_PID=100),
+                      P(711, 50, worker, CLAUDE_PID=100), P(712, 999, worker, CLAUDE_PID=100),
+                      P(713, 60, worker, CLAUDE_PID=100))
+        kills = [k for k in tick(procs).kills if k[1] == "worker solto (pai morreu)"]
+        self.assertEqual(sorted(k[0] for k in kills), [711, 712])
+
 class Hook(unittest.TestCase):
     def offending(self, cmd):
         return core.analyze_command(cmd)[0]

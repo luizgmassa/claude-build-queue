@@ -7,9 +7,7 @@ read, so agents never race each other: the lock serializes them and the tick dec
 import json
 import os
 import re
-import signal
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -20,68 +18,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bq import core  # noqa: E402
+from bq import core, system  # noqa: E402
+from bq.system import log  # noqa: E402
 
 PORT = int(os.environ.get("BQ_PORT", "8787"))
 DATA = core.DATA
 CONFIG = DATA / "config.json"
 PAGE = Path(__file__).with_name("page.html")
 TICK_S = 2.0
-
-
-def run(cmd, timeout=15):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
-    except (subprocess.SubprocessError, OSError) as e:
-        log(f"command failed: {cmd[0]}: {e}")
-        return ""
-
-
-def log(msg):
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, file=sys.stderr, flush=True)
-
-
-def snapshot_procs():
-    fmt = "pid=,ppid=,rss=,pcpu=,etime=,stat=,lstart=,command="
-    with_env = run(["ps", "-axEww", "-o", fmt])
-    plain = run(["ps", "-axww", "-o", fmt])
-    envs = {}
-    for line in with_env.splitlines():
-        parts = line.split(None, 11)
-        if len(parts) == 12:
-            envs[int(parts[0])] = parts[11]
-    procs = {}
-    for line in plain.splitlines():
-        parts = line.split(None, 11)
-        if len(parts) < 12 or parts[5].startswith("Z"):  # a zombie is dead even before its parent reaps it
-            continue
-        pid = int(parts[0])
-        args = parts[11]
-        full = envs.get(pid, "")
-        env_text = full[len(args):] if full.startswith(args) else ""
-        procs[pid] = core.Proc(pid=pid, ppid=int(parts[1]), rss_kb=int(parts[2]), cpu=float(parts[3]),
-                               etime=parts[4], lstart=" ".join(parts[6:11]), args=args,
-                               env=core.parse_env(env_text))
-    return procs
-
-
-def tcp_links():
-    """Returns (listen ports by pid, established (pid, local, remote) triples) for java processes."""
-    out = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN,ESTABLISHED", "-a", "-c", "java", "-F", "pnT"])
-    listen, est, pid, name = {}, [], None, None
-    for line in out.splitlines():
-        tag, val = line[:1], line[1:]
-        if tag == "p":
-            pid = int(val)
-        elif tag == "n":
-            name = val
-        elif tag == "T" and val.startswith("ST=") and pid and name:
-            if val == "ST=LISTEN":
-                listen.setdefault(pid, set()).add(name.rsplit(":", 1)[-1])
-            elif val == "ST=ESTABLISHED" and "->" in name:
-                local, remote = name.split("->", 1)
-                est.append((pid, local.rsplit(":", 1)[-1], remote.rsplit(":", 1)[-1]))
-    return listen, est
 
 
 def busy_daemons(procs, listen, est):
@@ -113,44 +57,6 @@ def ticket_rss_gb(gq_pid, tid, procs, serving, kotlin_of):
     return sum(procs[x].rss_kb for x in pids if x in procs) / 1024 ** 2
 
 
-def memory():
-    names = ["hw.memsize", "vm.swapusage", "kern.memorystatus_vm_pressure_level", "kern.memorystatus_level",
-             "hw.pagesize"]
-    vals = {}
-    for line in run(["sysctl"] + names).splitlines():
-        k, _, v = line.partition(":")
-        vals[k.strip()] = v.strip()
-    swap = dict(re.findall(r"(total|used|free) = ([\d.]+)M", vals.get("vm.swapusage", "")))
-    page = int(vals.get("hw.pagesize", "16384") or 16384)
-    vm = {}
-    for line in run(["vm_stat"]).splitlines():
-        m = re.match(r'"?([^":]+)"?:\s+(\d+)', line)
-        if m:
-            vm[m.group(1).strip()] = int(m.group(2)) * page
-    gb = 1024 ** 3
-    total = int(vals.get("hw.memsize", "0") or 0)
-    app = vm.get("Anonymous pages", 0) - vm.get("Pages purgeable", 0)
-    return {
-        "total_gb": round(total / gb, 1),
-        "app_gb": round(app / gb, 1),
-        "wired_gb": round(vm.get("Pages wired down", 0) / gb, 1),
-        "compressed_gb": round(vm.get("Pages occupied by compressor", 0) / gb, 1),
-        "cached_gb": round(vm.get("File-backed pages", 0) / gb, 1),
-        "free_gb": round(vm.get("Pages free", 0) / gb, 1),
-        "free_pct": int(vals.get("kern.memorystatus_level", "0") or 0),
-        "pressure": int(vals.get("kern.memorystatus_vm_pressure_level", "1") or 1),
-        "swap_used_gb": round(float(swap.get("used", 0)) / 1024, 1),
-        "swap_total_gb": round(float(swap.get("total", 0)) / 1024, 1),
-    }
-
-
-def cwd_of(pid):
-    for line in run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=5).splitlines():
-        if line.startswith("n"):
-            return line[1:]
-    return ""
-
-
 def read_calls():
     """The hook's recent `gq run` records; trims the file once it passes 1 MB."""
     try:
@@ -163,8 +69,11 @@ def read_calls():
         return []
     if size > 1 << 20:  # shortcut: a hook append racing this rewrite is lost; it only costs one label
         tmp = core.CALLS.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines) + "\n")
-        os.replace(tmp, core.CALLS)
+        try:
+            tmp.write_text("\n".join(lines) + "\n")
+            os.replace(tmp, core.CALLS)
+        except OSError:
+            pass  # Windows refuses the replace while a hook holds the file open; the next read retries
     out = []
     for line in lines:
         try:
@@ -285,9 +194,9 @@ class Queue:
 
     def tick(self):
         snap_ts = time.time()
-        procs = snapshot_procs()
-        listen, est = tcp_links()
-        mem = memory()
+        procs = system.snapshot_procs()
+        listen, est = system.tcp_links(procs)
+        mem = system.memory()
         roots = core.classify(procs, protected_pids={os.getpid()})
         busy, serving, kotlin_of = busy_daemons(procs, listen, est)
         now = time.time()
@@ -350,13 +259,11 @@ class Queue:
                 continue
             if pid in self.pending_kills:
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
+            err = system.stop(pid)
+            if err:
+                self.event("erro", err)
+            else:
                 self.pending_kills[pid] = (p.lstart, time.time() + core.TERM_GRACE_S, reason)
-            except ProcessLookupError:
-                pass
-            except PermissionError as e:
-                self.event("erro", f"sem permissão para matar {pid}: {e}")
         p = procs.get(root)
         self.event("kill", f"SIGTERM {root} ({p.kind if p else '?'}): {reason}")
 
@@ -367,11 +274,8 @@ class Queue:
             if p is None or p.lstart != start:
                 del self.pending_kills[pid]
             elif now >= deadline:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    self.event("kill", f"SIGKILL {pid} após {core.TERM_GRACE_S}s: {reason}")
-                except ProcessLookupError:
-                    pass
+                err = system.stop(pid, hard=True)
+                self.event("erro" if err else "kill", err or f"SIGKILL {pid} após {core.TERM_GRACE_S}s: {reason}")
                 del self.pending_kills[pid]
 
     # ------------------------------------------------------------ view
@@ -423,7 +327,7 @@ class Queue:
                        tree_rss_mb=tree_kb // 1024, tree_ram_pct=round(100 * tree_kb / total_kb, 2) if total_kb else 0,
                        tickets=self.ticket_rows("id=?", (int(p.env["BQ_TICKET"]),))
                        if p.env.get("BQ_TICKET", "").isdigit() else [])
-        out["cwd"] = cwd_of(pid)  # lsof outside the lock: it can take a moment
+        out["cwd"] = system.cwd_of(pid)  # outside the lock: it can take a moment
         return out
 
     def agent_details(self, claude_pid):
@@ -609,6 +513,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global Q
+    DATA.mkdir(parents=True, exist_ok=True)
+    if sys.stderr is None:  # pythonw on Windows has no console: keep the log in the data dir
+        sys.stderr = open(DATA / "server.log", "a", buffering=1)
     Q = Queue()
     if not CONFIG.exists():
         CONFIG.write_text(json.dumps({"enforce": False}, indent=1))

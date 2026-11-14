@@ -177,7 +177,8 @@ async function refresh() {
     ["Runner GitHub", v.counts.runner ? "ocupado" : "livre", v.counts.runner ? "warn" : "ok"],
     ["Pressão de memória", pl, pc],
     ["Memória livre", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
-    ["RAM", `${m.app_gb} app · ${m.wired_gb} wired · ${m.compressed_gb} comp / ${m.total_gb} GB`, ""],
+    ["RAM", [`${m.app_gb} app`, m.wired_gb != null && `${m.wired_gb} wired`, m.compressed_gb != null && `${m.compressed_gb} comp`]
+      .filter(Boolean).join(" · ") + ` / ${m.total_gb} GB`, ""],
     ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
     ["Limpeza", v.enforce ? "ligada" : "simulação", v.enforce ? "ok" : "warn"],
   ].map(([k, val, c]) => `<div class="card">${k}<b class="${c}">${esc(val)}</b></div>`).join("");
