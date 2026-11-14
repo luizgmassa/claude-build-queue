@@ -156,7 +156,8 @@ def status():
         print(f"blocked: {v['blocked']}")
     for t in v["tickets"]:
         if t["state"] != "done":
-            print(f"#{t['id']} {t['state']:8} {t['agent']}  {t['cmd'][:90]}")
+            ended = " (ended)" if t.get("agent_alive") is False else ""
+            print(f"#{t['id']} {t['state']:8} {t['agent']}{ended}  {t['cmd'][:90]}")
 
 
 def enforce(flag):
