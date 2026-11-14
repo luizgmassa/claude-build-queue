@@ -140,12 +140,18 @@ def run(cmd):
 
 
 def status():
-    v = call("/api/state", timeout=5)
-    m = v.get("memory") or {}  # empty until the server's first tick
+    for _ in range(20):  # the view is empty until the server's first tick
+        v = call("/api/state", timeout=5)
+        if v:
+            break
+        time.sleep(0.5)
+    else:
+        sys.exit("build-queue server is up but has not finished its first scan yet")
+    m = v["memory"]
     print(f"slots {v['used']}/{v['slots']} (base {v.get('base_slots')}, max {v.get('max_slots')}, "
           f"avail {v.get('avail_gb')} GB)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
-          f"enforce={'on' if v['enforce'] else 'off'}  pressure={m.get('pressure', '?')}  "
-          f"free={m.get('free_pct', '?')}%  swap={m.get('swap_used_gb', '?')}/{m.get('swap_total_gb', '?')} GB")
+          f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
+          f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB")
     if v["blocked"]:
         print(f"blocked: {v['blocked']}")
     for t in v["tickets"]:
