@@ -3,17 +3,18 @@
 Nothing here touches the system, so every rule is unit-testable with synthetic input.
 """
 
-import math
 import os
 import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SLOTS = 2  # base limit, runner included
-GB_PER_SLOT = 6  # slot ceiling = RAM / 6 GB, rounded up: 16 GB -> 3, 24 -> 4, 32 -> 6, 48 -> 8
-HEADROOM_GB = 6.0  # available memory that must remain after the next item's estimate
-RAISE_GAP_S = 30  # a new build needs time to reach its peak before memory is judged again
+SLOTS = 2  # base slots, runner included: these never wait on a memory check
+HEADROOM_GB = 6.0  # available memory that must remain after peak reserves and the next item's estimate
+EXTRA_GAP_S = 30  # a new build needs time to show its memory before the next extra entry is judged
+SWAP_GROWTH_GB = 0.5  # swap growing this much within SWAP_WINDOW_S stops extra entries
+SWAP_WINDOW_S = 60
+RUNNER_CTYPE = "gradle-check"  # the runner's peak reserve uses this command type's estimate
 PEAK_HISTORY = 5  # estimate = largest of the last N measured peaks of the same command type
 # Starting estimates (GB of the whole build: client, daemon, workers, Kotlin daemon) before any measurement.
 DEFAULT_GB = {"gradle-check": 8.0, "gradle-backend": 6.0, "gradle-ios": 6.0, "gradle-test": 5.0,
@@ -43,20 +44,16 @@ EN = {
     "kill.orphan": "orphan: agent {pid} ended",
     "kill.loose_worker": "loose worker (parent died)",
     "kill.idle_daemon": "idle daemon",
-    "refusal.ceiling": "ceiling of {ceiling} slots",
+    "refusal.ceiling": "configured max of {ceiling} slots",
     "refusal.gap": "next extra slot in {s}s",
-    "refusal.headroom": "extra slot refused: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) "
-                        "< {headroom_gb} GB headroom",
-    "refusal.taken": "extra slot taken by runs that do not wait",
+    "refusal.swap": "swap grew {gb} GB in the last {s}s (limit {limit_gb} GB)",
+    "refusal.headroom": "extra slot refused: {avail_gb} GB available − {reserve_gb} GB reserved for running "
+                        "peaks − {est_gb} GB estimated ({ctype}) < {headroom_gb} GB headroom",
     "blocked.pressure": "critical memory pressure",
     "blocked.daemon": "waiting for an idle daemon to end",
-    "blocked.no_slot": "no slot ({used}/{limit} in use); {why}",
-    "limit.raised": "limit {old}→{new}: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) "
-                    "≥ {headroom_gb} GB headroom",
-    "limit.raised_taken": "limit {old}→{new}: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) "
-                          "≥ {headroom_gb} GB headroom; nobody enters: {used} in use "
-                          "(runner or build outside the queue)",
-    "limit.lowered": "limit {old}→{new}: {n} run(s) ended",
+    "blocked.no_slot": "base slots full ({used} in use, base {base}); {why}",
+    "extra.granted": "ticket #{id} entered above the base: {avail_gb} GB available − {reserve_gb} GB reserved "
+                     "− {est_gb} GB estimated ({ctype}) ≥ {headroom_gb} GB headroom",
     "event.enqueue": "ticket #{id} pid {pid}: {cmd}",
     "event.grant": "ticket #{id} got a slot",
     "event.release": "ticket #{id} released its slot (exit {exit})",
@@ -188,6 +185,12 @@ def command_type(cmd):
     except ValueError:
         words = cmd.split()
     names = [exe_name(w) for w in words]
+    wrapper = next((k for k, w in enumerate(words)
+                    if w.endswith(("GradleWrapperMain", "gradle-wrapper.jar")) and "gradlew" not in names), None)
+    if wrapper is not None:  # the Java client `./gradlew` execs into: the tasks follow the wrapper's main class
+        if words[wrapper].endswith(".jar") and words[wrapper + 1:wrapper + 2] == ["org.gradle.wrapper.GradleWrapperMain"]:
+            wrapper += 1
+        names[wrapper] = "gradlew"
     if "xcodebuild" in names:
         return "xcodebuild"
     if "pod" in names and names[names.index("pod") + 1:][:1] in (["install"], ["update"]):
@@ -317,40 +320,47 @@ class Plan:
     used: int = 0
     runner_busy: bool = False
     counts: dict = field(default_factory=dict)
-    limit: int = SLOTS
-    raised: dict | None = None  # message explaining this tick's raise, if any
-    lowered: int = 0  # slot holders that ended since the last tick
-    holders: set = field(default_factory=set)  # slot holders after this tick's grants
+    extra: dict | None = None  # message explaining this tick's entry above the base, if any
+    reserve_gb: float = 0.0  # memory running builds are still expected to take before their peak
 
 
-def max_slots(total_gb):
-    """Slot ceiling for a machine with this much RAM, never below the base."""
-    return max(SLOTS, math.ceil(round(total_gb / GB_PER_SLOT, 6)))
+def swap_growth_gb(samples, now):
+    """How much swap grew within SWAP_WINDOW_S: newest sample minus the lowest one in the window."""
+    recent = [gb for ts, gb in samples if now - ts <= SWAP_WINDOW_S]
+    return recent[-1] - min(recent) if recent else 0.0
 
 
-def raise_refusal(*, used, limit, now, last_raise_ts, avail_gb, est, ceiling):
-    """Message saying why one more slot cannot open now, or None when it can."""
+def peak_reserve_gb(runs):
+    """Memory still to come from running builds: each (estimate, current) pair below its estimate."""
+    return sum(max(0.0, est - cur) for est, cur in runs)
+
+
+def extra_refusal(*, used, now, last_extra_ts, avail_gb, reserve_gb, est, ceiling, swap_gb):
+    """Message saying why the head cannot enter above the base slots now, or None when it can."""
     ctype, gb = est
-    if limit + 1 > ceiling:
+    if ceiling is not None and used >= ceiling:
         return msg("refusal.ceiling", ceiling=ceiling)
-    if last_raise_ts is not None and now - last_raise_ts < RAISE_GAP_S:
-        return msg("refusal.gap", s=int(RAISE_GAP_S - (now - last_raise_ts)))
-    if avail_gb - gb < HEADROOM_GB:
-        return msg("refusal.headroom", avail_gb=f"{avail_gb:.1f}", est_gb=f"{gb:.1f}", ctype=ctype,
-                   headroom_gb=f"{HEADROOM_GB:.0f}")
+    if swap_gb >= SWAP_GROWTH_GB:
+        return msg("refusal.swap", gb=f"{swap_gb:.1f}", s=SWAP_WINDOW_S, limit_gb=f"{SWAP_GROWTH_GB:.1f}")
+    if last_extra_ts is not None and now - last_extra_ts < EXTRA_GAP_S:
+        return msg("refusal.gap", s=int(EXTRA_GAP_S - (now - last_extra_ts)))
+    if avail_gb - reserve_gb - gb < HEADROOM_GB:
+        return msg("refusal.headroom", avail_gb=f"{avail_gb:.1f}", reserve_gb=f"{reserve_gb:.1f}",
+                   est_gb=f"{gb:.1f}", ctype=ctype, headroom_gb=f"{HEADROOM_GB:.0f}")
     return None
 
 
 def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idle_since, last_grant_ts,
-         live_claude_pids, limit=SLOTS, prev_holders=frozenset(), last_raise_ts=None, avail_gb=0.0,
-         estimates=None, ceiling=SLOTS):
+         live_claude_pids, last_extra_ts=None, avail_gb=0.0, estimates=None, ceiling=None, swap_gb=0.0,
+         rss_gb=None, peaks=None):
     """One scheduling tick. Pure: the caller applies the result under its lock.
 
-    The limit rises one slot at a time above SLOTS when memory allows the head item, and drops one slot
-    per slot holder that ended, never below SLOTS.
+    The first SLOTS runs enter freely. Each one above them needs memory for its estimate after the peak
+    reserve of every running build (`rss_gb`: current GB per holder key, "t<ticket id>", "p<root pid>" or
+    "runner"), swap that is not growing, EXTRA_GAP_S since the last extra entry and the configured max.
     """
     out = Plan()
-    estimates = estimates or {}
+    estimates, rss_gb, peaks = estimates or {}, rss_gb or {}, peaks or {}
     live = []
     for t in tickets:
         p = procs.get(t.pid)
@@ -418,11 +428,12 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         killed_daemon = True
 
     out.used = int(out.runner_busy) + local_active
-    holders = {f"t{t.id}" for t in granted} | {f"p{r.pid}@{r.lstart}" for r in nonagent + unqueued}
+    default = ("other", DEFAULT_GB["other"])
+    runs = [(estimates.get(t.id, default)[1], rss_gb.get(f"t{t.id}", 0.0)) for t in granted]
+    runs += [(estimate_gb(command_type(r.args), peaks), rss_gb.get(f"p{r.pid}", 0.0)) for r in nonagent + unqueued]
     if out.runner_busy:
-        holders.add("runner")
-    out.lowered = len(set(prev_holders) - holders)
-    limit = max(SLOTS, limit - out.lowered)
+        runs.append((estimate_gb(RUNNER_CTYPE, peaks), rss_gb.get("runner", 0.0)))
+    reserve = peak_reserve_gb(runs)
     out.counts = {"granted": len(granted), "nonagent": len(nonagent), "unqueued": len(unqueued),
                   "runner": int(out.runner_busy), "local_active": local_active}
     waiting = sorted((t for t in live if t.state == "waiting"), key=lambda t: t.id)
@@ -434,29 +445,23 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if killed_daemon:
             out.blocked = msg("blocked.daemon")
             break
-        if used >= limit:
-            est = estimates.get(t.id, ("other", DEFAULT_GB["other"]))
-            why = raise_refusal(used=used, limit=limit, now=now, last_raise_ts=last_raise_ts,
-                                avail_gb=avail_gb, est=est, ceiling=ceiling)
+        est = estimates.get(t.id, default)
+        if used >= SLOTS:
+            why = extra_refusal(used=used, now=now, last_extra_ts=last_extra_ts, avail_gb=avail_gb,
+                                reserve_gb=reserve, est=est, ceiling=ceiling, swap_gb=swap_gb)
             if why:
-                out.blocked = msg("blocked.no_slot", used=used, limit=limit, why=why)
+                out.blocked = msg("blocked.no_slot", used=used, base=SLOTS, why=why)
                 break
-            out.raised = msg("limit.raised", old=limit, new=limit + 1, avail_gb=f"{avail_gb:.1f}",
-                             est_gb=f"{est[1]:.1f}", ctype=est[0], headroom_gb=f"{HEADROOM_GB:.0f}")
-            limit += 1  # one slot per raise, even when runs that never wait already hold more than the limit
-            last_raise_ts = now  # one raise per RAISE_GAP_S, so at most one per tick
-            if used >= limit:
-                out.raised = msg("limit.raised_taken", **out.raised["params"], used=used)
-                out.blocked = msg("blocked.no_slot", used=used, limit=limit, why=msg("refusal.taken"))
-                break
+            out.extra = msg("extra.granted", id=t.id, avail_gb=f"{avail_gb:.1f}", reserve_gb=f"{reserve:.1f}",
+                            est_gb=f"{est[1]:.1f}", ctype=est[0], headroom_gb=f"{HEADROOM_GB:.0f}")
+            last_extra_ts = now  # one extra entry per EXTRA_GAP_S, so at most one per tick
         out.grants.append(t.id)
-        holders.add(f"t{t.id}")
+        reserve += est[1]  # it has not started yet: its whole estimate is still to come
         used += 1
         local_active += 1
     out.used = used  # after this tick's grants, the same count the blocked message shows
     out.counts["local_active"] = local_active
-    out.limit = limit
-    out.holders = holders
+    out.reserve_gb = reserve
     return out
 
 

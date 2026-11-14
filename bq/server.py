@@ -48,8 +48,15 @@ def busy_daemons(procs, listen, est):
 def ticket_rss_gb(gq_pid, tid, procs, serving, kotlin_of):
     """Memory of one queued build: its own tree, the Gradle daemon serving it with that daemon's workers,
     and the Kotlin daemon that daemon talks to."""
-    own = {gq_pid, *core.descendants(gq_pid, procs)} | {p.pid for p in procs.values()
-                                                       if p.env.get("BQ_TICKET") == str(tid)}
+    return tree_rss_gb({gq_pid} | {p.pid for p in procs.values() if p.env.get("BQ_TICKET") == str(tid)},
+                       procs, serving, kotlin_of)
+
+
+def tree_rss_gb(tops, procs, serving, kotlin_of):
+    """Memory of a build started at these pids, with the daemons serving it (see ticket_rss_gb)."""
+    own = set(tops)
+    for top in tops:
+        own.update(core.descendants(top, procs))
     daemons = {d for d, client in serving.items() if client in own}
     pids = set(own) | daemons
     for d in daemons:
@@ -146,9 +153,8 @@ class Queue:
         self.last_grant = None
         self.view = {}
         self.blocked = None  # message
-        self.limit = core.SLOTS  # restarts at the base: running builds above it just block new ones
-        self.holders = set()
-        self.last_raise = None
+        self.last_extra = None
+        self.swap_samples = deque()  # (ts, swap used GB) within core.SWAP_WINDOW_S
         self.peak = {}  # granted ticket id -> largest memory seen, GB
         self.taken_calls = set()  # hook records already matched to a ticket
         self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
@@ -160,11 +166,20 @@ class Queue:
         self.events.appendleft({"ts": time.strftime("%H:%M:%S"), "kind": kind, "msg": m})
         log(f"{kind}: {core.render(m)}")
 
-    def enforce(self):
+    def config(self):
         try:
-            return bool(json.loads(CONFIG.read_text()).get("enforce", False))
+            cfg = json.loads(CONFIG.read_text())
+            return cfg if isinstance(cfg, dict) else {}
         except (OSError, ValueError):
-            return False
+            return {}
+
+    def enforce(self):
+        return bool(self.config().get("enforce", False))
+
+    def ceiling(self):
+        """Configured max slots (`gq config max N`), or None when off."""
+        n = self.config().get("max")
+        return max(core.SLOTS, n) if isinstance(n, int) and not isinstance(n, bool) else None
 
     def active_tickets(self):
         rows = self.db.execute("select id, pid, state, created, granted, pid_start from tickets "
@@ -186,9 +201,8 @@ class Queue:
             out.setdefault(ctype, []).append(gb)
         return out
 
-    def estimates(self):
-        peaks = self.peaks()
-        rows = self.db.execute("select id, coalesce(ctype, 'other') from tickets where state='waiting'")
+    def estimates(self, peaks):
+        rows = self.db.execute("select id, coalesce(ctype, 'other') from tickets where state in ('waiting','granted')")
         return {tid: (ctype, core.estimate_gb(ctype, peaks)) for tid, ctype in rows}
 
     # ------------------------------------------------------------ scheduler tick
@@ -212,24 +226,31 @@ class Queue:
                 del self.idle_since[pid]
         live_claude = {p.pid for p in procs.values() if p.kind == "claude"}
         enforce = self.enforce()
+        rss = {f"p{r.pid}": tree_rss_gb({r.pid}, procs, serving, kotlin_of) for r in roots}
+        workers = {p.pid for p in procs.values() if p.kind == "runner_worker"}
+        rss["runner"] = tree_rss_gb(workers, procs, serving, kotlin_of)
+        self.swap_samples.append((now, mem["swap_used_gb"]))
+        while now - self.swap_samples[0][0] > core.SWAP_WINDOW_S:
+            self.swap_samples.popleft()
+        swap_gb = core.swap_growth_gb(self.swap_samples, now)
+        ceiling = self.ceiling()
         with self.lock:
             tickets = self.active_tickets()
             for t in tickets:
                 if t.state == "granted" and t.pid in procs:
                     gb = ticket_rss_gb(t.pid, t.id, procs, serving, kotlin_of)
+                    rss[f"t{t.id}"] = gb
                     self.peak[t.id] = max(self.peak.get(t.id, 0.0), gb)
             avail = mem["total_gb"] * mem["free_pct"] / 100
+            peaks = self.peaks()
             pl = core.plan(procs, roots, tickets, snapshot_ts=snap_ts, now=now, pressure=mem["pressure"],
                            busy_daemons=busy, idle_since=self.idle_since, last_grant_ts=self.last_grant,
-                           live_claude_pids=live_claude, limit=self.limit, prev_holders=self.holders,
-                           last_raise_ts=self.last_raise, avail_gb=avail, estimates=self.estimates(),
-                           ceiling=core.max_slots(mem["total_gb"]))
-            if pl.lowered and pl.limit < self.limit:
-                self.event("limit", core.msg("limit.lowered", old=self.limit, new=pl.limit, n=pl.lowered))
-            if pl.raised:
-                self.last_raise = now
-                self.event("limit", pl.raised)
-            self.limit, self.holders = pl.limit, pl.holders
+                           live_claude_pids=live_claude, last_extra_ts=self.last_extra, avail_gb=avail,
+                           estimates=self.estimates(peaks), ceiling=ceiling, swap_gb=swap_gb, rss_gb=rss,
+                           peaks=peaks)
+            if pl.extra:
+                self.last_extra = now
+                self.event("extra", pl.extra)
             for tid, start in pl.pid_starts.items():
                 self.db.execute("update tickets set pid_start=? where id=?", (start, tid))
             for tid, reason in pl.reaps:
@@ -250,7 +271,7 @@ class Queue:
                     would_kill.append({"pid": pid, "reason": reason})  # reason is a message
             self.escalate(procs)
             self.procs, self.mem, self.serving = procs, mem, serving
-            self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill)
+            self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill, ceiling, swap_gb)
 
     def kill(self, root, reason, procs):
         tree = [root] + core.descendants(root, procs)
@@ -361,7 +382,7 @@ class Queue:
                     "total_gb": mem["total_gb"], "avail_gb": round(avail_kb / 1024 ** 2, 1),
                     "procs": rows, "tickets": tickets}
 
-    def build_view(self, procs, roots, pl, mem, serving, enforce, would_kill):
+    def build_view(self, procs, roots, pl, mem, serving, enforce, would_kill, ceiling, swap_gb):
         agents = {}
         for p in procs.values():
             if p.kind == "claude":
@@ -389,9 +410,10 @@ class Queue:
             if t["state"] == "granted":
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
         return {
-            "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "slots": pl.limit, "used": pl.used,
-            "base_slots": core.SLOTS, "max_slots": core.max_slots(mem["total_gb"]), "headroom_gb": core.HEADROOM_GB,
-            "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1),
+            "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "used": pl.used,
+            "base_slots": core.SLOTS, "max_slots": ceiling, "headroom_gb": core.HEADROOM_GB,
+            "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1), "reserve_gb": round(pl.reserve_gb, 1),
+            "swap_growth_gb": round(swap_gb, 1), "swap_growth_limit_gb": core.SWAP_GROWTH_GB,
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
             "would_kill": would_kill,

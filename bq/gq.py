@@ -4,6 +4,7 @@
   gq run -- ./gradlew :shared:check     wait in FIFO order, run, release the slot on exit
   gq status                             show slots and queue
   gq enforce on|off                     turn the automatic cleanup kills on or off
+  gq config max N|off                   cap the slots at N (at least 2), or no cap (default)
 """
 
 import json
@@ -22,6 +23,7 @@ URL = os.environ.get("BQ_URL", "http://127.0.0.1:8787")
 CONFIG = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue")) / "config.json"
 UNREACHABLE_LIMIT_S = 60
 EX_TEMPFAIL = 75
+BASE_SLOTS = 2  # core.SLOTS; gq stays standard-library only, so it does not import bq.core
 SIGNALS = [getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK") if hasattr(signal, n)]
 
 
@@ -148,8 +150,9 @@ def status():
     else:
         sys.exit("build-queue server is up but has not finished its first scan yet")
     m = v["memory"]
-    print(f"slots {v['used']}/{v['slots']} (base {v.get('base_slots')}, max {v.get('max_slots')}, "
-          f"avail {v.get('avail_gb')} GB)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
+    print(f"slots {v['used']} in use (base {v.get('base_slots')}, max {v.get('max_slots') or 'off'}, "
+          f"avail {v.get('avail_gb')} GB, reserved {v.get('reserve_gb')} GB, "
+          f"swap +{v.get('swap_growth_gb')} GB/60s)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
           f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
           f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB")
     if v["blocked"]:
@@ -160,14 +163,38 @@ def status():
             print(f"#{t['id']} {t['state']:8} {t['agent']}{ended}  {t['cmd'][:90]}")
 
 
-def enforce(flag):
+def set_config(key, value):
+    """Changes one key of config.json, keeping the others, and wakes the server to apply it."""
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if value is None:
+        cfg.pop(key, None)
+    else:
+        cfg[key] = value
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps({"enforce": flag == "on"}, indent=1))
+    CONFIG.write_text(json.dumps(cfg, indent=1))
     try:
         call("/api/wake", timeout=5)
     except (urllib.error.URLError, OSError, ValueError):
         pass
+
+
+def enforce(flag):
+    set_config("enforce", flag == "on")
     print(f"enforce {flag}")
+
+
+def config_max(value):
+    if value == "off":
+        set_config("max", None)
+        return print("max off")
+    if not value.isdigit() or int(value) < BASE_SLOTS:
+        sys.exit(f"max must be off or a whole number of at least {BASE_SLOTS}")
+    set_config("max", int(value))
+    print(f"max {int(value)}")
 
 
 def main(argv):
@@ -181,6 +208,8 @@ def main(argv):
         return status()
     elif argv[:1] == ["enforce"] and argv[1:2] in (["on"], ["off"]):
         return enforce(argv[1])
+    elif argv[:2] == ["config", "max"] and len(argv) == 3:
+        return config_max(argv[2])
     print(__doc__, file=sys.stderr)
     sys.exit(2)
 

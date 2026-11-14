@@ -18,12 +18,15 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 - **2 vagas**, contando o runner self-hosted do GitHub (`Runner.Worker` vivo = 1 vaga). O runner nunca
   espera: se chega com 2 builds locais rodando, fica 3 até um terminar, e ninguém novo entra.
 - **FIFO estrito**: só o primeiro da fila pode entrar.
-- **Limite dinâmico, de 2 vagas até um teto dado pela RAM da máquina**: RAM ÷ 6 GB, arredondado para cima
-  (16 GB → 3, 24 GB → 4, 32 GB → 6, 48 GB → 8; nunca abaixo de 2). Com a fila cheia, o limite sobe 1 vaga para o primeiro da fila só se:
-  a pressão não está crítica, passaram 30 s desde a última subida, e a memória disponível do sistema menos a
-  estimativa do item deixa ≥ 6 GB de folga. Cada execução que termina baixa o limite em 1 (nunca abaixo de 2);
-  a próxima subida passa pela mesma análise. Cada subida soma exatamente 1 vaga: se quem não espera (runner,
-  build fora de agente) já ocupa essa vaga, ninguém entra até a próxima subida.
+- **Sem teto fixo**: as 2 primeiras vagas entram livres. Cada build acima delas entra um por vez, e só se:
+  a pressão de memória não está crítica; o swap não cresceu 0,5 GB ou mais nos últimos 60 s; passaram 30 s
+  desde a última entrada extra; e a memória disponível do sistema, menos a reserva de pico dos builds em
+  execução, menos a estimativa do item, deixa ≥ 6 GB de folga. A reserva de pico de um build em execução é
+  a estimativa dele menos a memória que ele usa agora (nunca abaixo de 0): um build recém-iniciado ainda
+  conta a memória que vai tomar. Reservam os builds da fila, o runner (pela estimativa de `gradle-check`) e
+  os builds sem ticket (build de agente sem vaga, build fora de agente, pelo tipo de comando). Quando um
+  sinal piora, nada é morto: as entradas extras param até ele passar. `gq config max N` limita as vagas a N
+  (no mínimo 2); `gq config max off`, o padrão, tira o limite.
 - **Estimativa por tipo de comando** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
   `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`, `node`, `cc`, `bazel`, `dotnet`, `msbuild`,
   `swift`, `cargo`, `go`, `maven`, `sbt`): maior pico das últimas 5 execuções liberadas
@@ -56,6 +59,7 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 ```
 cd ../worktree && gq run -- ./gradlew :shared:check      # Bash com run_in_background: true
 gq status
+gq config max 6        # teto opcional de vagas; desligado por padrão
 ```
 
 `gq` pega um ticket, espera a vaga sem gastar token, roda o comando e libera a vaga ao sair (inclusive em

@@ -41,7 +41,7 @@ class Scheduling(unittest.TestCase):
     def test_fifo_grants_head_first_up_to_two_slots(self):
         pl = tick(world(*self.gqs(3, 1, 2)), self.waiting(3, 1, 2))
         self.assertEqual(pl.grants, [1, 2])
-        self.assertIn("no slot", core.render(pl.blocked))
+        self.assertIn("base slots full", core.render(pl.blocked))
 
     def test_runner_takes_a_slot(self):
         runner = P(300, 1, "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient")
@@ -200,68 +200,98 @@ class Hook(unittest.TestCase):
         self.assertIsNone(decide({"command": "gq enforce on"}))
 
 
-class DynamicLimit(unittest.TestCase):
+class ExtraSlots(unittest.TestCase):
     def gqs(self, *ids):
         return [P(200 + i, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for i in ids]
 
-    def run_tick(self, granted, waiting, *, limit=2, avail=20.0, est=8.0, last_raise=None, prev=(), pressure=1,
-                 extra=()):
+    def run_tick(self, granted, waiting, *, avail=20.0, est=8.0, last_extra=None, pressure=1, extra=(),
+                 rss=None, ceiling=None, swap=0.0, peaks=None):
         procs = world(*self.gqs(*granted, *waiting), *extra)
         tickets = [core.Ticket(id=i, pid=200 + i, state="granted", created=0) for i in granted] + \
                   [core.Ticket(id=i, pid=200 + i, state="waiting", created=0) for i in waiting]
         now = 1000.0
+        rss = {f"t{i}": est for i in granted} if rss is None else rss  # granted runs at their peak by default
         return core.plan(procs, core.classify(procs), tickets, snapshot_ts=now - 1, now=now, pressure=pressure,
                          busy_daemons=set(), idle_since={}, last_grant_ts=None, live_claude_pids={100},
-                         limit=limit, prev_holders=set(prev), last_raise_ts=last_raise, avail_gb=avail,
-                         estimates={i: ("gradle-check", est) for i in waiting}, ceiling=core.max_slots(24.0))
+                         last_extra_ts=last_extra, avail_gb=avail,
+                         estimates={i: ("gradle-check", est) for i in [*granted, *waiting]},
+                         ceiling=ceiling, swap_gb=swap, rss_gb=rss, peaks=peaks or {})
 
-    def test_raises_one_slot_when_memory_covers_estimate_plus_headroom(self):
+    def test_extra_entry_when_memory_covers_estimate_plus_headroom(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
-        self.assertEqual((pl.grants, pl.limit), ([3], 3))
-        self.assertIn("20.0 GB available − 8.0 GB", core.render(pl.raised))
-        self.assertIn("next extra slot", core.render(pl.blocked))  # gradual: the second raise waits RAISE_GAP_S
+        self.assertEqual(pl.grants, [3])
+        self.assertIn("ticket #3 entered above the base: 20.0 GB available − 0.0 GB reserved − 8.0 GB",
+                      core.render(pl.extra))
+        self.assertIn("next extra slot", core.render(pl.blocked))  # gradual: the next extra waits EXTRA_GAP_S
+        self.assertEqual(pl.reserve_gb, 8.0)  # the new entry's whole estimate is still to come
 
-    def test_raise_adds_one_slot_even_above_the_limit(self):
+    def test_no_fixed_ceiling_by_default(self):
+        pl = self.run_tick([1, 2, 3, 4, 5, 6], [7], avail=40, est=4)
+        self.assertEqual(pl.grants, [7])
+
+    def test_configured_max_caps_extra_entries(self):
+        pl = self.run_tick([1, 2, 3, 4], [5], avail=40, ceiling=4)
+        self.assertEqual(pl.grants, [])
+        self.assertIn("configured max of 4", core.render(pl.blocked))
+        self.assertEqual(self.run_tick([1, 2, 3], [5], avail=40, ceiling=4).grants, [5])
+
+    def test_running_builds_below_their_estimate_reserve_the_rest(self):
+        rss = {"t1": 2.0, "t2": 8.0}  # t1 started recently: 6 GB of its 8 GB estimate still to come
+        pl = self.run_tick([1, 2], [3], avail=19, est=8, rss=rss)
+        self.assertEqual(pl.grants, [])
+        self.assertIn("19.0 GB available − 6.0 GB reserved for running peaks − 8.0 GB", core.render(pl.blocked))
+        self.assertEqual(self.run_tick([1, 2], [3], avail=19, est=8, rss={"t1": 9.0, "t2": 8.0}).grants, [3])
+
+    def test_runner_and_builds_without_a_ticket_reserve_their_type_estimate(self):
         runner = P(300, 1, "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient")
-        pl = self.run_tick([1, 2], [4], extra=[runner])  # 3 in use, limit 2
-        self.assertEqual((pl.limit, pl.grants), (3, []))
-        self.assertIn("nobody enters", core.render(pl.raised))
-        pl = self.run_tick([1, 2], [4], extra=[runner], limit=3, last_raise=1000 - core.RAISE_GAP_S)
-        self.assertEqual((pl.limit, pl.grants), (4, [4]))
+        loose = P(400, 1, "/jdk/bin/java -Xmx64m -Dorg.gradle.appname=gradlew -classpath /w/gradle/wrapper/"
+                          "gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain :shared:testAndroidHostTest")
+        rss = {"t1": 8.0, "runner": 1.0, "p400": 2.0}
+        pl = self.run_tick([1], [3], avail=40, est=8, extra=[runner, loose], rss=rss)
+        self.assertEqual(pl.counts["nonagent"], 1)
+        self.assertIn(f"{core.DEFAULT_GB['gradle-check'] - 1 + core.DEFAULT_GB['gradle-test'] - 2:.1f} GB reserved",
+                      core.render(pl.extra))
+        pl = self.run_tick([1], [3], avail=30, est=8, extra=[runner], rss={"t1": 8.0, "runner": 1.0},
+                           peaks={"gradle-check": [20.0]})  # the runner's reserve follows the learned estimate
+        self.assertIn("19.0 GB reserved", core.render(pl.blocked))
 
-    def test_ceiling_follows_ram(self):
-        self.assertEqual([core.max_slots(gb) for gb in (8.0, 16.0, 24.0, 32.0, 48.0, 64.0)], [2, 3, 4, 6, 8, 11])
+    def test_growing_swap_stops_extra_entries_but_not_base_slots(self):
+        pl = self.run_tick([1, 2], [3], avail=40, swap=core.SWAP_GROWTH_GB)
+        self.assertEqual(pl.grants, [])
+        self.assertIn("swap grew 0.5 GB", core.render(pl.blocked))
+        self.assertEqual(self.run_tick([1], [3], avail=0, swap=5.0).grants, [3])
+        self.assertEqual(self.run_tick([1, 2], [3], avail=40, swap=core.SWAP_GROWTH_GB - 0.1).grants, [3])
+
+    def test_swap_growth_is_measured_within_the_window(self):
+        now = 1000.0
+        samples = [(now - core.SWAP_WINDOW_S - 5, 0.0), (now - 50, 2.0), (now - 20, 1.5), (now, 2.4)]
+        self.assertAlmostEqual(core.swap_growth_gb(samples, now), 0.9)
+        self.assertEqual(core.swap_growth_gb([(now, 3.0)], now), 0.0)
+        self.assertEqual(core.swap_growth_gb([(now - 50, 3.0), (now, 1.0)], now), 0.0)  # shrinking swap
 
     def test_used_counts_this_ticks_grants(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
         self.assertEqual(pl.used, 3)
-        self.assertIn(f"({pl.used}/{pl.limit} in use)", core.render(pl.blocked))
+        self.assertIn(f"({pl.used} in use, base {core.SLOTS})", core.render(pl.blocked))
 
-    def test_no_raise_when_headroom_would_drop_below_6_gb(self):
+    def test_no_extra_when_headroom_would_drop_below_6_gb(self):
         pl = self.run_tick([1, 2], [3], avail=13.9, est=8)
-        self.assertEqual((pl.grants, pl.limit), ([], 2))
+        self.assertEqual(pl.grants, [])
         self.assertIn("< 6 GB headroom", core.render(pl.blocked))
 
-    def test_warn_pressure_still_raises_but_critical_does_not(self):
+    def test_warn_pressure_still_admits_but_critical_does_not(self):
         self.assertEqual(self.run_tick([1, 2], [3], pressure=2).grants, [3])
         pl = self.run_tick([1, 2], [3], pressure=4)
         self.assertEqual(pl.grants, [])
         self.assertIn("critical", core.render(pl.blocked))
 
-    def test_no_raise_within_gap_or_above_ceiling(self):
-        self.assertEqual(self.run_tick([1, 2], [3], last_raise=1000 - core.RAISE_GAP_S + 10).grants, [])
-        self.assertEqual(self.run_tick([1, 2], [3], last_raise=900).grants, [3])
-        pl = self.run_tick([1, 2, 3, 4], [5], limit=4, avail=40)
-        self.assertEqual(pl.grants, [])
-        self.assertIn("ceiling of 4", core.render(pl.blocked))
-        self.assertEqual(self.run_tick([], [3], pressure=2, avail=0, limit=2).grants, [3])  # base slot, warn
+    def test_no_extra_within_gap_and_base_slots_skip_every_check(self):
+        self.assertEqual(self.run_tick([1, 2], [3], last_extra=1000 - core.EXTRA_GAP_S + 10).grants, [])
+        self.assertEqual(self.run_tick([1, 2], [3], last_extra=900).grants, [3])
+        self.assertEqual(self.run_tick([], [3], pressure=2, avail=0, last_extra=999).grants, [3])
 
-    def test_limit_drops_one_per_finished_holder_and_rises_again_only_by_analysis(self):
-        pl = self.run_tick([1, 2], [4], limit=3, prev={"t1", "t2", "t3"}, avail=10)
-        self.assertEqual((pl.lowered, pl.limit, pl.grants), (1, 2, []))
-        pl = self.run_tick([1, 2], [4], limit=3, prev={"t1", "t2", "t3"}, avail=20)
-        self.assertEqual((pl.limit, pl.grants), (3, [4]))
-        self.assertEqual(self.run_tick([1], [], limit=3, prev={"t1", "t2", "t3"}).limit, 2)  # floor is SLOTS
+    def test_every_entry_above_the_base_is_checked_after_builds_end(self):
+        self.assertEqual(self.run_tick([1], [3, 4], avail=0).grants, [3])  # base slot only, no stored limit
 
     def test_command_type_and_learned_estimate(self):
         cases = {"perl -e 'alarm 3000; exec @ARGV' ./gradlew check --continue": "gradle-check",
@@ -271,7 +301,9 @@ class DynamicLimit(unittest.TestCase):
                  "./gradlew ktlintFormat :shared:detektMetadataMain": "gradle-lint",
                  "./gradlew :androidApp:assembleDebug": "gradle",
                  "xcodebuild test -workspace a": "xcodebuild", "uv run scripts/t.py": "uv",
-                 "pod install": "pod", "java -jar x.jar": "java"}
+                 "pod install": "pod", "java -jar x.jar": "java",
+                 "java -Xmx64m -classpath /w/gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain "
+                 ":shared:testAndroidHostTest": "gradle-test", CLIENT: "gradle-check"}
         for cmd, want in cases.items():
             self.assertEqual(core.command_type(cmd), want, cmd)
         self.assertEqual(core.estimate_gb("gradle-lint", {}), 3.0)
@@ -329,10 +361,10 @@ class Messages(unittest.TestCase):
         return json.loads(re.search(r'<script type="application/json" id="i18n">(.*?)</script>', html, re.S).group(1))
 
     def test_message_is_a_key_with_params_and_renders_nested_messages_in_english(self):
-        m = core.msg("blocked.no_slot", used=3, limit=3, why=core.msg("refusal.gap", s=81))
+        m = core.msg("blocked.no_slot", used=3, base=2, why=core.msg("refusal.gap", s=81))
         self.assertEqual(json.loads(json.dumps(m)), {"key": "blocked.no_slot", "params": {
-            "used": 3, "limit": 3, "why": {"key": "refusal.gap", "params": {"s": 81}}}})
-        self.assertEqual(core.render(m), "no slot (3/3 in use); next extra slot in 81s")
+            "used": 3, "base": 2, "why": {"key": "refusal.gap", "params": {"s": 81}}}})
+        self.assertEqual(core.render(m), "base slots full (3 in use, base 2); next extra slot in 81s")
         self.assertEqual(core.render(core.msg("event.release", id=3, exit=None)), "ticket #3 released its slot (exit )")
         self.assertEqual(core.render("ticket #3 liberou a vaga (exit 0)"), "ticket #3 liberou a vaga (exit 0)")
         self.assertEqual(core.render(None), "")
@@ -514,3 +546,27 @@ class ToolchainCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MaxConfig(unittest.TestCase):
+    def test_gq_config_max_keeps_other_keys_and_the_server_reads_it(self):
+        import tempfile
+        from unittest import mock
+        from bq import gq, server
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "config.json"
+            with mock.patch.object(gq, "CONFIG", cfg), mock.patch.object(server, "CONFIG", cfg), \
+                    mock.patch.object(gq, "call", side_effect=OSError), mock.patch("builtins.print"):
+                q = server.Queue.__new__(server.Queue)
+                self.assertIsNone(q.ceiling())  # default: no cap
+                gq.enforce("on")
+                gq.config_max("5")
+                self.assertEqual(json.loads(cfg.read_text()), {"enforce": True, "max": 5})
+                self.assertEqual((q.ceiling(), q.enforce()), (5, True))
+                with self.assertRaises(SystemExit):
+                    gq.config_max("1")
+                with self.assertRaises(SystemExit):
+                    gq.config_max("x")
+                gq.config_max("off")
+                self.assertEqual(json.loads(cfg.read_text()), {"enforce": True})
+                self.assertIsNone(q.ceiling())

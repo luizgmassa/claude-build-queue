@@ -18,12 +18,15 @@ made in its selector. Command lines and agent names are masked in these screensh
 - **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot). The runner never
   waits: if it arrives with 2 local builds running, the count goes to 3 until one ends, and nobody new gets in.
 - **Strict FIFO**: only the head of the queue may start.
-- **Dynamic limit, from 2 slots up to a ceiling set by the machine's RAM**: RAM / 6 GB, rounded up
-  (16 GB → 3, 24 GB → 4, 32 GB → 6, 48 GB → 8; never below 2). With every slot taken, the limit rises by 1 slot for the head of the queue
-  only if: memory pressure is not critical, 30 s have passed since the last raise, and the system's available memory minus
-  the item's estimate leaves ≥ 6 GB of headroom. Each run that ends lowers the limit by 1 (never below 2);
-  the next raise goes through the same analysis. A raise always adds exactly 1 slot: when runs that never
-  wait (runner, builds outside an agent) already hold it, nobody enters until the next raise.
+- **No fixed ceiling**: the first 2 slots enter freely. Every build above them enters one at a time, and
+  only if: memory pressure is not critical; swap did not grow by 0.5 GB or more in the last 60 s; 30 s have
+  passed since the last extra entry; and the system's available memory, minus the peak reserve of the running
+  builds, minus the item's estimate, leaves ≥ 6 GB of headroom. A running build's peak reserve is its
+  estimate minus its current memory (never below 0): a build that just started still counts the memory it is
+  about to take. Queued builds, the runner (by the `gradle-check` estimate) and builds without a ticket (agent
+  builds without a slot, builds outside an agent, by their command type) all reserve. When a signal turns bad,
+  nothing is killed: extra entries stop until it clears. `gq config max N` caps the slots at N (at least 2);
+  `gq config max off`, the default, removes the cap.
 - **Estimate per command type** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
   `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`, `node`, `cc`, `bazel`, `dotnet`, `msbuild`,
   `swift`, `cargo`, `go`, `maven`, `sbt`): the largest peak of the last 5 released runs
@@ -56,6 +59,7 @@ made in its selector. Command lines and agent names are masked in these screensh
 ```
 cd ../worktree && gq run -- ./gradlew :shared:check      # Bash with run_in_background: true
 gq status
+gq config max 6        # optional cap on slots; off by default
 ```
 
 `gq` takes a ticket, waits for a slot without spending tokens, runs the command and frees the slot on exit
