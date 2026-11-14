@@ -19,7 +19,7 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 - **FIFO estrito**: só o primeiro da fila pode entrar.
 - **Limite dinâmico, de 2 vagas até um teto dado pela RAM da máquina**: RAM ÷ 6 GB, arredondado para cima
   (16 GB → 3, 24 GB → 4, 32 GB → 6, 48 GB → 8; nunca abaixo de 2). Com a fila cheia, o limite sobe 1 vaga para o primeiro da fila só se:
-  a pressão não está crítica, passaram 90 s desde a última subida, e a memória disponível do sistema menos a
+  a pressão não está crítica, passaram 30 s desde a última subida, e a memória disponível do sistema menos a
   estimativa do item deixa ≥ 6 GB de folga. Cada execução que termina baixa o limite em 1 (nunca abaixo de 2);
   a próxima subida passa pela mesma análise. Cada subida soma exatamente 1 vaga: se quem não espera (runner,
   build fora de agente) já ocupa essa vaga, ninguém entra até a próxima subida.

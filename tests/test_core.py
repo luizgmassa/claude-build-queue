@@ -246,7 +246,7 @@ class DynamicLimit(unittest.TestCase):
         self.assertIn("critical", core.render(pl.blocked))
 
     def test_no_raise_within_gap_or_above_ceiling(self):
-        self.assertEqual(self.run_tick([1, 2], [3], last_raise=950).grants, [])
+        self.assertEqual(self.run_tick([1, 2], [3], last_raise=1000 - core.RAISE_GAP_S + 10).grants, [])
         self.assertEqual(self.run_tick([1, 2], [3], last_raise=900).grants, [3])
         pl = self.run_tick([1, 2, 3, 4], [5], limit=4, avail=40)
         self.assertEqual(pl.grants, [])

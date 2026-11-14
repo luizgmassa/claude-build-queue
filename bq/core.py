@@ -13,7 +13,7 @@ from pathlib import Path
 SLOTS = 2  # base limit, runner included
 GB_PER_SLOT = 6  # slot ceiling = RAM / 6 GB, rounded up: 16 GB -> 3, 24 -> 4, 32 -> 6, 48 -> 8
 HEADROOM_GB = 6.0  # available memory that must remain after the next item's estimate
-RAISE_GAP_S = 90  # a new build needs time to reach its peak before memory is judged again
+RAISE_GAP_S = 30  # a new build needs time to reach its peak before memory is judged again
 PEAK_HISTORY = 5  # estimate = largest of the last N measured peaks of the same command type
 # Starting estimates (GB of the whole build: client, daemon, workers, Kotlin daemon) before any measurement.
 DEFAULT_GB = {"gradle-check": 8.0, "gradle-backend": 6.0, "gradle-ios": 6.0, "gradle-test": 5.0,
