@@ -28,7 +28,7 @@ CALL_WINDOW_S = 60  # a `gq run` reaches the server within this long after the h
 DATA = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue"))
 CALLS = DATA / "calls.jsonl"  # the hook's record of each `gq run` Bash call: session and subagent
 
-PRESSURE_NORMAL, PRESSURE_WARN, PRESSURE_CRITICAL = 1, 2, 4
+PRESSURE_CRITICAL = 4  # kern.memorystatus_vm_pressure_level; warn (2) does not block
 
 ENV_KEYS = ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "RALPHY_STATUS_FILE", "BQ_TICKET", "GITHUB_ACTIONS")
 _ENV_RE = re.compile(r"(?:^|\s)(" + "|".join(ENV_KEYS) + r")=(\S*)")
@@ -236,13 +236,11 @@ def max_slots(total_gb):
     return max(SLOTS, math.ceil(round(total_gb / GB_PER_SLOT, 6)))
 
 
-def raise_refusal(*, used, limit, pressure, now, last_raise_ts, avail_gb, est, ceiling):
+def raise_refusal(*, used, limit, now, last_raise_ts, avail_gb, est, ceiling):
     """Why one more slot cannot open now, or "" when it can."""
     ctype, gb = est
     if limit + 1 > ceiling:
         return f"teto de {ceiling} vagas"
-    if pressure != PRESSURE_NORMAL:
-        return "vaga extra só com pressão normal"
     if last_raise_ts is not None and now - last_raise_ts < RAISE_GAP_S:
         return f"próxima vaga extra em {int(RAISE_GAP_S - (now - last_raise_ts))}s"
     if avail_gb - gb < HEADROOM_GB:
@@ -338,15 +336,12 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if pressure >= PRESSURE_CRITICAL:
             out.blocked = "pressão de memória crítica"
             break
-        if pressure >= PRESSURE_WARN and local_active > 0:
-            out.blocked = "pressão de memória em alerta (só entra com zero builds locais)"
-            break
         if killed_daemon:
             out.blocked = "aguardando daemon ocioso encerrar"
             break
         if used >= limit:
             est = estimates.get(t.id, ("other", DEFAULT_GB["other"]))
-            why = raise_refusal(used=used, limit=limit, pressure=pressure, now=now, last_raise_ts=last_raise_ts,
+            why = raise_refusal(used=used, limit=limit, now=now, last_raise_ts=last_raise_ts,
                                 avail_gb=avail_gb, est=est, ceiling=ceiling)
             if why:
                 out.blocked = f"sem vaga ({used}/{limit} em uso); {why}"

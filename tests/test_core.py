@@ -46,12 +46,10 @@ class Scheduling(unittest.TestCase):
         pl = tick(world(runner, *self.gqs(1, 2)), self.waiting(1, 2))
         self.assertEqual(pl.grants, [1])
 
-    def test_warn_pressure_admits_only_with_zero_local_builds(self):
-        self.assertEqual(tick(world(*self.gqs(1, 2)), self.waiting(1, 2), pressure=2).grants, [1])
+    def test_warn_pressure_does_not_block(self):
         granted = [core.Ticket(id=1, pid=201, state="granted", created=0)]
         pl = tick(world(*self.gqs(1, 2)), granted + self.waiting(2), pressure=2)
-        self.assertEqual(pl.grants, [])
-        self.assertIn("alerta", pl.blocked)
+        self.assertEqual(pl.grants, [2])
 
     def test_critical_pressure_admits_nobody(self):
         self.assertEqual(tick(world(*self.gqs(1)), self.waiting(1), pressure=4).grants, [])
@@ -205,7 +203,13 @@ class DynamicLimit(unittest.TestCase):
         self.assertEqual((pl.grants, pl.limit), ([], 2))
         self.assertIn("< 6 GB de folga", pl.blocked)
 
-    def test_no_raise_within_gap_or_above_ceiling_or_without_normal_pressure(self):
+    def test_warn_pressure_still_raises_but_critical_does_not(self):
+        self.assertEqual(self.run_tick([1, 2], [3], pressure=2).grants, [3])
+        pl = self.run_tick([1, 2], [3], pressure=4)
+        self.assertEqual(pl.grants, [])
+        self.assertIn("crítica", pl.blocked)
+
+    def test_no_raise_within_gap_or_above_ceiling(self):
         self.assertEqual(self.run_tick([1, 2], [3], last_raise=950).grants, [])
         self.assertEqual(self.run_tick([1, 2], [3], last_raise=900).grants, [3])
         pl = self.run_tick([1, 2, 3, 4], [5], limit=4, avail=40)
