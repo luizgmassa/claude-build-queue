@@ -32,8 +32,9 @@ $sh = "#!/bin/sh`nexec `"$($py -replace '\\', '/')`" `"$($gq -replace '\\', '/')
 $action = New-ScheduledTaskAction -Execute (Join-Path $venv "Scripts\pythonw.exe") `
     -Argument "`"$server`"" -WorkingDirectory $here
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Queue: Save & Apply starts the task again while the server still runs; the new start waits for it to exit
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries `
+    -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances Queue -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $label -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $label

@@ -70,8 +70,6 @@ jobs:
         shell: pwsh
         run: |
           Get-Content "$HOME\.local\share\build-queue\server.log" -ErrorAction SilentlyContinue
-          "--- restart.log"
-          Get-Content "$HOME\.local\share\build-queue\restart.log" -ErrorAction SilentlyContinue
           "--- task"
-          Get-ScheduledTask -TaskName com.massa.build-queue | Select-Object State, @{n="Trigger";e={$_.Triggers[0].Enabled}}
-          Get-ScheduledTaskInfo -TaskName com.massa.build-queue | Select-Object LastRunTime, LastTaskResult
+          Get-ScheduledTask -TaskName com.massa.build-queue | Select-Object State, @{n="Trigger";e={$_.Triggers[0].Enabled}}, @{n="Instances";e={$_.Settings.MultipleInstances}} | Format-List
+          Get-ScheduledTaskInfo -TaskName com.massa.build-queue | Select-Object LastRunTime, LastTaskResult | Format-List
