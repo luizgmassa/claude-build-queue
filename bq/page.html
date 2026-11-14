@@ -18,9 +18,13 @@
   .rz { position: absolute; right: 0; top: 0; width: 7px; height: 100%; cursor: col-resize; }
   .rz:hover, .rz.on { background: #456; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .cards { display: flex; gap: 10px; flex-wrap: wrap; }
-  .card { background: #1b1b1b; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; min-width: 120px; }
-  .card b { display: block; font-size: 20px; }
+  .cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  /* a fixed size, so a refresh with longer numbers does not move the cards around */
+  .card { background: #1b1b1b; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; width: 230px;
+          box-sizing: border-box; white-space: nowrap; }
+  .card.wide { width: 350px; }
+  .card b { display: block; font-size: 20px; overflow: hidden; text-overflow: ellipsis;
+            font-variant-numeric: tabular-nums; }
   .tri { margin-left: 5px; vertical-align: -1px; cursor: help; }
   [data-tip] { position: relative; }
   [data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); z-index: 5;
@@ -78,7 +82,7 @@
 <button id="cfg-open">⚙ <span data-i18n="cfg.open"></span></button>
 <select id="lang" data-i18n-title="language"><option value="en-US">EN-US</option><option value="pt-BR">PT-BR</option></select>
 <h1><span data-i18n="title"></span> <span id="ts" class="muted"></span></h1>
-<div class="cards" id="cards"></div>
+<div id="cards"></div>
 <div id="blocked" class="warn"></div>
 <h2 data-i18n="h.running"></h2><div class="wrap"><table id="running"></table></div>
 <h2 data-i18n="h.waiting"></h2><div class="wrap"><table id="waiting"></table></div>
@@ -145,8 +149,7 @@
   "card.slots_val": "{used} in use (base {base}, max {max})",
   "card.max_off": "off",
   "card.avail": "Available for an extra slot",
-  "card.avail_val": "{avail} GB − {reserve} GB reserved (headroom {headroom} GB)",
-  "card.swap_growth": "Swap growth ({s} s)",
+  "card.avail_val": "{reserve} GB reserved",
   "card.runner": "GitHub runner",
   "card.busy": "busy",
   "card.idle": "idle",
@@ -166,6 +169,7 @@
   "col.age": "age",
   "col.cmd": "command",
   "col.agent": "agent",
+  "col.project": "project",
   "col.gq_pid": "gq PID",
   "col.estimate": "estimate",
   "col.peak": "peak",
@@ -367,8 +371,7 @@
   "card.slots_val": "{used} em uso (base {base}, teto {max})",
   "card.max_off": "sem teto",
   "card.avail": "Disponível p/ vaga extra",
-  "card.avail_val": "{avail} GB − {reserve} GB reservados (folga {headroom} GB)",
-  "card.swap_growth": "Crescimento do swap ({s} s)",
+  "card.avail_val": "{reserve} GB reservados",
   "card.runner": "Runner GitHub",
   "card.busy": "ocupado",
   "card.idle": "livre",
@@ -388,6 +391,7 @@
   "col.age": "idade",
   "col.cmd": "comando",
   "col.agent": "agente",
+  "col.project": "projeto",
   "col.gq_pid": "PID gq",
   "col.estimate": "estimativa",
   "col.peak": "pico",
@@ -677,6 +681,7 @@ const T_ID = { k: "id", t: "#", num: true, w: 50 };
 const T_AGENT = { k: "agent", t: "col.agent", w: 220, f: t => agentLink(t.claude_pid, t.agent, t.agent_alive) };
 const T_PID = { k: "pid", t: "col.gq_pid", num: true, w: 70, f: t => procLink(t.pid) };
 const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
+const T_PROJ = { k: "project", t: "col.project", w: 180 };
 const T_STATE = { k: "state", t: "col.state", w: 80, v: t => T("state." + t.state, null, t.state),
   f: t => esc(T("state." + t.state, null, t.state)) };
 const T_EST = { k: "estimate_gb", t: "col.estimate", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
@@ -716,33 +721,35 @@ function render(v) {
   document.getElementById("ts").textContent = T("updated", { ts: v.ts });
   const swapCls = m.swap_used_gb / Math.max(m.swap_total_gb, 1) > .8 ? "bad" : "ok";
   const tip = (key, l, extra) => T(key, { gb: gb2(l.gb), pct: l.ram_pct, cpu: l.cpu_pct, ...extra });
-  const out = v.outside.n ? triangle(tip("tip.outside", v.outside, { n: v.outside.n })) : "";
-  document.getElementById("cards").innerHTML = [
+  const named = (v.outside.builds || []).map(b => [b.project, b.ctype].filter(Boolean).join(" · ") + " — PID " + b.pid);
+  const out = v.outside.n ? triangle([tip("tip.outside", v.outside, { n: v.outside.n }), ...named].join("\n")) : "";
+  const card = ([k, val, c, mark = "", cardTip = "", wide]) => `<div class="card${wide ? " wide" : ""}"${cardTip ? ` data-tip="${esc(cardTip)}"` : ""}>`
+    + `${esc(Array.isArray(k) ? T(...k) : T(k))}${mark}<b class="${c}">${esc(val)}</b></div>`;
+  document.getElementById("cards").innerHTML = [[
     ["card.slots", T("card.slots_val", { used: v.used, base: v.base_slots, max: v.max_slots ?? T("card.max_off") }),
-      v.used >= v.base_slots ? "warn" : "ok"],
-    ["card.avail", T("card.avail_val", { avail: v.avail_gb, reserve: v.reserve_gb, headroom: v.headroom_gb }),
-      v.avail_gb - v.reserve_gb < v.headroom_gb ? "bad" : "ok"],
+      v.used >= v.base_slots ? "warn" : "ok", "", "", true],
     ["card.runner", T(v.counts.runner ? "card.busy" : "card.idle"), v.counts.runner ? "warn" : "ok", "",
       v.counts.runner && v.runner_load ? tip("tip.runner", v.runner_load) : ""],
-    ["card.pressure", T(pl), pc],
-    ["card.free", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
-    ["RAM", T("card.ram_val", { used: v.builds_gb, free: v.avail_gb }), "", out],
-    ["card.cpu_total", v.cpu_total_pct + "%", "", out],
-    ["card.cpu_builds", v.builds_cpu_pct + "%", "", out],
-    ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
-    [["card.swap_growth", { s: v.swap_window_s }], `+${v.swap_growth_gb} GB`, v.swap_growth_gb >= v.swap_growth_limit_gb ? "bad" : "ok"],
     ["card.cleanup", T(v.enforce ? "card.cleanup_on" : "card.cleanup_dry"), v.enforce ? "ok" : "warn"],
-  ].map(([k, val, c, mark = "", cardTip = ""]) => `<div class="card"${cardTip ? ` data-tip="${esc(cardTip)}"` : ""}>`
-    + `${esc(Array.isArray(k) ? T(...k) : T(k))}${mark}<b class="${c}">${esc(val)}</b></div>`).join("");
+    ["card.pressure", T(pl), pc],
+  ], [
+    ["RAM", T("card.ram_val", { used: v.builds_gb, free: v.avail_gb }), "", out, "", true],
+    ["card.free", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
+    ["card.avail", T("card.avail_val", { reserve: v.reserve_gb }), v.avail_gb - v.reserve_gb < v.headroom_gb ? "bad" : "ok"],
+    ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
+  ], [
+    ["card.cpu_builds", v.builds_cpu_pct + "%", "", out],
+    ["card.cpu_total", v.cpu_total_pct + "%", "", out],
+  ]].map(row => `<div class="cards">${row.map(card).join("")}</div>`).join("");
   const blocked = v.blocked_msg || v.blocked;  // blocked_msg carries the key; blocked is the English text gq prints
   document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
   const waiting = v.tickets.filter(t => t.state === "waiting").sort((a, b) => a.id - b.id);
   waiting.forEach((t, i) => t.position = i + 1);
-  grid("running", [T_ID, T_AGENT, T_PID,
+  grid("running", [T_ID, T_AGENT, T_PROJ, T_PID,
     { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
     T_TYPE, T_RAM, T_CPU, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
-  grid("waiting", [{ k: "position", t: "col.position", num: true, w: 65 }, T_ID, T_AGENT, T_PID,
+  grid("waiting", [{ k: "position", t: "col.position", num: true, w: 65 }, T_ID, T_AGENT, T_PROJ, T_PID,
     { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
     T_TYPE, T_CPU, T_EST, T_CMD], waiting);
   grid("done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,

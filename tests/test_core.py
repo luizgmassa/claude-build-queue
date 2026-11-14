@@ -344,6 +344,24 @@ class TicketMemory(unittest.TestCase):
             self.assertEqual(server.cpu_pct(pids, procs), 12.5)  # 5 x 10% of one core, on 4 cores
             self.assertEqual(server.load(pids, procs, total_gb=0.5)["ram_pct"], 1.0)
 
+    def test_project_is_the_git_root_folder_and_outside_builds_are_named(self):
+        from unittest import mock
+        from bq import server
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp, "repo-wt")
+            (wt / "backend").mkdir(parents=True)
+            (wt / ".git").write_text("gitdir: elsewhere")  # a worktree's .git is a file
+            Path(tmp, "plain").mkdir()
+            self.assertEqual(server.project_of(str(wt / "backend")), "repo-wt")
+            self.assertEqual(server.project_of(str(Path(tmp, "plain"))), "plain")  # no git: the folder itself
+            self.assertEqual(server.project_of(""), "")
+            procs = world(P(400, 1, CLIENT), P(410, 400, "java GradleWorkerMain"))
+            with mock.patch.object(server.system, "cwd_of", return_value=str(wt / "backend")):
+                loads = server.outside_and_runner([400], {"p400": {400, 410}, "runner": set()}, procs, total_gb=1)
+        self.assertEqual(loads["outside"]["n"], 1)
+        self.assertEqual(loads["outside"]["builds"],
+                         [{"pid": 400, "project": "repo-wt", "ctype": core.command_type(CLIENT)}])
+
     def test_done_ticket_peak_is_rounded_and_missing_peak_stays_empty(self):
         import sqlite3
         from types import SimpleNamespace

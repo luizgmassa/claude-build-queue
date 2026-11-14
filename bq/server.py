@@ -4,6 +4,7 @@ One scheduler thread owns every decision (grant, reap, kill). HTTP handlers only
 read, so agents never race each other: the lock serializes them and the tick decides.
 """
 
+import functools
 import json
 import os
 import re
@@ -83,10 +84,26 @@ def load(pids, procs, total_gb):
             "cpu_pct": round(cpu_pct(pids, procs), 1)}
 
 
+@functools.lru_cache(maxsize=512)  # shortcut: a folder that becomes a repo later keeps its old name until a restart
+def project_of(cwd):
+    """Name of the git root folder holding cwd, so each worktree keeps its own name; outside git, the cwd's folder."""
+    if not cwd:
+        return ""
+    here = Path(cwd)
+    return next((d.name for d in (here, *here.parents) if (d / ".git").exists()), here.name)
+
+
+@functools.lru_cache(maxsize=256)
+def root_project(pid, lstart):  # lstart keys the cache, so a reused pid is looked up again
+    return project_of(system.cwd_of(pid))
+
+
 def outside_and_runner(outside_roots, trees, procs, total_gb):
-    """Memory and CPU of the builds running without a slot, and of the runner's job."""
+    """Memory and CPU of the builds running without a slot, each one named, and of the runner's job."""
     outside = set().union(*(trees[f"p{pid}"] for pid in outside_roots))  # a shared daemon counts once
-    return {"outside": {**load(outside, procs, total_gb), "n": len(outside_roots)},
+    builds = [{"pid": pid, "project": root_project(pid, procs[pid].lstart), "ctype": core.command_type(procs[pid].args)}
+              for pid in outside_roots]
+    return {"outside": {**load(outside, procs, total_gb), "n": len(outside_roots), "builds": builds},
             "runner": load(trees["runner"], procs, total_gb)}
 
 
@@ -450,6 +467,7 @@ class Queue:
         for t in tickets:
             t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] else "?"
             t["agent_alive"] = t["claude_pid"] in procs if t["claude_pid"] else None
+            t["project"] = project_of(t["cwd"])
             t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
             if t["state"] == "granted":
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
@@ -463,7 +481,7 @@ class Queue:
             "swap_window_s": core.SWAP_WINDOW_S, "peak_history": core.PEAK_HISTORY,
             "cpu_total_pct": round(self.cpu_total, 1), "builds_gb": round(sum(self.now_gb.values()), 1),
             "builds_cpu_pct": round(sum(c for tid, c in self.now_cpu.items() if tid in self.now_gb), 1),
-            "outside": self.loads.get("outside", {"n": 0}), "runner_load": self.loads.get("runner"),
+            "outside": self.loads.get("outside", {"n": 0, "builds": []}), "runner_load": self.loads.get("runner"),
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
             "would_kill": would_kill,
