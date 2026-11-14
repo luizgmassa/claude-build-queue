@@ -331,6 +331,7 @@ class Plan:
     counts: dict = field(default_factory=dict)
     extra: dict | None = None  # message explaining this tick's entry above the base, if any
     reserve_gb: float = 0.0  # memory running builds are still expected to take before their peak
+    outside: list = field(default_factory=list)  # root pids of builds running without a slot (non-agent, no gq)
 
 
 def swap_growth_gb(samples, now):
@@ -443,6 +444,7 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
     if out.runner_busy:
         runs.append((estimate_gb(RUNNER_CTYPE, peaks), rss_gb.get("runner", 0.0)))
     reserve = peak_reserve_gb(runs)
+    out.outside = [r.pid for r in nonagent + unqueued]
     out.counts = {"granted": len(granted), "nonagent": len(nonagent), "unqueued": len(unqueued),
                   "runner": int(out.runner_busy), "local_active": local_active}
     waiting = sorted((t for t in live if t.state == "waiting"), key=lambda t: t.id)

@@ -21,6 +21,11 @@
   .cards { display: flex; gap: 10px; flex-wrap: wrap; }
   .card { background: #1b1b1b; border: 1px solid #333; border-radius: 6px; padding: 8px 12px; min-width: 120px; }
   .card b { display: block; font-size: 20px; }
+  .tri { margin-left: 5px; vertical-align: -1px; cursor: help; }
+  [data-tip] { position: relative; }
+  [data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); z-index: 5;
+    white-space: pre; background: #2a2a2a; color: #eee; border: 1px solid #555; border-radius: 6px;
+    padding: 6px 9px; font-size: 12px; font-weight: normal; box-shadow: 0 4px 12px rgba(0, 0, 0, .5); }
   .ok { color: #6d6; } .warn { color: #fc4; } .bad { color: #f66; }
   code { color: #aaa; font-size: 11px; }
   pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #aaa; font-size: 11px; background: #181818;
@@ -150,6 +155,11 @@
   "card.cleanup": "Cleanup",
   "card.cleanup_on": "on",
   "card.cleanup_dry": "dry run",
+  "card.ram_val": "{used} GB builds / {free} GB free",
+  "card.cpu_total": "Total CPU",
+  "card.cpu_builds": "CPU of running builds",
+  "tip.outside": "Builds outside the queue: {n}\nMemory: {gb} GB ({pct}% of RAM)\nCPU: {cpu}%",
+  "tip.runner": "Memory: {gb} GB ({pct}% of RAM)\nCPU: {cpu}%",
   "col.type": "type",
   "col.owner": "owner",
   "col.state": "state",
@@ -166,7 +176,7 @@
   "col.waiting_for": "waiting for",
   "col.ended_ago": "ended ago",
   "col.claude_pid": "claude PID",
-  "col.total_rss": "total RSS (MB)",
+  "col.total_rss": "total RSS (GB)",
   "col.procs": "processes",
   "col.reason": "reason",
   "col.estimate_gb": "estimate (GB)",
@@ -186,9 +196,9 @@
   "kv.root": "Build root",
   "kv.type": "Type",
   "kv.state": "State",
-  "kv.rss_val": "{mb} MB ({pct}% of RAM)",
+  "kv.rss_val": "{gb} GB ({pct}% of RAM)",
   "kv.tree": "Tree (it + descendants)",
-  "kv.tree_val": "{n} processes, {mb} MB ({pct}% of RAM)",
+  "kv.tree_val": "{n} processes, {gb} GB ({pct}% of RAM)",
   "kv.dir": "Directory",
   "kv.env": "Environment",
   "state.waiting": "waiting",
@@ -367,6 +377,11 @@
   "card.cleanup": "Limpeza",
   "card.cleanup_on": "ligada",
   "card.cleanup_dry": "simulação",
+  "card.ram_val": "{used} GB builds / {free} GB livres",
+  "card.cpu_total": "CPU total",
+  "card.cpu_builds": "CPU das builds rodando",
+  "tip.outside": "Builds fora da fila: {n}\nMemória: {gb} GB ({pct}% da RAM)\nCPU: {cpu}%",
+  "tip.runner": "Memória: {gb} GB ({pct}% da RAM)\nCPU: {cpu}%",
   "col.type": "tipo",
   "col.owner": "dono",
   "col.state": "estado",
@@ -383,7 +398,7 @@
   "col.waiting_for": "esperando há",
   "col.ended_ago": "terminou há",
   "col.claude_pid": "PID claude",
-  "col.total_rss": "RSS total (MB)",
+  "col.total_rss": "RSS total (GB)",
   "col.procs": "processos",
   "col.reason": "motivo",
   "col.estimate_gb": "estimativa (GB)",
@@ -403,9 +418,9 @@
   "kv.root": "Raiz do build",
   "kv.type": "Tipo",
   "kv.state": "Estado",
-  "kv.rss_val": "{mb} MB ({pct}% da RAM)",
+  "kv.rss_val": "{gb} GB ({pct}% da RAM)",
   "kv.tree": "Árvore (ele + descendentes)",
-  "kv.tree_val": "{n} processos, {mb} MB ({pct}% da RAM)",
+  "kv.tree_val": "{n} processos, {gb} GB ({pct}% da RAM)",
   "kv.dir": "Diretório",
   "kv.env": "Ambiente",
   "state.waiting": "aguardando",
@@ -640,6 +655,10 @@ document.addEventListener("click", e => {
 
 // ---------------------------------------------------------------- column sets
 // `t` is a translation key; a header no language translates (PID, % RAM) is its own text
+const gb2 = x => x == null ? "" : x.toFixed(2);
+// a small yellow warning triangle; its tooltip is the text in data-tip
+const triangle = tip => `<span class="tri" data-tip="${esc(tip)}"><svg viewBox="0 0 16 16" width="13" height="13">`
+  + `<path d="M8 1.2 15.3 14.3H.7Z" fill="#e8b500"/><path d="M8 5.6v4.3M8 11.4v1.3" stroke="#111" stroke-width="1.7"/></svg></span>`;
 const PROC_COLS = [
   { k: "pid", t: "PID", num: true, w: 70, f: r => procLink(r.pid) },
   { k: "ppid", t: "PPID", num: true, w: 70, f: r => procLink(r.ppid) },
@@ -647,7 +666,7 @@ const PROC_COLS = [
   { k: "owner", t: "col.owner", w: 200, f: ownerOf },
   { k: "status", t: "col.state", w: 150, v: r => tr(r.status), cls: r => r.status?.key === "status.no_slot" ? "bad" : "",
     f: r => esc(tr(r.status)) + clientOf(r) },
-  { k: "rss_mb", t: "RSS (MB)", num: true, w: 85 },
+  { k: "rss_gb", t: "RSS (GB)", num: true, w: 85, f: r => gb2(r.rss_gb) },
   { k: "ram_pct", t: "% RAM", num: true, w: 70 },
   { k: "cpu", t: "CPU%", num: true, w: 65 },
   { k: "etime", t: "col.age", w: 90, v: r => etimeSecs(r.etime) },
@@ -661,6 +680,7 @@ const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
 const T_STATE = { k: "state", t: "col.state", w: 80, v: t => T("state." + t.state, null, t.state),
   f: t => esc(T("state." + t.state, null, t.state)) };
 const T_EST = { k: "estimate_gb", t: "col.estimate", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
+const T_CPU = { k: "cpu_pct", t: "% CPU", num: true, w: 70, f: r => r.cpu_pct != null ? r.cpu_pct + "%" : "" };
 const T_RAM = { k: "rss_gb", t: "col.ram_now", num: true, w: 85, f: t => t.rss_gb != null ? t.rss_gb + " GB" : "" };
 const T_PEAK = { k: "peak_gb", t: "col.peak", num: true, w: 75, f: t => t.peak_gb != null ? t.peak_gb + " GB" : "" };
 const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${esc(t.cwd)}$ ${esc(t.cmd)}</code>` };
@@ -695,20 +715,25 @@ function render(v) {
   const m = v.memory, [pl, pc] = pressure(m.pressure);
   document.getElementById("ts").textContent = T("updated", { ts: v.ts });
   const swapCls = m.swap_used_gb / Math.max(m.swap_total_gb, 1) > .8 ? "bad" : "ok";
+  const tip = (key, l, extra) => T(key, { gb: gb2(l.gb), pct: l.ram_pct, cpu: l.cpu_pct, ...extra });
+  const out = v.outside.n ? triangle(tip("tip.outside", v.outside, { n: v.outside.n })) : "";
   document.getElementById("cards").innerHTML = [
     ["card.slots", T("card.slots_val", { used: v.used, base: v.base_slots, max: v.max_slots ?? T("card.max_off") }),
       v.used >= v.base_slots ? "warn" : "ok"],
     ["card.avail", T("card.avail_val", { avail: v.avail_gb, reserve: v.reserve_gb, headroom: v.headroom_gb }),
       v.avail_gb - v.reserve_gb < v.headroom_gb ? "bad" : "ok"],
-    ["card.runner", T(v.counts.runner ? "card.busy" : "card.idle"), v.counts.runner ? "warn" : "ok"],
+    ["card.runner", T(v.counts.runner ? "card.busy" : "card.idle"), v.counts.runner ? "warn" : "ok", "",
+      v.counts.runner && v.runner_load ? tip("tip.runner", v.runner_load) : ""],
     ["card.pressure", T(pl), pc],
     ["card.free", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
-    ["RAM", [`${m.app_gb} app`, m.wired_gb != null && `${m.wired_gb} wired`, m.compressed_gb != null && `${m.compressed_gb} comp`]
-      .filter(Boolean).join(" · ") + ` / ${m.total_gb} GB`, ""],
+    ["RAM", T("card.ram_val", { used: v.builds_gb, free: v.avail_gb }), "", out],
+    ["card.cpu_total", v.cpu_total_pct + "%", "", out],
+    ["card.cpu_builds", v.builds_cpu_pct + "%", "", out],
     ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
     [["card.swap_growth", { s: v.swap_window_s }], `+${v.swap_growth_gb} GB`, v.swap_growth_gb >= v.swap_growth_limit_gb ? "bad" : "ok"],
     ["card.cleanup", T(v.enforce ? "card.cleanup_on" : "card.cleanup_dry"), v.enforce ? "ok" : "warn"],
-  ].map(([k, val, c]) => `<div class="card">${esc(Array.isArray(k) ? T(...k) : T(k))}<b class="${c}">${esc(val)}</b></div>`).join("");
+  ].map(([k, val, c, mark = "", cardTip = ""]) => `<div class="card"${cardTip ? ` data-tip="${esc(cardTip)}"` : ""}>`
+    + `${esc(Array.isArray(k) ? T(...k) : T(k))}${mark}<b class="${c}">${esc(val)}</b></div>`).join("");
   const blocked = v.blocked_msg || v.blocked;  // blocked_msg carries the key; blocked is the English text gq prints
   document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
@@ -716,18 +741,18 @@ function render(v) {
   waiting.forEach((t, i) => t.position = i + 1);
   grid("running", [T_ID, T_AGENT, T_PID,
     { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
-    T_TYPE, T_RAM, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
+    T_TYPE, T_RAM, T_CPU, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
   grid("waiting", [{ k: "position", t: "col.position", num: true, w: 65 }, T_ID, T_AGENT, T_PID,
     { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
-    T_TYPE, T_EST, T_CMD], waiting);
+    T_TYPE, T_CPU, T_EST, T_CMD], waiting);
   grid("done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,
     { k: "ended", t: "col.ended_ago", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD],
     v.tickets.filter(t => t.state === "done"));
   grid("agents", [
     { k: "label", t: "col.agent", w: 280, f: a => agentLink(a.pid, a.label) },
     { k: "pid", t: "col.claude_pid", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " " + esc(T("dead"))) },
-    { k: "rss_mb", t: "col.total_rss", num: true, w: 110 },
-    { k: "ram_pct", t: "% RAM", num: true, w: 70 },
+    { k: "rss_gb", t: "col.total_rss", num: true, w: 110, f: a => gb2(a.rss_gb) },
+    { k: "ram_pct", t: "% RAM", num: true, w: 70 }, T_CPU,
     { k: "procs", t: "col.procs", num: true, w: 80 }], v.agents);
   grid("procs", PROC_COLS, v.processes);
   document.getElementById("h-est").textContent = T("h.est", { n: v.peak_history });
@@ -777,7 +802,7 @@ function renderAgent(a, body) {
     ["kv.transcript", a.transcript ? `<code>${esc(a.transcript)}</code>` : ""],
     ["kv.start", esc(a.lstart)], ["kv.age", esc(a.etime)],
     ["h.procs", a.procs.length],
-    ["kv.rss", `${a.rss_mb} MB`],
+    ["kv.rss", `${gb2(a.rss_gb)} GB`],
     ["kv.ram_total", esc(T("kv.pct_of", { pct: a.ram_pct, gb: a.total_gb }))],
     ["kv.avail_now", esc(T("kv.pct_of", { pct: a.avail_pct, gb: a.avail_gb }))],
   ]) + `<h3>${esc(T("h.agent_procs"))}</h3><div class="wrap"><table id="dlg-procs"></table></div>`
@@ -793,8 +818,8 @@ function renderProc(p, body) {
     ["PID", p.pid], ["PPID", procLink(p.ppid)],
     ["kv.root", p.root && p.root !== p.pid ? procLink(p.root) : p.root ? esc(T("this_proc")) : ""],
     ["kv.type", esc(p.kind)], ["kv.state", esc(tr(p.status)) + clientOf(p)],
-    ["kv.rss", esc(T("kv.rss_val", { mb: p.rss_mb, pct: p.ram_pct }))],
-    ["kv.tree", esc(T("kv.tree_val", { n: p.tree.length, mb: p.tree_rss_mb, pct: p.tree_ram_pct }))],
+    ["kv.rss", esc(T("kv.rss_val", { gb: gb2(p.rss_gb), pct: p.ram_pct }))],
+    ["kv.tree", esc(T("kv.tree_val", { n: p.tree.length, gb: gb2(p.tree_rss_gb), pct: p.tree_ram_pct }))],
     ["CPU", p.cpu + "%"], ["kv.start", esc(p.lstart)], ["kv.age", esc(p.etime)],
     ["h.ticket", esc(p.ticket)], ["kv.dir", p.cwd ? `<code>${esc(p.cwd)}</code>` : ""],
     ["kv.env", Object.keys(p.env).length

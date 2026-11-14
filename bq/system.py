@@ -49,6 +49,14 @@ def etime(seconds):
     return f"{d}-{out}" if d else out
 
 
+NCPU = psutil.cpu_count() or 1  # a process's cpu_percent is per core; divide by this for the machine's share
+
+
+def cpu_total():
+    """CPU in use across the machine since the last call, 0-100."""
+    return psutil.cpu_percent(interval=None)
+
+
 def snapshot_procs():
     now, procs, starts = time.time(), {}, {}
     for p in psutil.process_iter(ATTRS, ad_value=None):

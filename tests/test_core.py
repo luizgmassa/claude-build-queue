@@ -92,12 +92,14 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(pl.kills, [])  # the hook is the only enforcement
         self.assertEqual(procs[400].status, core.msg("status.no_slot"))
         self.assertEqual(pl.used, 1)
+        self.assertEqual(pl.outside, [400])
 
     def test_queued_build_is_left_alone(self):
         gq = P(201, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)
         client = P(400, 201, CLIENT, CLAUDE_PID=100, BQ_TICKET=1)
         pl = tick(world(gq, client), [core.Ticket(id=1, pid=201, state="granted", created=0)])
         self.assertEqual(pl.kills, [])
+        self.assertEqual(pl.outside, [])  # it holds a slot
 
     def test_runner_and_nonagent_and_protected_paths_are_never_killed(self):
         from unittest import mock
@@ -113,6 +115,7 @@ class Cleanup(unittest.TestCase):
             pl = tick(procs)
         self.assertEqual(pl.kills, [])
         self.assertEqual(pl.counts["nonagent"], 1)
+        self.assertEqual(pl.outside, [501])  # the runner has its own card, so it is not an outside build
         self.assertEqual((procs[502].owner, procs[503].owner), ("protected", "runner"))
 
     def test_orphan_of_dead_agent_is_killed(self):
@@ -325,14 +328,21 @@ class ExtraSlots(unittest.TestCase):
 
 class TicketMemory(unittest.TestCase):
     def test_counts_own_tree_serving_daemon_its_workers_and_kotlin_daemon_only(self):
-        from bq.server import ticket_rss_gb
+        from unittest import mock
+        from bq import server
         procs = world(P(201, 101, "python3 gq run -- ./gradlew x", CLAUDE_PID=100),
                       P(400, 201, CLIENT, CLAUDE_PID=100, BQ_TICKET=1),
                       P(700, 1, DAEMON, CLAUDE_PID=100), P(710, 700, "java GradleWorkerMain", CLAUDE_PID=100),
                       P(800, 1, KOTLIN, CLAUDE_PID=100),
                       P(900, 1, DAEMON, CLAUDE_PID=100), P(910, 900, "java GradleWorkerMain", CLAUDE_PID=100))
-        gb = ticket_rss_gb(201, 1, procs, serving={700: 400, 900: 555}, kotlin_of={700: {800}, 900: {800}})
-        self.assertEqual(round(gb * 1024), 5)  # 201, 400, 700, 710, 800 at 1 MB each; 900 and 910 excluded
+        for pid in procs:
+            procs[pid].cpu = 10.0
+        pids = server.ticket_pids(201, 1, procs, serving={700: 400, 900: 555}, kotlin_of={700: {800}, 900: {800}})
+        self.assertEqual(pids, {201, 400, 700, 710, 800})  # 900 serves another client; 910 is its worker
+        self.assertEqual(round(server.rss_gb(pids, procs) * 1024), 5)  # 1 MB each
+        with mock.patch.object(server.system, "NCPU", 4):
+            self.assertEqual(server.cpu_pct(pids, procs), 12.5)  # 5 x 10% of one core, on 4 cores
+            self.assertEqual(server.load(pids, procs, total_gb=0.5)["ram_pct"], 1.0)
 
     def test_done_ticket_peak_is_rounded_and_missing_peak_stays_empty(self):
         import sqlite3

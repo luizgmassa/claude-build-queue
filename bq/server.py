@@ -48,15 +48,15 @@ def busy_daemons(procs, listen, est):
     return busy, serving, kotlin_of
 
 
-def ticket_rss_gb(gq_pid, tid, procs, serving, kotlin_of):
-    """Memory of one queued build: its own tree, the Gradle daemon serving it with that daemon's workers,
+def ticket_pids(gq_pid, tid, procs, serving, kotlin_of):
+    """The processes of one queued build: its own tree, the Gradle daemon serving it with that daemon's workers,
     and the Kotlin daemon that daemon talks to."""
-    return tree_rss_gb({gq_pid} | {p.pid for p in procs.values() if p.env.get("BQ_TICKET") == str(tid)},
-                       procs, serving, kotlin_of)
+    return tree_pids({gq_pid} | {p.pid for p in procs.values() if p.env.get("BQ_TICKET") == str(tid)},
+                     procs, serving, kotlin_of)
 
 
-def tree_rss_gb(tops, procs, serving, kotlin_of):
-    """Memory of a build started at these pids, with the daemons serving it (see ticket_rss_gb)."""
+def tree_pids(tops, procs, serving, kotlin_of):
+    """The processes of a build started at these pids, with the daemons serving it (see ticket_pids)."""
     own = set(tops)
     for top in tops:
         own.update(core.descendants(top, procs))
@@ -64,7 +64,30 @@ def tree_rss_gb(tops, procs, serving, kotlin_of):
     pids = set(own) | daemons
     for d in daemons:
         pids |= set(core.descendants(d, procs)) | kotlin_of.get(d, set())
-    return sum(procs[x].rss_kb for x in pids if x in procs) / 1024 ** 2
+    return {x for x in pids if x in procs}
+
+
+def rss_gb(pids, procs):
+    return sum(procs[x].rss_kb for x in pids) / 1024 ** 2
+
+
+def cpu_pct(pids, procs):
+    """Share of the whole machine, 0-100."""
+    return sum(procs[x].cpu for x in pids) / system.NCPU
+
+
+def load(pids, procs, total_gb):
+    """Memory and CPU of a set of processes, for the page's tooltips."""
+    gb = rss_gb(pids, procs)
+    return {"gb": round(gb, 2), "ram_pct": round(100 * gb / total_gb, 1) if total_gb else 0,
+            "cpu_pct": round(cpu_pct(pids, procs), 1)}
+
+
+def outside_and_runner(outside_roots, trees, procs, total_gb):
+    """Memory and CPU of the builds running without a slot, and of the runner's job."""
+    outside = set().union(*(trees[f"p{pid}"] for pid in outside_roots))  # a shared daemon counts once
+    return {"outside": {**load(outside, procs, total_gb), "n": len(outside_roots)},
+            "runner": load(trees["runner"], procs, total_gb)}
 
 
 def read_calls():
@@ -160,6 +183,9 @@ class Queue:
         self.swap_samples = deque()  # (ts, swap used GB) within core.SWAP_WINDOW_S
         self.peak = {}  # granted ticket id -> largest memory seen, GB
         self.now_gb = {}  # granted ticket id -> memory at the last tick, GB
+        self.now_cpu = {}  # active ticket id -> CPU at the last tick, % of the machine
+        self.loads = {}  # "outside" / "runner" -> memory and CPU at the last tick
+        self.cpu_total = 0.0
         self.taken_calls = set()  # hook records already matched to a ticket
         self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
         self.procs, self.mem = {}, {"total_gb": 0, "free_pct": 0}  # last snapshot, for the detail dialogs
@@ -230,9 +256,11 @@ class Queue:
                 del self.idle_since[pid]
         live_claude = {p.pid for p in procs.values() if p.kind == "claude"}
         enforce = self.enforce()
-        rss = {f"p{r.pid}": tree_rss_gb({r.pid}, procs, serving, kotlin_of) for r in roots}
+        trees = {f"p{r.pid}": tree_pids({r.pid}, procs, serving, kotlin_of) for r in roots}
         workers = {p.pid for p in procs.values() if p.kind == "runner_worker"}
-        rss["runner"] = tree_rss_gb(workers, procs, serving, kotlin_of)
+        trees["runner"] = tree_pids(workers, procs, serving, kotlin_of)
+        rss = {k: rss_gb(v, procs) for k, v in trees.items()}
+        self.cpu_total = system.cpu_total()
         self.swap_samples.append((now, mem["swap_used_gb"]))
         while now - self.swap_samples[0][0] > core.SWAP_WINDOW_S:
             self.swap_samples.popleft()
@@ -240,12 +268,7 @@ class Queue:
         ceiling = self.ceiling()
         with self.lock:
             tickets = self.active_tickets()
-            self.now_gb = {}
-            for t in tickets:
-                if t.state == "granted" and t.pid in procs:
-                    gb = ticket_rss_gb(t.pid, t.id, procs, serving, kotlin_of)
-                    rss[f"t{t.id}"] = self.now_gb[t.id] = gb
-                    self.peak[t.id] = max(self.peak.get(t.id, 0.0), gb)
+            rss.update(self.measure_tickets(tickets, procs, (serving, kotlin_of)))
             avail = mem["total_gb"] * mem["free_pct"] / 100
             peaks = self.peaks()
             pl = core.plan(procs, roots, tickets, snapshot_ts=snap_ts, now=now, pressure=mem["pressure"],
@@ -253,6 +276,7 @@ class Queue:
                            live_claude_pids=live_claude, last_extra_ts=self.last_extra, avail_gb=avail,
                            estimates=self.estimates(peaks), ceiling=ceiling, swap_gb=swap_gb, rss_gb=rss,
                            peaks=peaks)
+            self.loads = outside_and_runner(pl.outside, trees, procs, mem["total_gb"])
             if pl.extra:
                 self.last_extra = now
                 self.event("extra", pl.extra)
@@ -277,6 +301,18 @@ class Queue:
             self.escalate(procs)
             self.procs, self.mem, self.serving = procs, mem, serving
             self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill, ceiling, swap_gb)
+
+    def measure_tickets(self, tickets, procs, links):
+        """Memory and CPU of each live ticket; keeps the peak of a granted one. Returns its memory by "t<id>"."""
+        serving, kotlin_of = links
+        self.now_gb, self.now_cpu, rss = {}, {}, {}
+        for t in (t for t in tickets if t.pid in procs):
+            pids = ticket_pids(t.pid, t.id, procs, serving, kotlin_of)
+            self.now_cpu[t.id] = cpu_pct(pids, procs)
+            if t.state == "granted":
+                gb = rss[f"t{t.id}"] = self.now_gb[t.id] = rss_gb(pids, procs)
+                self.peak[t.id] = max(self.peak.get(t.id, 0.0), gb)
+        return rss
 
     def kill(self, root, reason, procs):
         tree = [root] + core.descendants(root, procs)
@@ -329,8 +365,8 @@ class Queue:
         owner = self.agent_label(agent_pid, procs, sub) if agent_pid else p.owner
         return {"pid": p.pid, "ppid": p.ppid, "kind": p.kind, "owner": owner, "agent_pid": agent_pid,
                 "agent_alive": agent_pid in procs if agent_pid else None,
-                "rss_mb": p.rss_kb // 1024, "ram_pct": round(100 * p.rss_kb / total_kb, 2) if total_kb else 0,
-                "cpu": p.cpu, "etime": p.etime, "status": p.status, "ticket": p.env.get("BQ_TICKET", ""),
+                "rss_gb": round(p.rss_kb / 1024 ** 2, 2),
+                "ram_pct": round(100 * p.rss_kb / total_kb, 2) if total_kb else 0, "cpu": p.cpu, "etime": p.etime, "status": p.status, "ticket": p.env.get("BQ_TICKET", ""),
                 "serving": (serving or {}).get(p.pid), "cmd": p.args[:220]}
 
     def ticket_rows(self, where, args):
@@ -355,7 +391,7 @@ class Queue:
             out.update(cmd=p.args, lstart=p.lstart, env=p.env, root=p.root,
                        ancestors=[self.proc_row(a, procs, total_kb, serving) for a in core.ancestors(pid, procs)],
                        tree=[self.proc_row(q, procs, total_kb, serving) for q in tree],
-                       tree_rss_mb=tree_kb // 1024, tree_ram_pct=round(100 * tree_kb / total_kb, 2) if total_kb else 0,
+                       tree_rss_gb=round(tree_kb / 1024 ** 2, 2), tree_ram_pct=round(100 * tree_kb / total_kb, 2) if total_kb else 0,
                        tickets=self.ticket_rows("id=?", (int(p.env["BQ_TICKET"]),))
                        if p.env.get("BQ_TICKET", "").isdigit() else [])
         out["cwd"] = system.cwd_of(pid)  # outside the lock: it can take a moment
@@ -369,7 +405,7 @@ class Queue:
             mine = {q.pid for q in procs.values() if q.env.get("CLAUDE_PID") == str(claude_pid)}
             if claude_pid in procs:
                 mine |= {claude_pid, *core.descendants(claude_pid, procs)}
-            rows = sorted((self.proc_row(procs[x], procs, total_kb) for x in mine), key=lambda r: -r["rss_mb"])
+            rows = sorted((self.proc_row(procs[x], procs, total_kb) for x in mine), key=lambda r: -r["rss_gb"])
             rss_kb = sum(procs[x].rss_kb for x in mine)
             avail_kb = total_kb * mem["free_pct"] / 100
             claude = procs.get(claude_pid)
@@ -382,7 +418,7 @@ class Queue:
                     "ralphy": m.group(1) if m else None, "session_id": sid,
                     "transcript": transcript[0] if transcript else None,
                     "etime": claude.etime if claude else None, "lstart": claude.lstart if claude else None,
-                    "rss_mb": rss_kb // 1024, "ram_pct": round(100 * rss_kb / total_kb, 2) if total_kb else 0,
+                    "rss_gb": round(rss_kb / 1024 ** 2, 2), "ram_pct": round(100 * rss_kb / total_kb, 2) if total_kb else 0,
                     "avail_pct": round(100 * rss_kb / avail_kb, 1) if avail_kb else 0,
                     "total_gb": mem["total_gb"], "avail_gb": round(avail_kb / 1024 ** 2, 1),
                     "procs": rows, "tickets": tickets}
@@ -391,7 +427,9 @@ class Queue:
         agents = {}
         for p in procs.values():
             if p.kind == "claude":
-                agents.setdefault(p.pid, {"rss": 0, "procs": 0})["rss"] += p.rss_kb
+                a = agents.setdefault(p.pid, {"rss": 0, "cpu": 0.0, "procs": 0})
+                a["rss"] += p.rss_kb
+                a["cpu"] += p.cpu
         relevant = []
         self.sub_tickets = dict(self.db.execute(
             "select id, subagent from tickets where state!='done' and subagent is not null").fetchall())
@@ -399,13 +437,14 @@ class Queue:
         for p in procs.values():
             cp = p.env.get("CLAUDE_PID", "")
             if p.owner == "agent" and cp.isdigit():
-                a = agents.setdefault(int(cp), {"rss": 0, "procs": 0})
+                a = agents.setdefault(int(cp), {"rss": 0, "cpu": 0.0, "procs": 0})
                 a["rss"] += p.rss_kb
+                a["cpu"] += p.cpu
                 a["procs"] += 1
             if p.kind in core.AGENT_EXEC_KINDS | core.INFRA_KINDS | {"gq", "runner_worker", "embedded_pg"} \
                     or p.root is not None:
                 relevant.append(self.proc_row(p, procs, total_kb, serving))
-        relevant.sort(key=lambda r: -r["rss_mb"])
+        relevant.sort(key=lambda r: -r["rss_gb"])
         tickets = self.ticket_rows("state!='done' or ended>?", (time.time() - 3600,))
         peaks = self.peaks()
         for t in tickets:
@@ -415,19 +454,24 @@ class Queue:
             if t["state"] == "granted":
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
                 t["rss_gb"] = round(self.now_gb[t["id"]], 1) if t["id"] in self.now_gb else None
+            t["cpu_pct"] = round(self.now_cpu[t["id"]], 1) if t["id"] in self.now_cpu else None
         return {
             "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "used": pl.used,
             "base_slots": core.SLOTS, "max_slots": ceiling, "headroom_gb": core.HEADROOM_GB,
             "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1), "reserve_gb": round(pl.reserve_gb, 1),
             "swap_growth_gb": round(swap_gb, 1), "swap_growth_limit_gb": core.SWAP_GROWTH_GB,
             "swap_window_s": core.SWAP_WINDOW_S, "peak_history": core.PEAK_HISTORY,
+            "cpu_total_pct": round(self.cpu_total, 1), "builds_gb": round(sum(self.now_gb.values()), 1),
+            "builds_cpu_pct": round(sum(c for tid, c in self.now_cpu.items() if tid in self.now_gb), 1),
+            "outside": self.loads.get("outside", {"n": 0}), "runner_load": self.loads.get("runner"),
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
             "would_kill": would_kill,
-            "agents": sorted(({"pid": k, "label": self.agent_label(k, procs), "rss_mb": v["rss"] // 1024,
+            "agents": sorted(({"pid": k, "label": self.agent_label(k, procs), "rss_gb": round(v["rss"] / 1024 ** 2, 2),
                                "ram_pct": round(100 * v["rss"] / total_kb, 1) if total_kb else 0,
+                               "cpu_pct": round(v["cpu"] / system.NCPU, 1),
                                "procs": v["procs"], "alive": k in procs} for k, v in agents.items()),
-                             key=lambda a: -a["rss_mb"]),
+                             key=lambda a: -a["rss_gb"]),
             "processes": relevant, "tickets": tickets, "events": list(self.events)[:80],
         }
 
