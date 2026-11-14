@@ -6,12 +6,12 @@ Machine-wide FIFO queue for the heavy builds of the Claude agents (Gradle/JVM, X
 Swift, Rust, Go, Maven, sbt), with a memory monitor, process cleanup and a page at http://127.0.0.1:8787.
 Runs on macOS, Linux and Windows.
 
-![Queue page: slots, memory, running and waiting builds, agents](docs/queue.png)
+![Queue page: slots, memory, running and waiting builds, agents](docs/queue-en.png)
 
-![Agent dialog: session, every process with its memory share, tickets](docs/agent-dialog.png)
+![Agent dialog: session, every process with its memory share, tickets](docs/agent-dialog-en.png)
 
 The page speaks English (EN-US) and Portuguese (PT-BR): it starts in the browser language and keeps the choice
-made in its selector. The screenshots show it in Portuguese, with command lines and session ids masked.
+made in its selector. Command lines and agent names are masked in these screenshots.
 
 ## Rules
 
