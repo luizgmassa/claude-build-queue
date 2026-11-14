@@ -466,8 +466,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.end_headers()
         try:
+            self.end_headers()  # flushes the headers: a dead client fails here already
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass  # the waiting gq died; the scheduler reaps its ticket

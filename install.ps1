@@ -9,6 +9,13 @@ $bin = Join-Path $HOME ".local\bin"
 $venv = Join-Path $data "venv"
 $python = if ($env:PYTHON) { $env:PYTHON } else { (Get-Command python -ErrorAction Stop).Source }
 
+# a running server holds the venv's python open, so stop it before the venv is rebuilt
+Stop-ScheduledTask -TaskName $label -ErrorAction SilentlyContinue
+$server = Join-Path $here "bq\server.py"
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($server) } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 1
+
 New-Item -ItemType Directory -Force $data, $bin | Out-Null
 & $python -m venv --clear $venv
 if ($LASTEXITCODE) { throw "venv creation failed with $python" }
@@ -23,13 +30,12 @@ $sh = "#!/bin/sh`nexec `"$($py -replace '\\', '/')`" `"$($gq -replace '\\', '/')
 [IO.File]::WriteAllText((Join-Path $bin "gq"), $sh)
 
 $action = New-ScheduledTaskAction -Execute (Join-Path $venv "Scripts\pythonw.exe") `
-    -Argument "`"$(Join-Path $here 'bq\server.py')`"" -WorkingDirectory $here
+    -Argument "`"$server`"" -WorkingDirectory $here
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $label -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
-Stop-ScheduledTask -TaskName $label -ErrorAction SilentlyContinue
 Start-ScheduledTask -TaskName $label
 
 if (-not (($env:Path -split ";") -contains $bin)) {

@@ -37,11 +37,12 @@ threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 env = {**os.environ, "BQ_URL": "http://127.0.0.1:8788", "CLAUDE_PID": "", "BQ_TICKET": ""}
 gq = [sys.executable, str(ROOT / "bq/gq.py"), "run", "--"]
-log = Path(os.environ["BQ_DATA"]) / "runs.log"
-job = [sys.executable, "-c", "import os, sys, time\n"
+marks = Path(os.environ["BQ_DATA"]) / "marks"
+marks.mkdir()
+job = [sys.executable, "-c", "import os, sys, time\n"  # one file per mark: Windows appends are not atomic
        "def mark(kind):\n"
-       "    with open(sys.argv[1], 'a') as f: f.write(f'{kind} {os.environ[\"N\"]} {time.time()}\\n')\n"
-       "mark('start'); time.sleep(3); mark('end')", str(log)]
+       "    open(os.path.join(sys.argv[1], kind + '-' + os.environ['N']), 'w').write(str(time.time()))\n"
+       "mark('start'); time.sleep(3); mark('end')", str(marks)]
 procs = []
 for n in range(1, 6):
     procs.append(subprocess.Popen(gq + job, env={**env, "N": str(n)}, stderr=subprocess.PIPE))
@@ -50,9 +51,9 @@ time.sleep(1)
 procs[3].kill()  # job 4 dies while waiting: its ticket must be reaped, not block the queue
 codes = [p.wait(timeout=60) for p in procs]
 
-events = [line.split() for line in log.read_text().splitlines()]
-starts = {n: float(t) for kind, n, t in events if kind == "start"}
-ends = {n: float(t) for kind, n, t in events if kind == "end"}
+times = {f.name: float(f.read_text()) for f in marks.iterdir()}
+starts = {k[6:]: t for k, t in times.items() if k.startswith("start-")}
+ends = {k[4:]: t for k, t in times.items() if k.startswith("end-")}
 order = sorted(starts, key=starts.get)
 peak = max(sum(1 for n in starts if starts[n] <= t < ends[n]) for t in starts.values())
 print("start order:", order, "| peak concurrency:", peak, "| exit codes:", codes)
