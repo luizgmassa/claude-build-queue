@@ -57,7 +57,11 @@ ends = {k[4:]: t for k, t in times.items() if k.startswith("end-")}
 order = sorted(starts, key=starts.get)
 peak = max(sum(1 for n in starts if starts[n] <= t < ends[n]) for t in starts.values())
 print("start order:", order, "| peak concurrency:", peak, "| exit codes:", codes)
-assert set(order[:2]) == {"1", "2"} and order[2:] == ["3", "5"], order  # 1 and 2 enter in the same tick
+# FIFO by the server's grant times: jobs granted in the same tick may write their start marks in any order
+with server.Q.lock:
+    granted = dict(server.Q.db.execute("select id, granted from tickets where id <= 5").fetchall())
+assert set(order[:2]) == {"1", "2"} and set(order[2:]) == {"3", "5"}, order
+assert granted[1] <= granted[3] and granted[2] <= granted[3] <= granted[5] and granted[4] is None, granted
 assert peak == 2, peak
 assert codes[3] != 0 and all(c == 0 for i, c in enumerate(codes) if i != 3), codes
 

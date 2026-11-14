@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from bq.settings import LABEL
+from bq.settings import DATA, LABEL
 
 TASK_PS = f"(Get-ScheduledTask -TaskName '{LABEL}' -ErrorAction Stop)"
 
@@ -78,10 +78,21 @@ def restart(argv):
     sys.stderr.flush()
     if os.name != "nt":
         os.execv(sys.executable, [sys.executable, *argv])
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     if installed():
-        subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
-                          f"Start-Sleep -Seconds 2; Start-ScheduledTask -TaskName '{LABEL}'"], creationflags=flags)
-    else:
-        subprocess.Popen([sys.executable, *argv], creationflags=flags)
+        _detached(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+                   f"Start-Sleep -Seconds 2; Get-Date -Format s; Start-ScheduledTask -TaskName '{LABEL}'; 'started'"])
+        os._exit(1)  # a failure exit: if the helper is lost, the task's restart on failure brings the server back
+    _detached([sys.executable, *argv])
     os._exit(0)
+
+
+def _detached(cmd):
+    """Starts cmd outside this process's console, group and, where Windows allows it, its job: the task's job
+    may end with this process. Its output goes to restart.log."""
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    with open(DATA / "restart.log", "a") as out:
+        try:
+            subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, stdout=out,
+                             stderr=subprocess.STDOUT)
+        except OSError:  # the job forbids breakaway
+            subprocess.Popen(cmd, creationflags=flags, stdout=out, stderr=subprocess.STDOUT)

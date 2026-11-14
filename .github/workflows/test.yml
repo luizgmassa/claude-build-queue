@@ -53,7 +53,7 @@ jobs:
           get() { curl -sf http://127.0.0.1:8787/api/config | "$py" -c "import json,sys; d=json.load(sys.stdin); print($1, end='')"; }
           post() { curl -sf -H 'Content-Type: application/json' -d "$1" http://127.0.0.1:8787/api/config; echo; }
           wait_restart() {
-            for i in $(seq 40); do sleep 1; s=$(get 'd["started"]' 2>/dev/null) && [ "$s" != "$1" ] && return 0; done
+            for i in $(seq 90); do sleep 1; s=$(get 'd["started"]' 2>/dev/null) && [ "$s" != "$1" ] && return 0; done
             echo "server did not come back" >&2; return 1
           }
           s0=$(get 'd["started"]'); [ "$(get 'd["autostart"]')" = True ]
@@ -68,4 +68,10 @@ jobs:
       - name: Server log
         if: always()
         shell: pwsh
-        run: Get-Content "$HOME\.local\share\build-queue\server.log" -ErrorAction SilentlyContinue
+        run: |
+          Get-Content "$HOME\.local\share\build-queue\server.log" -ErrorAction SilentlyContinue
+          "--- restart.log"
+          Get-Content "$HOME\.local\share\build-queue\restart.log" -ErrorAction SilentlyContinue
+          "--- task"
+          Get-ScheduledTask -TaskName com.massa.build-queue | Select-Object State, @{n="Trigger";e={$_.Triggers[0].Enabled}}
+          Get-ScheduledTaskInfo -TaskName com.massa.build-queue | Select-Object LastRunTime, LastTaskResult
