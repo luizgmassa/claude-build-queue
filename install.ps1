@@ -41,4 +41,6 @@ Start-ScheduledTask -TaskName $label
 if (-not (($env:Path -split ";") -contains $bin)) {
     Write-Host "add $bin to your user PATH so Git Bash and cmd find gq"
 }
-Write-Host "installed: http://127.0.0.1:8787 (log: $(Join-Path $data 'server.log'))"
+# the port the settings dialog saved in config.json, 8787 by default
+$port = & $py -c "import sys; sys.path.insert(0, sys.argv[1]); from bq import settings; print(settings.load()['port'])" $here
+Write-Host "installed: http://127.0.0.1:$port (log: $(Join-Path $data 'server.log'))"

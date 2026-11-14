@@ -17,8 +17,8 @@ import psutil
 from bq import core
 
 PRESSURE_NORMAL = 1
-PSI_CRITICAL_PCT = 10.0  # Linux: share of the last 10 s in which every runnable task waited for memory
-LOW_MEMORY_PCT = 5  # where the kernel gives no signal: available memory below this share of RAM is critical
+PSI_CRITICAL_PCT = core.SETTINGS["psi_critical_pct"]  # Linux: share of the last 10 s every runnable task waited
+LOW_MEMORY_PCT = core.SETTINGS["low_memory_pct"]  # no kernel signal: available memory below this share is critical
 ATTRS = ["pid", "ppid", "name", "cmdline", "environ", "memory_info", "cpu_percent", "create_time", "status"]
 
 

@@ -14,6 +14,8 @@ mkdir -p "$HOME/.local/bin" "$data"
 ln -sf "$here/bq/gq.py" "$HOME/.local/bin/gq"
 "$python" -m venv --clear "$venv"
 "$venv/bin/python" -m pip install -q --disable-pip-version-check "psutil>=6"
+# the port the settings dialog saved in config.json, 8787 by default
+port=$("$venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); from bq import settings; print(settings.load()["port"])' "$here")
 
 case "$(uname -s)" in
 Darwin)
@@ -35,8 +37,9 @@ Darwin)
 </plist>
 EOF
   launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl enable "gui/$(id -u)/$label"  # a reinstall turns the start with the system back on
   launchctl bootstrap "gui/$(id -u)" "$plist"
-  echo "installed: http://127.0.0.1:8787 (log: $logfile)"
+  echo "installed: http://127.0.0.1:$port (log: $logfile)"
   ;;
 Linux)
   unit="$HOME/.config/systemd/user/$label.service"
@@ -56,7 +59,7 @@ EOF
   systemctl --user daemon-reload
   systemctl --user enable "$label.service"
   systemctl --user restart "$label.service"
-  echo "installed: http://127.0.0.1:8787 (log: journalctl --user -u $label)"
+  echo "installed: http://127.0.0.1:$port (log: journalctl --user -u $label)"
   ;;
 *)
   echo "unsupported system $(uname -s); on Windows run install.ps1" >&2

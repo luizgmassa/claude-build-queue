@@ -4,11 +4,15 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# settings load at import: read them from an empty data dir, never this machine's config.json
+os.environ["BQ_DATA"] = os.environ.get("BQ_TEST_DATA") or tempfile.mkdtemp(prefix="bq-test-")
+os.environ["BQ_TEST_DATA"] = os.environ["BQ_DATA"]
 from bq import core, system  # noqa: E402
 
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)", "bq-test-marker"]

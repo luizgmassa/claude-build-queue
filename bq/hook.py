@@ -7,9 +7,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bq.core import CALLS, analyze_command  # noqa: E402
+from bq.core import CALLS, SETTINGS, analyze_command  # noqa: E402
 
-PAGE = "http://127.0.0.1:8787"
+PAGE = f"http://127.0.0.1:{SETTINGS['port']}"
 
 
 def decide(tool_input):
@@ -18,8 +18,8 @@ def decide(tool_input):
     if offending:
         return ("Heavy builds (Gradle/JVM, xcodebuild, pod install, uv run, npm/pnpm/yarn/bun install/build/test, "
                 "tsc, make/cmake/ninja/bazel, compilers, dotnet/msbuild, swift, cargo, go, mvn, sbt) "
-                "must go through the machine-wide build queue "
-                "(max 2 concurrent runs, FIFO). Prefix each such command with `gq run --`, e.g. "
+                f"must go through the machine-wide build queue (FIFO, {SETTINGS['base_slots']} runs at once "
+                "before memory checks). Prefix each such command with `gq run --`, e.g. "
                 "`cd ../my-worktree && gq run -- ./gradlew :shared:check`, and call Bash with "
                 "run_in_background: true. gq waits for a slot, runs, and frees the slot on exit. "
                 f"Offending: {offending}. Queue: {PAGE}")

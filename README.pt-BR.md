@@ -15,6 +15,8 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 
 ## Regras
 
+Os números abaixo são os padrões; cada um deles é uma configuração (veja [Configurações](#configurações)).
+
 - **2 vagas**, contando o runner self-hosted do GitHub (`Runner.Worker` vivo = 1 vaga). O runner nunca
   espera: se chega com 2 builds locais rodando, fica 3 até um terminar, e ninguém novo entra.
 - **FIFO estrito**: só o primeiro da fila pode entrar.
@@ -26,11 +28,11 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
   conta a memória que vai tomar. Reservam os builds da fila, o runner (pela estimativa de `gradle-check`) e
   os builds sem ticket (build de agente sem vaga, build fora de agente, pelo tipo de comando). Quando um
   sinal piora, nada é morto: as entradas extras param até ele passar. `gq config max N` limita as vagas a N
-  (no mínimo 2); `gq config max off`, o padrão, tira o limite.
+  (no mínimo o número de vagas base); `gq config max off`, o padrão, tira o limite.
 - **Estimativa por tipo de comando** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
   `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`, `node`, `cc`, `bazel`, `dotnet`, `msbuild`,
   `swift`, `cargo`, `go`, `maven`, `sbt`): maior pico das últimas 5 execuções liberadas
-  do mesmo tipo; antes disso, a tabela `DEFAULT_GB` de `bq/core.py`. O pico soma a árvore do `gq`, o daemon
+  do mesmo tipo; antes disso, a estimativa inicial do tipo, nas configurações. O pico soma a árvore do `gq`, o daemon
   Gradle que atende o cliente, os workers dele e o daemon Kotlin ligado a ele.
 - **Memória**: só a pressão crítica bloqueia (ninguém entra, nem por vaga extra). macOS: nível `critical` do
   kernel (`warn` não bloqueia). Linux: PSI `full avg10` ≥ 10% em `/proc/pressure/memory`. Windows: o aviso de
@@ -51,8 +53,25 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 - Build sem vaga nunca é morto, Gradle incluído: o gancho é a única imposição. Ele ainda ocupa vaga, então a
   fila espera por ele.
 - Builds fora de agente (seu terminal, Android Studio) contam vaga, mas nunca são mortos.
-- Nunca tocados: runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), backend do staging
-  (`~/.health-hub-local`), processos `claude`, o próprio servidor.
+- Nunca tocados: runner (`GITHUB_ACTIONS`, ou linha de comando com um marcador do runner, `/actions-runner/`
+  por padrão), processo cuja linha de comando contém um caminho protegido (nenhum por padrão; um backend local,
+  por exemplo), processos `claude`, o próprio servidor.
+
+## Configurações
+
+O botão ⚙ da página abre as configurações. A parte simples tem as vagas base, o teto, um perfil de memória
+(Cuidadoso, Equilibrado, Ousado: folga, limite de swap e intervalo entre builds extras juntos), a limpeza e o
+início com o sistema. **Avançado** tem todas as configurações, cada uma com seu padrão: limites da fila e da
+memória, tempos da limpeza, caminhos protegidos e marcadores do runner (um por linha), a estimativa inicial de
+cada tipo de comando, a porta e o intervalo de varredura.
+
+**Salvar e aplicar** valida cada valor (nada é gravado enquanto um estiver errado), grava `config.json` e
+reinicia o servidor; os builds em andamento continuam e o `gq` reconecta. Uma porta nova leva a página para ela;
+o `gq` e o gancho também leem a porta do `config.json`, mas um `gq` já rodando continua na antiga, então mude
+sem build esperando. `BQ_PORT` no ambiente do servidor vale no lugar da configuração. O início com o sistema é a
+chave do próprio gerenciador de serviços (launchd, `systemctl --user`, o gatilho de logon da tarefa do Windows);
+reinstalar liga de novo. A página só aceita essas mudanças vindas dela mesma: requisição JSON cujo `Host` e
+`Origin` são `127.0.0.1` ou `localhost` na porta do servidor.
 
 ## Uso pelos agentes
 

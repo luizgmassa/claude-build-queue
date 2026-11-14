@@ -19,11 +19,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-URL = os.environ.get("BQ_URL", "http://127.0.0.1:8787")
-CONFIG = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue")) / "config.json"
-UNREACHABLE_LIMIT_S = 60
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # ~/.local/bin/gq is a symlink to this file
+from bq import settings  # noqa: E402  (standard library only, like gq itself)
+
+SETTINGS = settings.load()
+URL = os.environ.get("BQ_URL", f"http://127.0.0.1:{SETTINGS['port']}")
+CONFIG = settings.CONFIG
+UNREACHABLE_LIMIT_S = SETTINGS["unreachable_limit_s"]
 EX_TEMPFAIL = 75
-BASE_SLOTS = 2  # core.SLOTS; gq stays standard-library only, so it does not import bq.core
+BASE_SLOTS = SETTINGS["base_slots"]
 SIGNALS = [getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK") if hasattr(signal, n)]
 
 
@@ -152,7 +156,7 @@ def status():
     m = v["memory"]
     print(f"slots {v['used']} in use (base {v.get('base_slots')}, max {v.get('max_slots') or 'off'}, "
           f"avail {v.get('avail_gb')} GB, reserved {v.get('reserve_gb')} GB, "
-          f"swap +{v.get('swap_growth_gb')} GB/60s)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
+          f"swap +{v.get('swap_growth_gb')} GB/{v.get('swap_window_s')}s)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
           f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
           f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB")
     if v["blocked"]:
@@ -191,8 +195,10 @@ def config_max(value):
     if value == "off":
         set_config("max", None)
         return print("max off")
-    if not value.isdigit() or int(value) < BASE_SLOTS:
-        sys.exit(f"max must be off or a whole number of at least {BASE_SLOTS}")
+    _n, err = settings.check("max", int(value) if value.isdigit() else value, BASE_SLOTS)
+    if err:
+        high = settings.SPEC["max"][4]
+        sys.exit(f"max must be off or a whole number from {BASE_SLOTS} to {high}")
     set_config("max", int(value))
     print(f"max {int(value)}")
 

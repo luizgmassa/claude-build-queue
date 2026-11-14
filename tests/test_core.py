@@ -1,11 +1,16 @@
 import json
+import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bq import core  # noqa: E402
+# settings load at import: read them from an empty data dir, never this machine's config.json
+os.environ["BQ_DATA"] = os.environ.get("BQ_TEST_DATA") or tempfile.mkdtemp(prefix="bq-test-")
+os.environ["BQ_TEST_DATA"] = os.environ["BQ_DATA"]
+from bq import core, settings  # noqa: E402
 from bq.hook import decide  # noqa: E402
 
 CLIENT = "java -Xmx64m -Dorg.gradle.appname=gradlew -jar /w/gradle/wrapper/gradle-wrapper.jar check"
@@ -94,14 +99,21 @@ class Cleanup(unittest.TestCase):
         pl = tick(world(gq, client), [core.Ticket(id=1, pid=201, state="granted", created=0)])
         self.assertEqual(pl.kills, [])
 
-    def test_runner_and_nonagent_and_staging_are_never_killed(self):
-        runner = P(500, 1, CLIENT + " -Dgradle.user.home=/u/.gradle-health-hub-ci", GITHUB_ACTIONS="true")
+    def test_runner_and_nonagent_and_protected_paths_are_never_killed(self):
+        from unittest import mock
+        runner = P(500, 1, CLIENT + " -Dgradle.user.home=/u/.gradle-ci", GITHUB_ACTIONS="true")
+        marked = P(503, 1, CLIENT + " -Dgradle.user.home=/u/.gradle-ci", CLAUDE_PID=4242)
         human = P(501, 1, CLIENT)
-        staging = P(502, 1, "/usr/bin/java -classpath /u/.health-hub-local/releases/x/lib/runtime.jar M",
-                    CLAUDE_PID=4242)
-        pl = tick(world(runner, human, staging))
+        staging = P(502, 1, "/usr/bin/java -classpath /u/.staging/releases/x/lib/runtime.jar M", CLAUDE_PID=4242)
+        # positive control: with the default (empty) lists, a dead agent's processes are orphans and die
+        self.assertEqual({k[0] for k in tick(world(runner, marked, human, staging)).kills}, {502, 503})
+        with mock.patch.object(core, "PROTECTED_PATHS", ("/.staging/",)), \
+                mock.patch.object(core, "RUNNER_MARKERS", ("/actions-runner/", ".gradle-ci")):
+            procs = world(runner, marked, human, staging)
+            pl = tick(procs)
         self.assertEqual(pl.kills, [])
         self.assertEqual(pl.counts["nonagent"], 1)
+        self.assertEqual((procs[502].owner, procs[503].owner), ("protected", "runner"))
 
     def test_orphan_of_dead_agent_is_killed(self):
         pl = tick(world(P(600, 1, CLIENT, CLAUDE_PID=4242)))
@@ -389,9 +401,17 @@ class Messages(unittest.TestCase):
         self.assertTrue(self.PT.search('f"ticket #{tid} entrou na vaga"'))  # positive control: the scan fires
         self.assertTrue(self.PT.search("sem vaga (3/3 em uso)"))
         root = Path(__file__).resolve().parent.parent / "bq"
-        for name in ("core.py", "server.py", "system.py"):
+        for name in ("core.py", "server.py", "system.py", "settings.py", "service.py", "gq.py", "hook.py"):
             for n, line in enumerate((root / name).read_text(encoding="utf-8").splitlines(), 1):
                 self.assertFalse(self.PT.search(line), f"{name}:{n}: {line.strip()}")
+
+    def test_page_labels_every_setting_in_both_languages(self):
+        i18n = self.page_i18n()
+        for lang in ("en-US", "pt-BR"):
+            for key, (group, _default, kind, low, _high) in settings.SPEC.items():
+                for k in (f"cfg.{key}", f"cfg.{key}.help", f"cfg.group.{group}",
+                          *([f"cfg.{key}.{c}" for c in low] if kind == "choice" else [])):
+                    self.assertTrue(i18n[lang].get(k), f"{lang} {k}")
 
     def test_page_has_every_server_key_in_both_languages_with_the_same_english_text(self):
         i18n = self.page_i18n()
@@ -544,10 +564,6 @@ class ToolchainCleanup(unittest.TestCase):
         self.assertEqual(self.kills(*procs), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class MaxConfig(unittest.TestCase):
     def test_gq_config_max_keeps_other_keys_and_the_server_reads_it(self):
         import tempfile
@@ -570,3 +586,155 @@ class MaxConfig(unittest.TestCase):
                 gq.config_max("off")
                 self.assertEqual(json.loads(cfg.read_text()), {"enforce": True})
                 self.assertIsNone(q.ceiling())
+
+
+class Settings(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        from bq import settings
+        self.settings = settings
+        self.dir = tempfile.TemporaryDirectory()
+        cfg = Path(self.dir.name) / "config.json"
+        self.cfg = cfg
+        for patch in (mock.patch.object(settings, "CONFIG", cfg), mock.patch.object(settings, "DATA", cfg.parent)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.dir.cleanup)
+
+    def test_defaults_and_bad_stored_values_fall_back_one_key_at_a_time(self):
+        s = self.settings
+        self.assertEqual(s.load(), s.defaults())
+        self.cfg.write_text(json.dumps({"headroom_gb": "lots", "extra_gap_s": 45, "max": 1, "base_slots": 3,
+                                        "default_gb": {"node": 7}, "protected_paths": ["/x/"]}))
+        v = s.load()
+        self.assertEqual(v["headroom_gb"], 6.0)  # a string: ignored
+        self.assertEqual((v["extra_gap_s"], v["base_slots"], v["max"]), (45, 3, None))  # max 1 < base 3: off
+        self.assertEqual((v["default_gb"]["node"], v["default_gb"]["gradle-check"]), (7.0, 8.0))
+        self.assertEqual(v["protected_paths"], ["/x/"])
+        self.cfg.write_text("{not json")
+        self.assertEqual(s.load(), s.defaults())
+
+    def test_validate_reports_every_bad_value_and_cross_checks_max_against_base(self):
+        s = self.settings
+        clean, errors = s.validate({"base_slots": 4, "max": 3, "port": 80, "tick_s": True, "enforce": "yes",
+                                    "runner_ctype": "nope", "block_pressure": 3, "protected_paths": ["ok", " "],
+                                    "default_gb": {"nope": 1}, "bogus": 1})
+        self.assertEqual(set(errors), {"max", "port", "tick_s", "enforce", "runner_ctype", "block_pressure",
+                                       "protected_paths", "default_gb", "bogus"})
+        self.assertEqual(errors["max"], core.msg("config.max_below_base", base=4))
+        self.assertEqual(errors["port"], core.msg("config.range", min=1024, max=65535))
+        for e in errors.values():
+            self.assertIn(e["key"], core.EN)
+        clean, errors = s.validate({"max": None, "base_slots": 1, "block_pressure": 2, "headroom_gb": 4})
+        self.assertEqual(errors, {})
+        self.assertEqual((clean["max"], clean["base_slots"], clean["headroom_gb"]), (None, 1, 4.0))
+
+    def test_save_keeps_only_changed_and_unknown_keys(self):
+        s = self.settings
+        self.cfg.write_text(json.dumps({"enforce": True, "future_key": 1, "headroom_gb": 9.0}))
+        clean, errors = s.validate({"headroom_gb": 6.0, "extra_gap_s": 10, "protected_paths": [" /p/ "]})
+        self.assertEqual(errors, {})
+        s.save(clean)
+        self.assertEqual(json.loads(self.cfg.read_text()),
+                         {"future_key": 1, "enforce": True, "extra_gap_s": 10, "protected_paths": ["/p/"]})
+
+
+class ConfigApi(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        from bq import server, settings
+        self.server = server
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        cfg = Path(self.dir.name) / "config.json"
+        self.cfg = cfg
+        self.restarts = []
+        for patch in (mock.patch.object(settings, "CONFIG", cfg), mock.patch.object(settings, "DATA", cfg.parent),
+                      mock.patch.object(server, "restart_soon", lambda: self.restarts.append(1)),
+                      mock.patch.object(server.service, "installed", lambda: True),
+                      mock.patch.object(server.service, "autostart", lambda: True)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def apply(self, body):
+        import threading
+        out = self.server.apply_config(body)
+        for t in threading.enumerate():
+            if t.name == "restart":
+                t.join(5)
+        return out
+
+    def test_invalid_values_save_nothing_and_do_not_restart(self):
+        reply, code = self.apply({"values": {"headroom_gb": -1, "extra_gap_s": 5}})
+        self.assertEqual(code, 400)
+        self.assertEqual(set(reply["errors"]), {"headroom_gb"})
+        self.assertFalse(self.cfg.exists())
+        self.assertEqual(self.restarts, [])
+        self.assertEqual(self.apply({"values": []})[1], 400)
+
+    def test_valid_values_are_saved_then_the_server_restarts(self):
+        from unittest import mock
+        with mock.patch.object(self.server.service, "set_autostart", return_value="") as switch:
+            reply, code = self.apply({"values": {"extra_gap_s": 5}, "autostart": True})
+            switch.assert_not_called()  # unchanged
+            self.assertEqual((code, reply["ok"]), (200, True))
+            self.assertEqual(json.loads(self.cfg.read_text()), {"extra_gap_s": 5})
+            self.assertEqual(self.restarts, [1])
+            reply, code = self.apply({"values": {}, "autostart": False})
+            switch.assert_called_once_with(False)
+        with mock.patch.object(self.server.service, "set_autostart", return_value="denied"):
+            reply, code = self.apply({"values": {}, "autostart": False})
+        self.assertEqual((code, reply["errors"]["autostart"]["key"]), (400, "config.autostart"))
+
+    def test_taken_port_is_refused(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            s.listen()
+            port = s.getsockname()[1]
+            if port < 1024:
+                self.skipTest("ephemeral port below the allowed range")
+            reply, code = self.apply({"values": {"port": port}})
+        self.assertEqual((code, reply["errors"]["port"]), (400, core.msg("config.port_taken", port=port)))
+
+    def test_only_the_page_itself_may_post(self):
+        from types import SimpleNamespace
+        port = self.server.PORT
+        ok = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}", "Content-Type": "application/json"}
+
+        def allowed(**headers):
+            h = {**ok, **headers}
+            return self.server.Handler.same_origin(SimpleNamespace(headers={k: v for k, v in h.items() if v}))
+
+        self.assertTrue(allowed())
+        self.assertTrue(allowed(Origin=None))  # curl and gq send no Origin
+        self.assertFalse(allowed(Origin="http://evil.example"))
+        self.assertFalse(allowed(Host=f"evil.example:{port}"))  # DNS rebinding
+        self.assertFalse(allowed(**{"Content-Type": "text/plain"}))  # a form post skips the CORS preflight
+
+    def test_config_view_lists_every_setting_with_its_bounds(self):
+        v = self.server.config_view()
+        self.assertEqual([f["key"] for f in v["spec"]], list(self.server.settings.SPEC))
+        port = next(f for f in v["spec"] if f["key"] == "port")
+        self.assertEqual((port["min"], port["max"]), (1024, 65535))
+        self.assertEqual(next(f for f in v["spec"] if f["key"] == "block_pressure")["choices"], [2, 4])
+        self.assertTrue(v["autostart"])
+
+
+class Autostart(unittest.TestCase):
+    def test_launchd_disabled_list_is_read_in_both_formats(self):
+        from unittest import mock
+        from bq import service
+        for out, want in [('\t"com.massa.build-queue" => disabled', False), ('"com.massa.build-queue" => true', False),
+                          ('"com.massa.build-queue" => enabled', True), ('"other" => disabled', True)]:
+            with mock.patch.object(service, "_system", return_value="darwin"), \
+                    mock.patch.object(service, "installed", return_value=True), \
+                    mock.patch.object(service, "_run", return_value=(0, out)), \
+                    mock.patch.object(service.os, "getuid", return_value=501, create=True):
+                self.assertEqual(service.autostart(), want, out)
+        with mock.patch.object(service, "installed", return_value=False):
+            self.assertIsNone(service.autostart())
+
+
+if __name__ == "__main__":
+    unittest.main()

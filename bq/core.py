@@ -7,30 +7,31 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
-from pathlib import Path
 
-SLOTS = 2  # base slots, runner included: these never wait on a memory check
-HEADROOM_GB = 6.0  # available memory that must remain after peak reserves and the next item's estimate
-EXTRA_GAP_S = 30  # a new build needs time to show its memory before the next extra entry is judged
-SWAP_GROWTH_GB = 0.5  # swap growing this much within SWAP_WINDOW_S stops extra entries
-SWAP_WINDOW_S = 60
-RUNNER_CTYPE = "gradle-check"  # the runner's peak reserve uses this command type's estimate
-PEAK_HISTORY = 5  # estimate = largest of the last N measured peaks of the same command type
-# Starting estimates (GB of the whole build: client, daemon, workers, Kotlin daemon) before any measurement.
-DEFAULT_GB = {"gradle-check": 8.0, "gradle-backend": 6.0, "gradle-ios": 6.0, "gradle-test": 5.0,
-              "gradle-lint": 3.0, "gradle": 4.0, "xcodebuild": 6.0, "java": 2.0, "pod": 1.0, "uv": 1.0,
-              "node": 3.0, "cc": 4.0, "bazel": 6.0, "dotnet": 3.0, "msbuild": 4.0, "swift": 4.0, "cargo": 4.0,
-              "go": 2.0, "maven": 3.0, "sbt": 4.0, "other": 4.0}
-IDLE_GRACE_S = 20
-KOTLIN_IDLE_S = 60  # idle Kotlin daemon dies even mid-build: KGP falls back to in-process compile
-GRANT_QUIET_S = 20
-TERM_GRACE_S = 10
-CALL_WINDOW_S = 60  # a `gq run` reaches the server within this long after the hook saw its Bash call
+from bq import settings
 
-DATA = Path(os.environ.get("BQ_DATA", Path.home() / ".local/share/build-queue"))
+SETTINGS = settings.load()  # read once per process: the page's Save & Apply restarts the server
+SLOTS = SETTINGS["base_slots"]  # base slots, runner included: these never wait on a memory check
+HEADROOM_GB = SETTINGS["headroom_gb"]  # available memory left after peak reserves and the next item's estimate
+EXTRA_GAP_S = SETTINGS["extra_gap_s"]  # a new build needs time to show its memory before the next extra entry
+SWAP_GROWTH_GB = SETTINGS["swap_growth_gb"]  # swap growing this much within SWAP_WINDOW_S stops extra entries
+SWAP_WINDOW_S = SETTINGS["swap_window_s"]
+RUNNER_CTYPE = SETTINGS["runner_ctype"]  # the runner's peak reserve uses this command type's estimate
+PEAK_HISTORY = SETTINGS["peak_history"]  # estimate = largest of the last N measured peaks of the same command type
+DEFAULT_GB = SETTINGS["default_gb"]  # starting estimates per command type, before any measurement
+IDLE_GRACE_S = SETTINGS["idle_grace_s"]
+KOTLIN_IDLE_S = SETTINGS["kotlin_idle_s"]  # idle Kotlin daemon dies even mid-build: KGP falls back to in-process
+GRANT_QUIET_S = SETTINGS["grant_quiet_s"]
+TERM_GRACE_S = SETTINGS["term_grace_s"]
+CALL_WINDOW_S = SETTINGS["call_window_s"]  # a `gq run` reaches the server within this long after the hook saw it
+PROTECTED_PATHS = tuple(SETTINGS["protected_paths"])  # command-line fragments of processes never touched
+RUNNER_MARKERS = tuple(SETTINGS["runner_markers"])  # command-line fragments that mark the CI runner's processes
+
+DATA = settings.DATA
 CALLS = DATA / "calls.jsonl"  # the hook's record of each `gq run` Bash call: session and subagent
 
-PRESSURE_CRITICAL = 4  # kern.memorystatus_vm_pressure_level; warn (2) does not block
+PRESSURE_CRITICAL = 4  # the macOS kern.memorystatus_vm_pressure_level scale every system reports on
+BLOCK_PRESSURE = SETTINGS["block_pressure"]  # 4 (critical) by default; 2 also blocks on warn
 
 # English text of every message the server emits. A message travels as {"key", "params"}: the log renders it
 # with this table, the page with its own copy per language (page.html, `i18n` block; tests keep them in step).
@@ -64,6 +65,14 @@ EN = {
     "error.pid_gone": "PID {pid} no longer exists",
     "end.released": "released",  # end_reason values stored in the tickets table, as "end." + value
     "end.owner process gone": "owner process gone",
+    "config.type": "wrong type",
+    "config.range": "must be between {min} and {max}",
+    "config.max_below_base": "must be at least the base slots ({base})",
+    "config.choice": "not one of the options",
+    "config.list": "one non-empty entry per line, at most {n} lines of {chars} characters",
+    "config.unknown": "unknown setting",
+    "config.port_taken": "port {port} is in use",
+    "config.autostart": "could not change the start with the system: {detail}",
 }
 
 
@@ -271,11 +280,11 @@ def classify(procs, protected_pids=()):
             src = next((a for a in anc if "CLAUDE_PID" in a.env), None)
             if src:
                 p.env = {**src.env, **p.env}
-        if p.pid in protected_pids or p.kind == "claude" or "/.health-hub-local/" in p.args:
+        if p.pid in protected_pids or p.kind == "claude" or any(m in p.args for m in PROTECTED_PATHS):
             p.owner = "protected"
         elif (p.env.get("GITHUB_ACTIONS") == "true" or p.kind == "runner_worker"
               or any(a.kind == "runner_worker" for a in anc)
-              or ".gradle-health-hub-ci" in p.args or "/actions-runner/" in p.args):
+              or any(m in p.args for m in RUNNER_MARKERS)):
             p.owner = "runner"
         elif "CLAUDE_PID" in p.env:
             p.owner = "agent"
@@ -439,7 +448,7 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
     waiting = sorted((t for t in live if t.state == "waiting"), key=lambda t: t.id)
     used = out.used
     for t in waiting:  # strict FIFO: only the head may enter, so stop at the first refusal
-        if pressure >= PRESSURE_CRITICAL:
+        if pressure >= BLOCK_PRESSURE:
             out.blocked = msg("blocked.pressure")
             break
         if killed_daemon:

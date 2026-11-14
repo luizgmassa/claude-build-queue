@@ -15,6 +15,8 @@ made in its selector. Command lines and agent names are masked in these screensh
 
 ## Rules
 
+The numbers below are the defaults; every one of them is a setting (see [Settings](#settings)).
+
 - **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot). The runner never
   waits: if it arrives with 2 local builds running, the count goes to 3 until one ends, and nobody new gets in.
 - **Strict FIFO**: only the head of the queue may start.
@@ -25,12 +27,12 @@ made in its selector. Command lines and agent names are masked in these screensh
   estimate minus its current memory (never below 0): a build that just started still counts the memory it is
   about to take. Queued builds, the runner (by the `gradle-check` estimate) and builds without a ticket (agent
   builds without a slot, builds outside an agent, by their command type) all reserve. When a signal turns bad,
-  nothing is killed: extra entries stop until it clears. `gq config max N` caps the slots at N (at least 2);
+  nothing is killed: extra entries stop until it clears. `gq config max N` caps the slots at N (at least the base slots);
   `gq config max off`, the default, removes the cap.
 - **Estimate per command type** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
   `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`, `node`, `cc`, `bazel`, `dotnet`, `msbuild`,
   `swift`, `cargo`, `go`, `maven`, `sbt`): the largest peak of the last 5 released runs
-  of the same type; before that, the `DEFAULT_GB` table in `bq/core.py`. The peak adds up the `gq` tree, the
+  of the same type; before that, the starting estimate of the type, in the settings. The peak adds up the `gq` tree, the
   Gradle daemon serving the client, its workers and the Kotlin daemon attached to it.
 - **Memory**: only critical pressure blocks (nobody enters, extra slot included). macOS: the kernel's `critical`
   level (`warn` does not block). Linux: PSI `full avg10` ≥ 10% in `/proc/pressure/memory`. Windows: the
@@ -51,8 +53,25 @@ made in its selector. Command lines and agent names are masked in these screensh
 - A build without a slot is never killed, Gradle included: the hook is the only enforcement. It still takes a
   slot, so the queue waits for it.
 - Builds outside an agent (your terminal, Android Studio) take a slot, but are never killed.
-- Never touched: the runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), the staging backend
-  (`~/.health-hub-local`), `claude` processes, the server itself.
+- Never touched: the runner (`GITHUB_ACTIONS`, or a command line containing a runner marker, `/actions-runner/`
+  by default), a process whose command line contains a protected path (none by default; a local backend, for
+  example), `claude` processes, the server itself.
+
+## Settings
+
+The ⚙ button on the page opens the settings. The simple part has the base slots, the cap, a memory profile
+(Careful, Balanced, Bold: headroom, swap limit and gap between extra builds together), the cleanup and the start
+with the system. **Advanced** has every setting, each with its default: queue and memory thresholds, cleanup
+timers, protected paths and runner markers (one per line), the starting estimate of each command type, the port
+and the scan interval.
+
+**Save & Apply** validates every value (nothing is saved while one is wrong), writes `config.json` and restarts
+the server; running builds keep running and `gq` reconnects. A new port moves the page to it; `gq` and the hook
+read the port from `config.json` too, but a `gq` already running keeps the old one, so change it with no build
+waiting. `BQ_PORT` in the server's environment wins over the setting. The start with the system is the service
+manager's own switch (launchd, `systemctl --user`, the logon trigger of the Windows task); reinstalling turns it
+back on. The page accepts these changes only from itself: a JSON request whose `Host` and `Origin` are
+`127.0.0.1` or `localhost` on the server's port.
 
 ## Use by the agents
 

@@ -7,6 +7,7 @@ read, so agents never race each other: the lock serializes them and the tick dec
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -18,14 +19,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bq import core, system  # noqa: E402
+from bq import core, service, settings, system  # noqa: E402
 from bq.system import log  # noqa: E402
 
-PORT = int(os.environ.get("BQ_PORT", "8787"))
+PORT = int(os.environ.get("BQ_PORT") or core.SETTINGS["port"])  # BQ_PORT wins, so tests never take 8787
 DATA = core.DATA
-CONFIG = DATA / "config.json"
+CONFIG = settings.CONFIG
 PAGE = Path(__file__).with_name("page.html")
-TICK_S = 2.0
+TICK_S = core.SETTINGS["tick_s"]
+STARTED = time.time()  # the page waits for this to change after Save & Apply
+BIND_WAIT_S = 10  # a restart may find the old process still holding the port for a moment
 
 
 def busy_daemons(procs, listen, est):
@@ -414,6 +417,7 @@ class Queue:
             "base_slots": core.SLOTS, "max_slots": ceiling, "headroom_gb": core.HEADROOM_GB,
             "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1), "reserve_gb": round(pl.reserve_gb, 1),
             "swap_growth_gb": round(swap_gb, 1), "swap_growth_limit_gb": core.SWAP_GROWTH_GB,
+            "swap_window_s": core.SWAP_WINDOW_S, "peak_history": core.PEAK_HISTORY,
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
             "would_kill": would_kill,
@@ -482,6 +486,70 @@ class Queue:
         return {"ok": True}
 
 
+def port_free(port):
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def config_view():
+    """What the settings dialog needs: stored values, defaults, bounds, and the service's start with the system."""
+    spec = [{"key": k, "group": g, "kind": kind, **({"choices": list(lo)} if kind == "choice" else
+                                                    {"min": lo, "max": hi} if lo is not None else {})}
+            for k, (g, _default, kind, lo, hi) in settings.SPEC.items()]
+    return {"values": settings.load(), "defaults": settings.defaults(), "spec": spec, "ctypes": list(settings.CTYPES),
+            "autostart": service.autostart(), "started": STARTED, "port": PORT, "port_env": "BQ_PORT" in os.environ}
+
+
+def config_errors(values):
+    """(clean settings, {key: error message}): the values' own checks, plus a new port that must be free."""
+    clean, errors = settings.validate(values)
+    port = clean.get("port", PORT)
+    if port != PORT and not port_free(port):
+        errors["port"] = core.msg("config.port_taken", port=port)
+    return clean, errors
+
+
+def switch_autostart(want):
+    """Error message, or None when the start with the system already matches or was switched."""
+    if not isinstance(want, bool) or not service.installed():
+        return None
+    if want == service.autostart():
+        return None
+    err = service.set_autostart(want)
+    return core.msg("config.autostart", detail=err[:300]) if err else None
+
+
+def apply_config(body):
+    """Validates and saves the dialog's values, switches the start with the system, then restarts the server.
+
+    Returns (reply, HTTP code). Nothing is saved while any value is invalid."""
+    values = body.get("values")
+    if not isinstance(values, dict):
+        return {"error": "values must be an object"}, 400
+    clean, errors = config_errors(values)
+    if not errors:
+        err = switch_autostart(body.get("autostart"))
+        errors = {"autostart": err} if err else {}
+    if errors:
+        return {"errors": errors}, 400
+    try:
+        settings.save(clean)
+    except OSError as e:
+        return {"error": f"cannot write {CONFIG}: {e}"}, 500
+    log("settings saved from the page; restarting to apply them")
+    threading.Thread(target=restart_soon, daemon=True, name="restart").start()
+    return {"ok": True, "port": int(os.environ.get("BQ_PORT") or clean["port"])}, 200
+
+
+def restart_soon():
+    time.sleep(0.5)  # lets the reply reach the page first
+    service.restart([os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+
+
 Q = None
 
 
@@ -503,41 +571,61 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
-        q = parse_qs(u.query)
         try:
             if u.path == "/":
-                self.reply(PAGE.read_bytes(), ctype="text/html; charset=utf-8")
-            elif u.path == "/api/state":
-                self.reply(Q.view)
-            elif u.path == "/api/wait":
-                self.reply(Q.wait(int(q["id"][0]), float(q.get("timeout", ["25"])[0])))
-            elif u.path == "/api/ticket":
-                with Q.lock:
-                    self.reply(Q.status(int(q["id"][0])))
-            elif u.path == "/api/proc":
-                self.reply(Q.proc_details(int(q["pid"][0])))
-            elif u.path == "/api/agent":
-                self.reply(Q.agent_details(int(q["pid"][0])))
-            elif u.path == "/api/wake":
-                Q.wake.set()
-                self.reply({"ok": True})
-            else:
-                self.reply({"error": "not found"}, 404)
+                return self.reply(PAGE.read_bytes(), ctype="text/html; charset=utf-8")
+            route = GET_ROUTES.get(u.path)
+            self.reply(*(route(parse_qs(u.query)) if route else ({"error": "not found"}, 404)))
         except (KeyError, ValueError) as e:
             self.reply({"error": f"bad request: {e}"}, 400)
+
+    def same_origin(self):
+        """Only the page itself may change settings: a JSON content type forces a CORS preflight this server never
+        answers, the Host check stops DNS rebinding, the Origin check any other site."""
+        hosts = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+        origin = self.headers.get("Origin")
+        return (self.headers.get("Host") in hosts and (origin is None or origin in {"http://" + h for h in hosts})
+                and (self.headers.get("Content-Type") or "").startswith("application/json"))
 
     def do_POST(self):
         u = urlparse(self.path)
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0") or 0)) or b"{}")
-            if u.path == "/api/enqueue":
-                self.reply(Q.enqueue(body))
-            elif u.path == "/api/release":
-                self.reply(Q.release(int(body["id"]), body.get("exit_code")))
-            else:
-                self.reply({"error": "not found"}, 404)
+            route = POST_ROUTES.get(u.path)
+            self.reply(*(route(self, body) if route else ({"error": "not found"}, 404)))
         except (KeyError, ValueError, TypeError) as e:
             self.reply({"error": f"bad request: {e}"}, 400)
+
+
+def ticket_status(q):
+    with Q.lock:
+        return Q.status(int(q["id"][0])), 200
+
+
+def wake(_q):
+    Q.wake.set()
+    return {"ok": True}, 200
+
+
+def post_config(handler, body):
+    return apply_config(body) if handler.same_origin() else ({"error": "forbidden"}, 403)
+
+
+# path -> handler returning (reply, HTTP code); Q is looked up at call time, after main() created it
+GET_ROUTES = {
+    "/api/state": lambda q: (Q.view, 200),
+    "/api/wait": lambda q: (Q.wait(int(q["id"][0]), float(q.get("timeout", ["25"])[0])), 200),
+    "/api/ticket": ticket_status,
+    "/api/proc": lambda q: (Q.proc_details(int(q["pid"][0])), 200),
+    "/api/agent": lambda q: (Q.agent_details(int(q["pid"][0])), 200),
+    "/api/config": lambda q: (config_view(), 200),
+    "/api/wake": wake,
+}
+POST_ROUTES = {
+    "/api/config": post_config,
+    "/api/enqueue": lambda h, body: (Q.enqueue(body), 200),
+    "/api/release": lambda h, body: (Q.release(int(body["id"]), body.get("exit_code")), 200),
+}
 
 
 def main():
@@ -549,7 +637,15 @@ def main():
     if not CONFIG.exists():
         CONFIG.write_text(json.dumps({"enforce": False}, indent=1))
     threading.Thread(target=Q.loop, daemon=True, name="scheduler").start()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    deadline = time.time() + BIND_WAIT_S
+    while True:
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+            break
+        except OSError as e:
+            if time.time() > deadline:
+                raise SystemExit(f"cannot listen on 127.0.0.1:{PORT}: {e}")
+            time.sleep(0.5)
     srv.daemon_threads = True
     log(f"build-queue listening on http://127.0.0.1:{PORT}")
     srv.serve_forever()

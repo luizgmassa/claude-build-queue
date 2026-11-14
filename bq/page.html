@@ -41,9 +41,35 @@
   .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 8px 0; }
   .kv > div:nth-child(odd) { color: #888; }
   #lang { float: right; background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; }
+  #cfg-open { float: right; margin-right: 8px; background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px;
+              cursor: pointer; padding: 2px 10px; }
+  #cfg { width: min(860px, 94vw); }
+  #cfg-body { padding: 4px 16px 10px; }
+  #cfg h3 { margin-top: 16px; }
+  .f { display: grid; grid-template-columns: 230px 1fr; gap: 4px 14px; padding: 8px 0; border-bottom: 1px solid #222; }
+  .f > label { color: #ccc; padding-top: 3px; }
+  .help { color: #888; font-size: 12px; margin-top: 3px; }
+  .err { color: #f66; font-size: 12px; }
+  #cfg input, #cfg select, #cfg textarea { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px;
+                                           padding: 3px 6px; font: inherit; }
+  #cfg input[type=number] { width: 90px; }
+  #cfg input:invalid { border-color: #f66; }
+  #cfg textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 12px; }
+  .prof { display: block; padding: 2px 0; }
+  #cfg details > summary { cursor: pointer; color: #9cf; padding: 12px 0 4px; font-weight: 600; }
+  .gb { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 4px 14px; }
+  .gb label { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .df { display: flex; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid #333;
+        position: sticky; bottom: 0; background: #161616; }
+  .df span { flex: 1; }
+  .df button { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 5px 12px;
+               cursor: pointer; font: inherit; }
+  .df button.primary { background: #234; border-color: #47a; font-weight: 600; }
+  .df button:disabled { opacity: .4; cursor: default; }
 </style>
 </head>
 <body>
+<button id="cfg-open">⚙ <span data-i18n="cfg.open"></span></button>
 <select id="lang" data-i18n-title="language"><option value="en-US">EN-US</option><option value="pt-BR">PT-BR</option></select>
 <h1><span data-i18n="title"></span> <span id="ts" class="muted"></span></h1>
 <div class="cards" id="cards"></div>
@@ -54,7 +80,7 @@
 <h2 data-i18n="h.procs"></h2><div class="wrap"><table id="procs"></table></div>
 <h2 id="wk-title"></h2><div class="wrap"><table id="would"></table></div>
 <h2 data-i18n="h.done"></h2><div class="wrap"><table id="done"></table></div>
-<h2 data-i18n="h.est"></h2>
+<h2 id="h-est"></h2>
 <div class="wrap"><table id="est"></table></div>
 <h2 data-i18n="h.events"></h2><div class="wrap"><table id="events"></table></div>
 
@@ -62,6 +88,13 @@
   <div class="dh"><button id="dlg-back" data-i18n-title="back">←</button><b id="dlg-title"></b>
     <button id="dlg-x" data-i18n-title="close">×</button></div>
   <div id="dlg-body"></div>
+</dialog>
+
+<dialog id="cfg">
+  <div class="dh"><b data-i18n="cfg.title"></b><button id="cfg-x" data-i18n-title="close">×</button></div>
+  <div id="cfg-body"></div>
+  <div class="df"><span id="cfg-msg"></span><button id="cfg-reset" data-i18n="cfg.reset"></button>
+    <button id="cfg-cancel" data-i18n="cfg.cancel"></button><button id="cfg-save" class="primary" data-i18n="cfg.save"></button></div>
 </dialog>
 
 <!-- Every text the page shows, per language. Server messages arrive as {"key", "params"}; their en-US
@@ -78,7 +111,7 @@
   "h.cleanup_on": "Cleanup (on: see events)",
   "h.cleanup_dry": "Cleanup in dry run: would kill",
   "h.done": "Finished in the last hour",
-  "h.est": "Estimate by type (largest peak of the last 5 runs, or the starting table)",
+  "h.est": "Estimate by type (largest peak of the last {n} runs, or the starting table)",
   "h.events": "Events",
   "h.agent_procs": "Agent processes",
   "h.agent_tickets": "Tickets (active and from the last hour)",
@@ -107,7 +140,7 @@
   "card.max_off": "off",
   "card.avail": "Available for an extra slot",
   "card.avail_val": "{avail} GB − {reserve} GB reserved (headroom {headroom} GB)",
-  "card.swap_growth": "Swap growth (60 s)",
+  "card.swap_growth": "Swap growth ({s} s)",
   "card.runner": "GitHub runner",
   "card.busy": "busy",
   "card.idle": "idle",
@@ -195,7 +228,94 @@
   "error.no_permission": "no permission to kill {pid}: {detail}",
   "error.pid_gone": "PID {pid} no longer exists",
   "end.released": "released",
-  "end.owner process gone": "owner process gone"
+  "end.owner process gone": "owner process gone",
+  "config.type": "wrong type",
+  "config.range": "must be between {min} and {max}",
+  "config.max_below_base": "must be at least the base slots ({base})",
+  "config.choice": "not one of the options",
+  "config.list": "one non-empty entry per line, at most {n} lines of {chars} characters",
+  "config.unknown": "unknown setting",
+  "config.port_taken": "port {port} is in use",
+  "config.autostart": "could not change the start with the system: {detail}",
+  "cfg.open": "Settings",
+  "cfg.title": "Settings",
+  "cfg.save": "Save & Apply",
+  "cfg.cancel": "Cancel",
+  "cfg.reset": "Restore defaults",
+  "cfg.advanced": "Advanced: every setting",
+  "cfg.default": "default: {v}",
+  "cfg.off": "no cap",
+  "cfg.bool.true": "on",
+  "cfg.bool.false": "off",
+  "cfg.restart_note": "Save & Apply saves the settings and restarts the server, in about 2 s. Running builds keep running and gq reconnects by itself.",
+  "cfg.restarting": "Restarting the server…",
+  "cfg.restart_failed": "The server did not come back within 30 s. See its log (macOS: ~/Library/Logs/build-queue.log; Linux: journalctl --user -u com.massa.build-queue; Windows: ~/.local/share/build-queue/server.log).",
+  "cfg.invalid": "Fix the highlighted fields.",
+  "cfg.port_env": "BQ_PORT is set in the server's environment and wins over this value.",
+  "cfg.autostart_none": "No service installed: this server was started by hand.",
+  "cfg.memory": "Memory use",
+  "cfg.memory.help": "How close to the memory limit the builds above the base may take the machine.",
+  "cfg.profile.careful": "Careful",
+  "cfg.profile.balanced": "Balanced",
+  "cfg.profile.bold": "Bold",
+  "cfg.profile.custom": "Custom",
+  "cfg.profile.desc": "headroom {headroom} GB, swap limit {swap} GB, {gap} s between extra builds",
+  "cfg.profile.custom.desc": "values set in Advanced",
+  "cfg.group.queue": "Queue and slots",
+  "cfg.group.memory": "Memory signal",
+  "cfg.group.cleanup": "Cleanup and protection",
+  "cfg.group.estimates": "Starting estimates",
+  "cfg.group.server": "Server",
+  "cfg.base_slots": "Builds that always run together",
+  "cfg.base_slots.help": "These start without any memory check. The GitHub runner counts as one.",
+  "cfg.max": "Most builds at once",
+  "cfg.max.help": "Above the base, each build waits for free memory. A cap stops at this number even with memory left.",
+  "cfg.headroom_gb": "Headroom (GB)",
+  "cfg.headroom_gb.help": "Available memory that must remain after the reserves of the running builds and the next build's estimate.",
+  "cfg.extra_gap_s": "Gap between extra builds (s)",
+  "cfg.extra_gap_s.help": "A new build needs time to show its memory before the next one above the base is judged.",
+  "cfg.swap_growth_gb": "Swap growth limit (GB)",
+  "cfg.swap_growth_gb.help": "Swap growing this much within the swap window stops the builds above the base.",
+  "cfg.swap_window_s": "Swap window (s)",
+  "cfg.swap_window_s.help": "The period the swap growth is measured over.",
+  "cfg.peak_history": "Peaks remembered",
+  "cfg.peak_history.help": "A command type's estimate is the largest peak of its last N runs.",
+  "cfg.runner_ctype": "Runner's command type",
+  "cfg.runner_ctype.help": "The GitHub runner reserves memory by this type's estimate.",
+  "cfg.call_window_s": "Hook to gq window (s)",
+  "cfg.call_window_s.help": "A gq run reaches the server within this long after the hook saw its Bash call. It labels subagents.",
+  "cfg.block_pressure": "macOS: stop at",
+  "cfg.block_pressure.help": "The kernel memory pressure level that stops every new build.",
+  "cfg.block_pressure.2": "warning",
+  "cfg.block_pressure.4": "critical",
+  "cfg.psi_critical_pct": "Linux: critical PSI (%)",
+  "cfg.psi_critical_pct.help": "Share of the last 10 s in which every runnable task waited for memory.",
+  "cfg.low_memory_pct": "Low memory (%)",
+  "cfg.low_memory_pct.help": "Where the system gives no pressure signal: available memory below this share of RAM is critical.",
+  "cfg.enforce": "Clean up processes",
+  "cfg.enforce.help": "Ends orphan builds of dead agents, idle Gradle and Kotlin daemons and loose workers. Off: the page only lists them.",
+  "cfg.idle_grace_s": "Idle Gradle daemon (s)",
+  "cfg.idle_grace_s.help": "An agent's Gradle daemon with no client for this long is ended.",
+  "cfg.kotlin_idle_s": "Idle Kotlin daemon (s)",
+  "cfg.kotlin_idle_s.help": "Ended after this long idle, even while builds run.",
+  "cfg.grant_quiet_s": "Quiet after a slot (s)",
+  "cfg.grant_quiet_s.help": "No daemon is ended this soon after a build got a slot.",
+  "cfg.term_grace_s": "SIGKILL after (s)",
+  "cfg.term_grace_s.help": "Time between SIGTERM and SIGKILL.",
+  "cfg.protected_paths": "Protected paths",
+  "cfg.protected_paths.help": "One per line. A process whose command line contains one is never touched, such as a local backend.",
+  "cfg.runner_markers": "Runner markers",
+  "cfg.runner_markers.help": "One per line. A process whose command line contains one belongs to the CI runner: never killed, and it takes a slot.",
+  "cfg.default_gb": "Estimate per command type (GB)",
+  "cfg.default_gb.help": "Used until a command type has measured peaks.",
+  "cfg.port": "Port",
+  "cfg.port.help": "The page, gq and the hook use this port; the page moves to it after the restart. Change it with no build waiting: a gq already running keeps the old port.",
+  "cfg.tick_s": "Scan interval (s)",
+  "cfg.tick_s.help": "How often the server reads processes and memory.",
+  "cfg.unreachable_limit_s": "gq gives up after (s)",
+  "cfg.unreachable_limit_s.help": "How long gq waits for an unreachable server before it fails.",
+  "cfg.autostart": "Start with the system",
+  "cfg.autostart.help": "Starts the server when you log in. Reinstalling turns it back on."
  },
  "pt-BR": {
   "title": "Fila de builds",
@@ -207,7 +327,7 @@
   "h.cleanup_on": "Limpeza (ligada: ver eventos)",
   "h.cleanup_dry": "Limpeza em simulação: mataria",
   "h.done": "Terminados na última hora",
-  "h.est": "Estimativa por tipo (maior pico das últimas 5 execuções, ou tabela inicial)",
+  "h.est": "Estimativa por tipo (maior pico das últimas {n} execuções, ou tabela inicial)",
   "h.events": "Eventos",
   "h.agent_procs": "Processos do agente",
   "h.agent_tickets": "Tickets (ativos e da última hora)",
@@ -236,7 +356,7 @@
   "card.max_off": "sem teto",
   "card.avail": "Disponível p/ vaga extra",
   "card.avail_val": "{avail} GB − {reserve} GB reservados (folga {headroom} GB)",
-  "card.swap_growth": "Crescimento do swap (60 s)",
+  "card.swap_growth": "Crescimento do swap ({s} s)",
   "card.runner": "Runner GitHub",
   "card.busy": "ocupado",
   "card.idle": "livre",
@@ -324,7 +444,94 @@
   "error.no_permission": "sem permissão para matar {pid}: {detail}",
   "error.pid_gone": "PID {pid} não existe mais",
   "end.released": "liberado",
-  "end.owner process gone": "processo dono sumiu"
+  "end.owner process gone": "processo dono sumiu",
+  "config.type": "tipo errado",
+  "config.range": "precisa estar entre {min} e {max}",
+  "config.max_below_base": "precisa ser pelo menos o número de vagas base ({base})",
+  "config.choice": "não é uma das opções",
+  "config.list": "uma entrada não vazia por linha, no máximo {n} linhas de {chars} caracteres",
+  "config.unknown": "configuração desconhecida",
+  "config.port_taken": "a porta {port} está em uso",
+  "config.autostart": "não foi possível mudar o início com o sistema: {detail}",
+  "cfg.open": "Configurações",
+  "cfg.title": "Configurações",
+  "cfg.save": "Salvar e aplicar",
+  "cfg.cancel": "Cancelar",
+  "cfg.reset": "Restaurar padrões",
+  "cfg.advanced": "Avançado: todas as configurações",
+  "cfg.default": "padrão: {v}",
+  "cfg.off": "sem teto",
+  "cfg.bool.true": "ligado",
+  "cfg.bool.false": "desligado",
+  "cfg.restart_note": "Salvar e aplicar grava as configurações e reinicia o servidor, em uns 2 s. Os builds em andamento continuam e o gq reconecta sozinho.",
+  "cfg.restarting": "Reiniciando o servidor…",
+  "cfg.restart_failed": "O servidor não voltou em 30 s. Veja o log (macOS: ~/Library/Logs/build-queue.log; Linux: journalctl --user -u com.massa.build-queue; Windows: ~/.local/share/build-queue/server.log).",
+  "cfg.invalid": "Corrija os campos marcados.",
+  "cfg.port_env": "BQ_PORT está definida no ambiente do servidor e vale no lugar deste valor.",
+  "cfg.autostart_none": "Nenhum serviço instalado: este servidor foi iniciado à mão.",
+  "cfg.memory": "Uso de memória",
+  "cfg.memory.help": "Quão perto do limite de memória os builds acima da base podem levar a máquina.",
+  "cfg.profile.careful": "Cuidadoso",
+  "cfg.profile.balanced": "Equilibrado",
+  "cfg.profile.bold": "Ousado",
+  "cfg.profile.custom": "Personalizado",
+  "cfg.profile.desc": "folga {headroom} GB, limite de swap {swap} GB, {gap} s entre builds extras",
+  "cfg.profile.custom.desc": "valores definidos no Avançado",
+  "cfg.group.queue": "Fila e vagas",
+  "cfg.group.memory": "Sinal de memória",
+  "cfg.group.cleanup": "Limpeza e proteção",
+  "cfg.group.estimates": "Estimativas iniciais",
+  "cfg.group.server": "Servidor",
+  "cfg.base_slots": "Builds que sempre rodam juntos",
+  "cfg.base_slots.help": "Entram sem nenhuma checagem de memória. O runner do GitHub conta como um.",
+  "cfg.max": "Máximo de builds ao mesmo tempo",
+  "cfg.max.help": "Acima da base, cada build espera memória livre. Um teto para neste número mesmo sobrando memória.",
+  "cfg.headroom_gb": "Folga (GB)",
+  "cfg.headroom_gb.help": "Memória disponível que precisa sobrar depois das reservas dos builds em execução e da estimativa do próximo.",
+  "cfg.extra_gap_s": "Intervalo entre builds extras (s)",
+  "cfg.extra_gap_s.help": "Um build novo precisa de tempo para mostrar sua memória antes de o próximo acima da base ser avaliado.",
+  "cfg.swap_growth_gb": "Limite de crescimento do swap (GB)",
+  "cfg.swap_growth_gb.help": "Se o swap crescer isto dentro da janela, os builds acima da base param de entrar.",
+  "cfg.swap_window_s": "Janela do swap (s)",
+  "cfg.swap_window_s.help": "Período em que o crescimento do swap é medido.",
+  "cfg.peak_history": "Picos lembrados",
+  "cfg.peak_history.help": "A estimativa de um tipo de comando é o maior pico das suas últimas N execuções.",
+  "cfg.runner_ctype": "Tipo de comando do runner",
+  "cfg.runner_ctype.help": "O runner do GitHub reserva memória pela estimativa deste tipo.",
+  "cfg.call_window_s": "Janela do gancho ao gq (s)",
+  "cfg.call_window_s.help": "Um gq run chega ao servidor até este tempo depois de o gancho ver a chamada Bash. Serve para rotular subagentes.",
+  "cfg.block_pressure": "macOS: parar em",
+  "cfg.block_pressure.help": "O nível de pressão de memória do kernel que impede todo build novo.",
+  "cfg.block_pressure.2": "alerta",
+  "cfg.block_pressure.4": "crítica",
+  "cfg.psi_critical_pct": "Linux: PSI crítico (%)",
+  "cfg.psi_critical_pct.help": "Parcela dos últimos 10 s em que toda tarefa pronta esperou por memória.",
+  "cfg.low_memory_pct": "Memória baixa (%)",
+  "cfg.low_memory_pct.help": "Onde o sistema não dá sinal de pressão: memória disponível abaixo desta parcela da RAM é crítica.",
+  "cfg.enforce": "Limpar processos",
+  "cfg.enforce.help": "Encerra builds órfãos de agentes mortos, daemons Gradle e Kotlin ociosos e workers soltos. Desligado: a página só os lista.",
+  "cfg.idle_grace_s": "Daemon Gradle ocioso (s)",
+  "cfg.idle_grace_s.help": "Daemon Gradle de agente sem cliente por este tempo é encerrado.",
+  "cfg.kotlin_idle_s": "Daemon Kotlin ocioso (s)",
+  "cfg.kotlin_idle_s.help": "Encerrado depois deste tempo ocioso, mesmo com builds rodando.",
+  "cfg.grant_quiet_s": "Pausa depois de uma vaga (s)",
+  "cfg.grant_quiet_s.help": "Nenhum daemon é encerrado tão cedo depois de um build ganhar vaga.",
+  "cfg.term_grace_s": "SIGKILL depois de (s)",
+  "cfg.term_grace_s.help": "Tempo entre o SIGTERM e o SIGKILL.",
+  "cfg.protected_paths": "Caminhos protegidos",
+  "cfg.protected_paths.help": "Um por linha. Processo cuja linha de comando contém um deles nunca é tocado, como um backend local.",
+  "cfg.runner_markers": "Marcadores do runner",
+  "cfg.runner_markers.help": "Um por linha. Processo cuja linha de comando contém um deles é do runner de CI: nunca é morto e ocupa uma vaga.",
+  "cfg.default_gb": "Estimativa por tipo de comando (GB)",
+  "cfg.default_gb.help": "Usada até o tipo de comando ter picos medidos.",
+  "cfg.port": "Porta",
+  "cfg.port.help": "A página, o gq e o gancho usam esta porta; a página vai para ela depois do reinício. Mude sem build esperando: um gq já rodando continua na porta antiga.",
+  "cfg.tick_s": "Intervalo de varredura (s)",
+  "cfg.tick_s.help": "De quanto em quanto tempo o servidor lê processos e memória.",
+  "cfg.unreachable_limit_s": "gq desiste depois de (s)",
+  "cfg.unreachable_limit_s.help": "Quanto tempo o gq espera por um servidor fora do ar antes de falhar.",
+  "cfg.autostart": "Iniciar com o sistema",
+  "cfg.autostart.help": "Inicia o servidor quando você entra na sessão. Reinstalar liga de novo."
  }
 }
 </script>
@@ -485,9 +692,9 @@ function render(v) {
     ["RAM", [`${m.app_gb} app`, m.wired_gb != null && `${m.wired_gb} wired`, m.compressed_gb != null && `${m.compressed_gb} comp`]
       .filter(Boolean).join(" · ") + ` / ${m.total_gb} GB`, ""],
     ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
-    ["card.swap_growth", `+${v.swap_growth_gb} GB`, v.swap_growth_gb >= v.swap_growth_limit_gb ? "bad" : "ok"],
+    [["card.swap_growth", { s: v.swap_window_s }], `+${v.swap_growth_gb} GB`, v.swap_growth_gb >= v.swap_growth_limit_gb ? "bad" : "ok"],
     ["card.cleanup", T(v.enforce ? "card.cleanup_on" : "card.cleanup_dry"), v.enforce ? "ok" : "warn"],
-  ].map(([k, val, c]) => `<div class="card">${esc(T(k))}<b class="${c}">${esc(val)}</b></div>`).join("");
+  ].map(([k, val, c]) => `<div class="card">${esc(Array.isArray(k) ? T(...k) : T(k))}<b class="${c}">${esc(val)}</b></div>`).join("");
   const blocked = v.blocked_msg || v.blocked;  // blocked_msg carries the key; blocked is the English text gq prints
   document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
@@ -509,6 +716,7 @@ function render(v) {
     { k: "ram_pct", t: "% RAM", num: true, w: 70 },
     { k: "procs", t: "col.procs", num: true, w: 80 }], v.agents);
   grid("procs", PROC_COLS, v.processes);
+  document.getElementById("h-est").textContent = T("h.est", { n: v.peak_history });
   document.getElementById("wk-title").textContent = T(v.enforce ? "h.cleanup_on" : "h.cleanup_dry");
   grid("would", [{ k: "pid", t: "PID", num: true, w: 80, f: k => procLink(k.pid) },
     { k: "reason", t: "col.reason", w: 300, v: k => tr(k.reason), f: k => esc(tr(k.reason)) }], v.would_kill);
@@ -588,12 +796,170 @@ document.getElementById("dlg-back").onclick = () => { const prev = trail.pop(); 
 dlg.addEventListener("click", e => { if (e.target === dlg) dlg.close(); });  // click on the backdrop
 dlg.addEventListener("close", () => { current = null; trail = []; });
 
+// ---------------------------------------------------------------- settings dialog
+// One state object holds every value; the simple and the advanced inputs of a key both read and write it.
+const cfgDlg = document.getElementById("cfg"), cfgBody = document.getElementById("cfg-body");
+const PROFILES = { careful: { headroom_gb: 8, swap_growth_gb: 0.25, extra_gap_s: 60 },
+  balanced: { headroom_gb: 6, swap_growth_gb: 0.5, extra_gap_s: 30 },
+  bold: { headroom_gb: 4, swap_growth_gb: 1, extra_gap_s: 15 } };
+let cfg = null, cfgAdvOpen = false, cfgBusy = false;
+const clone = o => JSON.parse(JSON.stringify(o));
+const profileOf = v => Object.keys(PROFILES).find(p => Object.entries(PROFILES[p]).every(([k, x]) => v[k] === x)) || "custom";
+
+function shown(spec, v) {
+  if (v === null) return T("cfg.off");
+  if (spec.kind === "bool") return T("cfg.bool." + v);
+  if (spec.kind === "choice") return T(`cfg.${spec.key}.${v}`, null, String(v));
+  if (spec.kind === "list") return v.length ? v.join(", ") : "—";
+  return String(v);
+}
+
+function control(spec) {
+  const k = spec.key, lim = spec.min != null ? ` min="${spec.min}" max="${spec.max}"` : "";
+  const step = spec.kind === "float" ? ` step="any"` : ` step="1"`;
+  if (spec.kind === "bool") return `<label><input type="checkbox" data-k="${k}"> ${esc(T("cfg.bool.true"))}</label>`;
+  if (spec.kind === "int" || spec.kind === "float") return `<input type="number" data-k="${k}"${lim}${step}>`;
+  if (spec.kind === "int_or_off") return `<label><input type="checkbox" data-k="${k}" data-off> ${esc(T("cfg.off"))}</label>
+    <input type="number" data-k="${k}"${lim} step="1">`;
+  if (spec.kind === "choice") return `<select data-k="${k}">${spec.choices.map(c =>
+    `<option value="${c}">${esc(T(`cfg.${k}.${c}`, null, String(c)))}</option>`).join("")}</select>`;
+  if (spec.kind === "ctype") return `<select data-k="${k}">${cfg.ctypes.map(c => `<option>${esc(c)}</option>`).join("")}</select>`;
+  if (spec.kind === "list") return `<textarea data-k="${k}" rows="3" spellcheck="false"></textarea>`;
+  return `<div class="gb">${cfg.ctypes.map(c => `<label title="${esc(T("cfg.default", { v: cfg.defaults[k][c] }))}">${esc(c)}
+    <input type="number" data-k="${k}" data-sub="${c}"${lim} step="any"></label>`).join("")}</div>`;
+}
+
+function field(spec, opts) {
+  const k = spec.key, def = spec.kind === "gb_table" ? "" : " " + T("cfg.default", { v: shown(spec, cfg.defaults[k]) });
+  return `<div class="f"><label>${esc(T("cfg." + k))}</label><div>${control(spec)}
+    <div class="help">${esc(T("cfg." + k + ".help") + (opts?.noDefault ? "" : def))}</div>
+    ${k === "port" && cfg.port_env ? `<div class="help warn">${esc(T("cfg.port_env"))}</div>` : ""}
+    <div class="err" data-err="${k}"></div></div></div>`;
+}
+
+function renderCfg() {
+  const spec = Object.fromEntries(cfg.spec.map(s => [s.key, s]));
+  const prof = Object.keys(PROFILES).map(p => `<label class="prof"><input type="radio" name="prof" value="${p}">
+    <b>${esc(T("cfg.profile." + p))}</b> <span class="muted">${esc(T("cfg.profile.desc",
+      { headroom: PROFILES[p].headroom_gb, swap: PROFILES[p].swap_growth_gb, gap: PROFILES[p].extra_gap_s }))}</span></label>`).join("")
+    + `<label class="prof"><input type="radio" name="prof" value="custom">
+    <b>${esc(T("cfg.profile.custom"))}</b> <span class="muted">${esc(T("cfg.profile.custom.desc"))}</span></label>`;
+  const auto = cfg.autostart === null
+    ? `<input type="checkbox" disabled> <span class="muted">${esc(T("cfg.autostart_none"))}</span>`
+    : `<label><input type="checkbox" data-auto> ${esc(T("cfg.bool.true"))}</label>`;
+  const groups = ["queue", "memory", "cleanup", "estimates", "server"].map(g => `<h3>${esc(T("cfg.group." + g))}</h3>`
+    + cfg.spec.filter(s => s.group === g).map(s => field(s)).join("")).join("");
+  cfgBody.innerHTML = `<p class="help">${esc(T("cfg.restart_note"))}</p>`
+    + field(spec.base_slots, { noDefault: true }) + field(spec.max, { noDefault: true })
+    + `<div class="f"><label>${esc(T("cfg.memory"))}</label><div>${prof}<div class="help">${esc(T("cfg.memory.help"))}</div>
+      <div class="err" data-err="headroom_gb"></div><div class="err" data-err="swap_growth_gb"></div>
+      <div class="err" data-err="extra_gap_s"></div></div></div>`
+    + field(spec.enforce, { noDefault: true })
+    + `<div class="f"><label>${esc(T("cfg.autostart"))}</label><div>${auto}<div class="help">${esc(T("cfg.autostart.help"))}</div>
+      <div class="err" data-err="autostart"></div></div></div>`
+    + `<details${cfgAdvOpen ? " open" : ""}><summary>${esc(T("cfg.advanced"))}</summary>${groups}</details>`;
+  cfgBody.querySelector("details").ontoggle = e => cfgAdvOpen = e.target.open;
+  syncCfg();
+}
+
+// writes the state into every input, except the one being typed in (it would lose the cursor and partial text)
+function syncCfg() {
+  const v = cfg.values;
+  cfgBody.querySelectorAll("[data-k]").forEach(el => {
+    if (el === document.activeElement && el.type !== "checkbox") return;
+    const k = el.dataset.k, x = v[k];
+    if (el.hasAttribute("data-off")) el.checked = x === null;
+    else if (el.dataset.sub) el.value = x[el.dataset.sub];
+    else if (el.type === "checkbox") el.checked = x;
+    else if (el.tagName === "TEXTAREA") el.value = Array.isArray(x) ? x.join("\n") : x;
+    else if (k === "max") { el.disabled = x === null; el.value = x ?? cfg.lastMax; }
+    else el.value = x;
+  });
+  const auto = cfgBody.querySelector("[data-auto]");
+  if (auto) auto.checked = cfg.autostart;
+  const p = profileOf(v);
+  cfgBody.querySelectorAll("input[name=prof]").forEach(r => r.checked = r.value === p);
+}
+
+// the typed value, or the text itself when it is not a number, so the server reports the wrong type
+const num = s => s.trim() !== "" && !isNaN(Number(s)) ? Number(s) : s;
+cfgBody.addEventListener("input", e => {
+  const el = e.target, v = cfg.values;
+  if (el.name === "prof") Object.assign(v, PROFILES[el.value] || {});  // "custom" only marks values set in Advanced
+  else if (el.hasAttribute("data-auto")) cfg.autostart = el.checked;
+  else if (!el.dataset.k) return;
+  else if (el.hasAttribute("data-off")) v.max = el.checked ? null : cfg.lastMax;
+  else if (el.dataset.sub) v[el.dataset.k] = { ...v[el.dataset.k], [el.dataset.sub]: num(el.value) };
+  else if (el.type === "checkbox") v[el.dataset.k] = el.checked;
+  else if (el.tagName === "TEXTAREA") v[el.dataset.k] = el.value.split("\n").map(x => x.trim()).filter(Boolean);
+  else if (el.tagName === "SELECT") v[el.dataset.k] = el.dataset.k === "block_pressure" ? Number(el.value) : el.value;
+  else { v[el.dataset.k] = num(el.value); if (el.dataset.k === "max" && typeof v.max === "number") cfg.lastMax = v.max; }
+  syncCfg();
+});
+
+const cfgMsg = (text, cls) => { const m = document.getElementById("cfg-msg"); m.textContent = text || ""; m.className = cls || ""; };
+function cfgButtons(on) {
+  cfgBusy = !on;
+  ["cfg-save", "cfg-reset", "cfg-cancel"].forEach(id => document.getElementById(id).disabled = !on);
+}
+
+async function openCfg() {
+  cfgMsg(""); cfgBody.innerHTML = esc(T("loading")); cfgButtons(true); cfgDlg.showModal();
+  try { cfg = await (await fetch("/api/config")).json(); } catch (e) { cfgBody.textContent = T("server_down"); return; }
+  cfg.lastMax = cfg.values.max ?? Math.max(6, cfg.values.base_slots);
+  renderCfg();
+}
+
+function showErrors(errors) {
+  cfgBody.querySelectorAll("[data-err]").forEach(el => el.textContent = errors[el.dataset.err] ? tr(errors[el.dataset.err]) : "");
+  const unknown = Object.keys(errors).filter(k => !cfgBody.querySelector(`[data-err="${k}"]`));
+  const adv = cfg.spec.some(s => errors[s.key] && !["base_slots", "max", "enforce", "headroom_gb", "swap_growth_gb",
+    "extra_gap_s"].includes(s.key));
+  if (adv) { cfgAdvOpen = true; cfgBody.querySelector("details").open = true; }
+  cfgMsg([T("cfg.invalid"), ...unknown.map(k => k + ": " + tr(errors[k]))].join(" "), "bad");
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function saveCfg() {
+  cfgButtons(false); cfgMsg("");
+  const body = { values: cfg.values, ...(cfg.autostart === null ? {} : { autostart: cfg.autostart }) };
+  let r, d;
+  try {
+    r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    d = await r.json();
+  } catch (e) { cfgMsg(T("server_down"), "bad"); cfgButtons(true); return; }
+  if (!r.ok) {
+    if (d.errors) showErrors(d.errors); else cfgMsg(tr(d.error_msg || d.error || r.status), "bad");
+    cfgButtons(true); return;
+  }
+  showErrors({}); cfgMsg(T("cfg.restarting"));
+  const moved = String(d.port) !== (location.port || "80"), target = `${location.protocol}//${location.hostname}:${d.port}/`;
+  for (const end = Date.now() + 30000; Date.now() < end;) {
+    await sleep(1000);
+    try {
+      if (moved) { await fetch(target + "api/state", { mode: "no-cors", cache: "no-store" }); location.href = target; return; }
+      const c = await (await fetch("/api/config", { cache: "no-store" })).json();
+      if (c.started !== cfg.started) { location.reload(); return; }
+    } catch (e) { /* still restarting */ }
+  }
+  cfgMsg(T("cfg.restart_failed"), "bad"); cfgButtons(true);
+}
+
+document.getElementById("cfg-open").onclick = openCfg;
+document.getElementById("cfg-save").onclick = saveCfg;
+document.getElementById("cfg-reset").onclick = () => {
+  cfg.values = clone(cfg.defaults); cfg.lastMax = Math.max(6, cfg.values.base_slots); showErrors({}); cfgMsg(""); syncCfg(); };
+document.getElementById("cfg-cancel").onclick = document.getElementById("cfg-x").onclick = () => cfgDlg.close();
+cfgDlg.addEventListener("cancel", e => { if (cfgBusy) e.preventDefault(); });  // Esc during the restart wait
+cfgDlg.addEventListener("click", e => { if (e.target === cfgDlg && !cfgBusy) cfgDlg.close(); });
+
 const deep = location.hash.match(/^#(agent|proc)=(\d+)$/);  // direct link to a dialog: #agent=PID or #proc=PID
 if (deep) openDetail(deep[1], +deep[2], true);
 document.getElementById("lang").onchange = e => {
   lang = localStorage.bqLang = e.target.value;
   applyLang();
   if (last) render(last);  // also re-renders the open dialog
+  if (cfgDlg.open && cfg) renderCfg();
 };
 applyLang();
 refresh(); setInterval(refresh, 2000);

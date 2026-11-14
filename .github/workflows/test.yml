@@ -46,6 +46,25 @@ jobs:
           for i in $(seq 30); do curl -sf http://127.0.0.1:8787/api/state > /dev/null && break; sleep 1; done
           ~/.local/bin/gq status
           ~/.local/bin/gq run -- python -c "print('queued-ok')" | grep queued-ok
+      - name: Save & Apply restarts the task with the new settings and switches the start with the system
+        shell: bash
+        run: |
+          py=~/.local/share/build-queue/venv/Scripts/python.exe
+          get() { curl -sf http://127.0.0.1:8787/api/config | "$py" -c "import json,sys; d=json.load(sys.stdin); print($1, end='')"; }
+          post() { curl -sf -H 'Content-Type: application/json' -d "$1" http://127.0.0.1:8787/api/config; echo; }
+          wait_restart() {
+            for i in $(seq 40); do sleep 1; s=$(get 'd["started"]' 2>/dev/null) && [ "$s" != "$1" ] && return 0; done
+            echo "server did not come back" >&2; return 1
+          }
+          s0=$(get 'd["started"]'); [ "$(get 'd["autostart"]')" = True ]
+          post '{"values": {"max": 5}, "autostart": false}'
+          wait_restart "$s0"
+          [ "$(get 'd["values"]["max"], d["autostart"]')" = "5 False" ]
+          s1=$(get 'd["started"]')
+          post '{"values": {"max": null}, "autostart": true}'
+          wait_restart "$s1"
+          [ "$(get 'd["values"]["max"], d["autostart"]')" = "None True" ]
+          ~/.local/bin/gq run -- python -c "print('after-restart-ok')" | grep after-restart-ok
       - name: Server log
         if: always()
         shell: pwsh
