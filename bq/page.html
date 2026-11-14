@@ -30,6 +30,7 @@
   a.lnk:hover { text-decoration: underline; }
   dialog { background: #161616; color: #ddd; border: 1px solid #444; border-radius: 8px; padding: 0;
            width: min(1300px, 94vw); max-height: 88vh; overflow: auto; }
+  html, dialog { overflow-anchor: none; }  /* a refresh must not follow the content as it grows */
   dialog::backdrop { background: rgba(0, 0, 0, .6); }
   .dh { display: flex; gap: 10px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #333;
         position: sticky; top: 0; background: #161616; z-index: 1; }
@@ -158,6 +159,7 @@
   "col.gq_pid": "gq PID",
   "col.estimate": "estimate",
   "col.peak": "peak",
+  "col.ram_now": "RAM now",
   "col.end": "end",
   "col.running_for": "running for",
   "col.position": "position",
@@ -374,6 +376,7 @@
   "col.gq_pid": "PID gq",
   "col.estimate": "estimativa",
   "col.peak": "pico",
+  "col.ram_now": "RAM agora",
   "col.end": "fim",
   "col.running_for": "rodando há",
   "col.position": "posição",
@@ -658,6 +661,7 @@ const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
 const T_STATE = { k: "state", t: "col.state", w: 80, v: t => T("state." + t.state, null, t.state),
   f: t => esc(T("state." + t.state, null, t.state)) };
 const T_EST = { k: "estimate_gb", t: "col.estimate", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
+const T_RAM = { k: "rss_gb", t: "col.ram_now", num: true, w: 85, f: t => t.rss_gb != null ? t.rss_gb + " GB" : "" };
 const T_PEAK = { k: "peak_gb", t: "col.peak", num: true, w: 75, f: t => t.peak_gb != null ? t.peak_gb + " GB" : "" };
 const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${esc(t.cwd)}$ ${esc(t.cmd)}</code>` };
 // end_reason is stored as a plain value ("released", "owner process gone"); unknown values show as stored
@@ -674,7 +678,17 @@ async function refresh() {
     document.getElementById("ts").textContent = T("server_down"); return; }
   if (!v.memory) return;
   last = v;
-  render(v);
+  keepScroll(() => render(v));
+}
+
+// A refresh rebuilds the tables and the dialog body: put the page, the dialog and each table back where they were.
+function keepScroll(fn) {
+  const page = document.scrollingElement, y = page.scrollTop, dy = dlg.scrollTop;
+  const tablesIn = () => document.querySelectorAll(".wrap > table[id]");
+  const x = Object.fromEntries([...tablesIn()].map(t => [t.id, t.parentNode.scrollLeft]));
+  fn();
+  page.scrollTop = y; dlg.scrollTop = dy;
+  tablesIn().forEach(t => { if (t.id in x) t.parentNode.scrollLeft = x[t.id]; });
 }
 
 function render(v) {
@@ -702,7 +716,7 @@ function render(v) {
   waiting.forEach((t, i) => t.position = i + 1);
   grid("running", [T_ID, T_AGENT, T_PID,
     { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
-    T_TYPE, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
+    T_TYPE, T_RAM, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
   grid("waiting", [{ k: "position", t: "col.position", num: true, w: 65 }, T_ID, T_AGENT, T_PID,
     { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
     T_TYPE, T_EST, T_CMD], waiting);
@@ -736,6 +750,7 @@ const kv = pairs => `<div class="kv">${pairs.filter(p => p[1] !== undefined && p
   .map(([k, v]) => `<div>${esc(T(k))}</div><div>${v}</div>`).join("")}</div>`;
 
 async function openDetail(type, pid, push) {
+  const again = current && current.type === type && current.pid === pid;  // a refresh of the detail already shown
   if (push && dlg.open && current && (current.type !== type || current.pid !== pid)) trail.push(current);
   current = { type, pid };
   if (!dlg.open) { trail = []; document.getElementById("dlg-body").innerHTML = esc(T("loading")); dlg.showModal(); }
@@ -744,11 +759,13 @@ async function openDetail(type, pid, push) {
   if (!current || current.type !== type || current.pid !== pid) return;  // the user moved on while this loaded
   document.getElementById("dlg-back").disabled = !trail.length;
   const body = document.getElementById("dlg-body"), scroll = dlg.scrollTop;
-  if (d.error || d.error_msg) {
-    document.getElementById("dlg-title").textContent = type === "agent" ? T("dlg.agent", { pid }) : "PID " + pid;
-    body.innerHTML = `<p class="bad">${esc(tr(d.error_msg || d.error))}</p>`;
-  } else if (type === "agent") renderAgent(d, body); else renderProc(d, body);
-  dlg.scrollTop = scroll;
+  const show = () => {
+    if (d.error || d.error_msg) {
+      document.getElementById("dlg-title").textContent = type === "agent" ? T("dlg.agent", { pid }) : "PID " + pid;
+      body.innerHTML = `<p class="bad">${esc(tr(d.error_msg || d.error))}</p>`;
+    } else if (type === "agent") renderAgent(d, body); else renderProc(d, body);
+  };
+  if (again) keepScroll(show); else { show(); dlg.scrollTop = scroll; }
 }
 
 function renderAgent(a, body) {
@@ -958,7 +975,7 @@ if (deep) openDetail(deep[1], +deep[2], true);
 document.getElementById("lang").onchange = e => {
   lang = localStorage.bqLang = e.target.value;
   applyLang();
-  if (last) render(last);  // also re-renders the open dialog
+  if (last) keepScroll(() => render(last));  // also re-renders the open dialog
   if (cfgDlg.open && cfg) renderCfg();
 };
 applyLang();

@@ -159,6 +159,7 @@ class Queue:
         self.last_extra = None
         self.swap_samples = deque()  # (ts, swap used GB) within core.SWAP_WINDOW_S
         self.peak = {}  # granted ticket id -> largest memory seen, GB
+        self.now_gb = {}  # granted ticket id -> memory at the last tick, GB
         self.taken_calls = set()  # hook records already matched to a ticket
         self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
         self.procs, self.mem = {}, {"total_gb": 0, "free_pct": 0}  # last snapshot, for the detail dialogs
@@ -239,10 +240,11 @@ class Queue:
         ceiling = self.ceiling()
         with self.lock:
             tickets = self.active_tickets()
+            self.now_gb = {}
             for t in tickets:
                 if t.state == "granted" and t.pid in procs:
                     gb = ticket_rss_gb(t.pid, t.id, procs, serving, kotlin_of)
-                    rss[f"t{t.id}"] = gb
+                    rss[f"t{t.id}"] = self.now_gb[t.id] = gb
                     self.peak[t.id] = max(self.peak.get(t.id, 0.0), gb)
             avail = mem["total_gb"] * mem["free_pct"] / 100
             peaks = self.peaks()
@@ -412,6 +414,7 @@ class Queue:
             t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
             if t["state"] == "granted":
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
+                t["rss_gb"] = round(self.now_gb[t["id"]], 1) if t["id"] in self.now_gb else None
         return {
             "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "used": pl.used,
             "base_slots": core.SLOTS, "max_slots": ceiling, "headroom_gb": core.HEADROOM_GB,
