@@ -402,7 +402,8 @@ class Queue:
     def ticket_rows(self, where, args):
         cols = ["id", "pid", "claude_pid", "ralphy", "cwd", "cmd", "state", "created", "granted", "ended",
                 "end_reason", "exit_code", "ctype", "peak_gb", "subagent"]
-        rows = self.db.execute(f"select {', '.join(cols)} from tickets where {where} order by id", args)
+        exprs = ["round(peak_gb, 1)" if c == "peak_gb" else c for c in cols]
+        rows = self.db.execute(f"select {', '.join(exprs)} from tickets where {where} order by id", args)
         return [dict(zip(cols, r)) for r in rows.fetchall()]
 
     def proc_details(self, pid):

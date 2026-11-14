@@ -247,6 +247,17 @@ class TicketMemory(unittest.TestCase):
         gb = ticket_rss_gb(201, 1, procs, serving={700: 400, 900: 555}, kotlin_of={700: {800}, 900: {800}})
         self.assertEqual(round(gb * 1024), 5)  # 201, 400, 700, 710, 800 at 1 MB each; 900 and 910 excluded
 
+    def test_done_ticket_peak_is_rounded_and_missing_peak_stays_empty(self):
+        import sqlite3
+        from types import SimpleNamespace
+        from bq.server import Queue
+        db = sqlite3.connect(":memory:")
+        db.execute("create table tickets (id, pid, claude_pid, ralphy, cwd, cmd, state, created, granted, ended,"
+                   " end_reason, exit_code, ctype, peak_gb, subagent)")
+        db.execute("insert into tickets (id, state, peak_gb) values (1, 'done', 3.923477172851), (2, 'done', null)")
+        rows = Queue.ticket_rows(SimpleNamespace(db=db), "1=1", ())
+        self.assertEqual([r["peak_gb"] for r in rows], [3.9, None])
+
 
 
 class SubagentCall(unittest.TestCase):
