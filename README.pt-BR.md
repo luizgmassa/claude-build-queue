@@ -1,9 +1,10 @@
-# build-queue
+# Claude Build Queue
 
 [English](README.md) · **Português**
 
-Fila FIFO de máquina para os builds pesados (Gradle/JVM e outras toolchains) dos agentes Claude, com monitor de memória, limpeza de
-processos e página em http://127.0.0.1:8787. Roda em macOS, Linux e Windows.
+Fila FIFO de máquina para os builds pesados dos agentes Claude (Gradle/JVM, Xcode, Node/JS, C/C++, .NET,
+Swift, Rust, Go, Maven, sbt), com monitor de memória, limpeza de processos e página em http://127.0.0.1:8787.
+Roda em macOS, Linux e Windows.
 
 ![Página da fila: vagas, memória, builds executando e aguardando, agentes](docs/queue.png)
 
@@ -62,6 +63,9 @@ crash: o servidor recolhe o ticket quando o PID do `gq` morre). `gq` dentro de u
 
 O gancho `PreToolUse` global (`bq/hook.py`) nega todo Bash que rode esses comandos fora de `gq run`,
 e todo `gq run` sem `run_in_background`.
+
+`gq status` mostra as vagas, a memória, por que a fila está parada e os tickets abertos; `(ended)` marca o
+ticket cujo agente morreu. `gq`, o gancho e o log do servidor falam inglês; só a página é traduzida.
 
 ## Limpeza (`gq enforce on|off`)
 

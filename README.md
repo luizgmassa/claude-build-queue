@@ -1,9 +1,10 @@
-# build-queue
+# Claude Build Queue
 
 **English** · [Português](README.pt-BR.md)
 
-Machine-wide FIFO queue for the heavy builds (Gradle/JVM and other toolchains) of the Claude agents, with a memory monitor, process cleanup
-and a page at http://127.0.0.1:8787. Runs on macOS, Linux and Windows.
+Machine-wide FIFO queue for the heavy builds of the Claude agents (Gradle/JVM, Xcode, Node/JS, C/C++, .NET,
+Swift, Rust, Go, Maven, sbt), with a memory monitor, process cleanup and a page at http://127.0.0.1:8787.
+Runs on macOS, Linux and Windows.
 
 ![Queue page: slots, memory, running and waiting builds, agents](docs/queue.png)
 
@@ -62,6 +63,9 @@ gq status
 
 The global `PreToolUse` hook (`bq/hook.py`) denies every Bash call that runs these commands outside
 `gq run`, and every `gq run` without `run_in_background`.
+
+`gq status` prints the slots, memory, why the queue is stopped, and the open tickets; `(ended)` marks a ticket
+whose agent has died. `gq`, the hook and the server log speak English; only the page is translated.
 
 ## Cleanup (`gq enforce on|off`)
 
