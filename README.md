@@ -5,6 +5,12 @@
 Machine-wide FIFO queue for the Gradle/JVM runs of the Claude agents on this Mac, with a memory monitor,
 process cleanup and a page at http://127.0.0.1:8787.
 
+![Queue page: slots, memory, running and waiting builds, agents](docs/queue.png)
+
+![Agent dialog: session, every process with its memory share, tickets](docs/agent-dialog.png)
+
+The page is in Portuguese; command lines and session ids are masked in these screenshots.
+
 ## Rules
 
 - **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot). The runner never

@@ -5,6 +5,12 @@
 Fila FIFO de máquina para execuções Gradle/JVM dos agentes Claude neste Mac, com monitor de memória,
 limpeza de processos e página em http://127.0.0.1:8787.
 
+![Página da fila: vagas, memória, builds executando e aguardando, agentes](docs/queue.png)
+
+![Dialog do agente: sessão, cada processo com sua parcela de memória, tickets](docs/agent-dialog.png)
+
+Linhas de comando e IDs de sessão estão mascarados nestes prints.
+
 ## Regras
 
 - **2 vagas**, contando o runner self-hosted do GitHub (`Runner.Worker` vivo = 1 vaga). O runner nunca
