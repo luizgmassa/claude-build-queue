@@ -368,5 +368,142 @@ class Messages(unittest.TestCase):
             self.assertEqual(set(re.findall(r"\{(\w+)\}", i18n["pt-BR"][key])), placeholders, key)
 
 
+class Toolchains(unittest.TestCase):
+    QUEUED = {"npm ci": "node", "npm install": "node", "npm run build": "node", "npm test": "node",
+              "npm run test:unit": "node", "pnpm build": "node", "pnpm --filter=web test": "node", "yarn": "node",
+              "yarn build": "node", "bun install": "node", "bun test": "node", "npx tsc --noEmit": "node",
+              "pnpm exec jest": "node", "yarn vitest run": "node", "tsc -p .": "node", "next build": "node",
+              "vite build": "node", "jest": "node", "vitest run": "node", "node node_modules/.bin/tsc -b": "node",
+              "cmake --build build -j8": "cc", "make -j8": "cc", "ninja -C out": "cc", "clang -c a.c": "cc",
+              "g++ -O2 -o x a.cpp": "cc", "gcc-13 -c a.c": "cc", "bazel build //...": "bazel",
+              "bazelisk test //x:y": "bazel", "dotnet build": "dotnet", "dotnet test x.sln": "dotnet",
+              "dotnet publish -c Release": "dotnet", "dotnet restore": "dotnet", "msbuild x.sln": "msbuild",
+              "swift build": "swift", "swift test --parallel": "swift", "cargo build --release": "cargo",
+              "cargo +nightly test": "cargo", "go build ./...": "go", "go test ./...": "go", "mvn -q test": "maven",
+              "./mvnw package": "maven", "sbt compile": "sbt"}
+    CHEAP = ["npm --version", "npm ls", "npm run dev", "npm run lint", "npm start", "npm run build:watch",
+             "npm run build -- --watch", "npx create-next-app x", "node -e 'console.log(1)'", "node server.js",
+             "tsc --watch", "tsc -v", "jest --watch", "vitest watch", "next dev", "vite", "cmake -S . -B build",
+             "clang --version", "clang -print-resource-dir", "make --version", "bazel query //...",
+             "bazel shutdown", "dotnet --info", "dotnet run", "dotnet build-server shutdown", "msbuild /version",
+             "swift package resolve", "swift --version", "cargo --version", "cargo fmt", "cargo check",
+             "go fmt ./...", "go vet ./...", "go run .", "mvn --version", "git status", "ls", "which make",
+             "brew install cmake", "echo cargo build", "grep -r 'npm ci' ."]
+
+    def test_heavy_commands_get_their_command_type_and_the_hook_queues_them(self):
+        for cmd, want in self.QUEUED.items():
+            self.assertEqual(core.command_type(cmd), want, cmd)
+            self.assertTrue(core.analyze_command(cmd)[0], cmd)
+            self.assertEqual(core.analyze_command(f"gq run -- {cmd}"), ([], True), cmd)
+
+    def test_cheap_commands_are_not_queued(self):
+        for cmd in self.CHEAP:
+            self.assertEqual(core.analyze_command(cmd)[0], [], cmd)
+
+    def test_windows_spellings_and_shell_wrappers_are_queued(self):
+        for cmd in ["npm.cmd run build", "pnpm.CMD install", "dotnet.exe test", "MSBuild.exe x.sln /m",
+                    "cargo.exe build", "go.exe test ./...", "mvn.cmd package", "cmd /c \"npm.cmd ci\"",
+                    "cmd //c dotnet build", "bash -c 'cargo test'", "sh -c \"make -j4 && make install\"",
+                    "cd web && npx vite build", "timeout 600 swift build"]:
+            self.assertTrue(core.analyze_command(cmd)[0], cmd)
+        self.assertEqual(core.command_type("C:/dotnet/dotnet.exe build x.sln"), "dotnet")
+        self.assertEqual(core.command_type("perl -e 'alarm 3000; exec @ARGV' cargo test"), "cargo")
+        self.assertEqual(core.analyze_command("bash -c 'gq run -- cargo test'"), ([], True))
+
+    def test_process_kinds(self):
+        for args, kind in [
+                ("node /opt/homebrew/bin/npm ci", "node"), ("npm install", "node"),  # Linux npm retitles itself
+                ("C:/nodejs/node.exe C:/nodejs/node_modules/npm/bin/npm-cli.js run build", "node"),
+                ("node --max-old-space-size=4096 /w/node_modules/.bin/tsc -p .", "node"),
+                ("node /w/node_modules/.bin/tsc --watch", "tsc_watch"),
+                ("node /w/node_modules/.bin/next build", "node"),
+                ("/usr/bin/make -j8", "cc"), ("cmake --build build", "cc"), ("/usr/bin/clang -c a.c", "compiler"),
+                ("/usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -quiet a.cpp", "compiler"),
+                ("C:/llvm/bin/clang++.exe -c a.cpp", "compiler"), ("swift-frontend -frontend -c a.swift", "compiler"),
+                ("/usr/bin/swift-build --configuration debug", "swift"), ("cargo build", "cargo"),
+                ("rustc --crate-name x src/lib.rs", "compiler"), ("go test ./...", "go"), ("dotnet build", "dotnet"),
+                ("C:/dotnet/dotnet.exe test", "dotnet"), ("C:/VS/MSBuild/Bin/MSBuild.exe x.sln /m", "msbuild"),
+                ("bazel build //...", "bazel"),
+                ("dotnet /usr/share/dotnet/sdk/8.0/MSBuild.dll /nologo /nodemode:1 /nodeReuse:true", "msbuild_node"),
+                ("C:/VS/MSBuild/Bin/MSBuild.exe /nodemode:1 /nodeReuse:true /low:false", "msbuild_node"),
+                ("dotnet /usr/share/dotnet/sdk/8.0.100/Roslyn/bincore/VBCSCompiler.dll -pipename:abc", "vbcscompiler"),
+                ("C:/VS/Roslyn/VBCSCompiler.exe -pipename:abc", "vbcscompiler"),
+                ("dotnet exec /sdk/Sdks/Microsoft.NET.Sdk.Razor/tools/rzc.dll server -p pipe", "razor_server"),
+                ("bazel(ws) -XX:+HeapDumpOnOutOfMemoryError -jar /u/.cache/bazel/A-server.jar", "bazel_server"),
+                ("node /w/node_modules/eslint_d/lib/server.js", "eslint_d"),
+                ("/jdk/bin/java -cp boot org.codehaus.plexus.classworlds.launcher.Launcher test", "java"),
+                ("node /u/.vscode/extensions/ts/tsserver.js", "other"), ("rust-analyzer", "other"),
+                ("sccache", "other"), ("clangd --background-index", "other"), ("sourcekit-lsp", "other"),
+                ("node /w/node_modules/.bin/eslint .", "other"), ("node server.js", "other"),
+                ("cargo check --message-format=json", "other"), ("dotnet /sdk/MSBuild.dll x.sln", "other")]:
+            self.assertEqual(core.kind_of(args), kind, args)
+
+
+class ToolchainCleanup(unittest.TestCase):
+    ORPHAN = core.msg("kill.orphan", pid=4242)
+    WORKER = core.msg("kill.loose_worker")
+
+    def kills(self, *procs):
+        return tick(world(*procs)).kills
+
+    def test_build_and_daemons_of_a_dead_agent_die(self):
+        procs = [P(900, 1, "cargo build", CLAUDE_PID=4242), P(901, 900, "rustc --crate-name x", CLAUDE_PID=4242),
+                 P(910, 1, "dotnet /sdk/MSBuild.dll /nologo /nodemode:1 /nodeReuse:true", CLAUDE_PID=4242),
+                 P(911, 910, "node /w/node_modules/.bin/tsc -p .", CLAUDE_PID=4242),
+                 P(920, 1, "dotnet /sdk/Roslyn/bincore/VBCSCompiler.dll -pipename:x", CLAUDE_PID=4242),
+                 P(930, 1, "dotnet exec /sdk/rzc.dll server -p x", CLAUDE_PID=4242),
+                 P(940, 1, "bazel(ws) -jar /u/.cache/bazel/install/a/A-server.jar", CLAUDE_PID=4242),
+                 P(941, 940, "/jdk/bin/java -jar JavaBuilder_deploy.jar --persistent_worker", CLAUDE_PID=4242),
+                 P(950, 1, "node /w/node_modules/.bin/tsc --watch", CLAUDE_PID=4242),
+                 P(960, 1, "node /w/node_modules/eslint_d/lib/server.js", CLAUDE_PID=4242),
+                 P(970, 1, "node /opt/homebrew/bin/npm ci", CLAUDE_PID=4242),
+                 P(971, 970, "node /w/node_modules/.bin/next build", CLAUDE_PID=4242)]
+        # 941 is a `java`, which the existing rule already kills on its own; the bazel server's tree kill covers it too
+        want = [(p, self.ORPHAN) for p in (900, 910, 920, 930, 940, 941, 950, 960, 970)]
+        self.assertEqual(sorted(self.kills(*procs)), want)
+
+    def test_the_same_processes_of_a_live_agent_or_outside_any_agent_are_spared(self):
+        for env in ({"CLAUDE_PID": 100}, {}):
+            procs = [P(900, 101, "cargo build", **env), P(901, 101, "make -j8", **env),
+                     P(910, 1, "dotnet /sdk/MSBuild.dll /nodemode:1 /nodeReuse:true", **env),
+                     P(920, 1, "C:/VS/Roslyn/VBCSCompiler.exe -pipename:x", **env),
+                     P(940, 1, "bazel(ws) -jar /u/.cache/bazel/install/a/A-server.jar", **env),
+                     P(941, 940, "/jdk/bin/java -jar JavaBuilder_deploy.jar --persistent_worker", **env),
+                     P(950, 1, "node /w/node_modules/.bin/tsc --watch", **env),
+                     P(960, 1, "node /w/node_modules/eslint_d/lib/server.js", **env)]
+            self.assertEqual(self.kills(*procs), [], env)
+
+    def test_ide_language_servers_and_caches_of_a_dead_agent_are_spared(self):
+        self.assertEqual(self.kills(P(900, 1, "rust-analyzer", CLAUDE_PID=4242), P(901, 1, "sccache", CLAUDE_PID=4242),
+                                    P(902, 1, "node /u/.vscode/extensions/ts/tsserver.js", CLAUDE_PID=4242),
+                                    P(903, 1, "clangd --background-index", CLAUDE_PID=4242),
+                                    P(904, 1, "sourcekit-lsp", CLAUDE_PID=4242),
+                                    P(905, 1, "node /w/node_modules/.bin/eslint .", CLAUDE_PID=4242),
+                                    P(906, 1, "cargo check --message-format=json", CLAUDE_PID=4242)), [])
+
+    def test_nested_toolchain_under_a_queued_run_dies_with_its_gq_only(self):
+        gq = P(201, 101, "python3 /u/.local/bin/gq run -- npm run build", CLAUDE_PID=4242)
+        procs = [gq, P(400, 201, "node /opt/homebrew/bin/npm run build", CLAUDE_PID=4242),
+                 P(401, 400, "node /w/node_modules/.bin/next build", CLAUDE_PID=4242)]
+        self.assertEqual(self.kills(*procs), [(201, self.ORPHAN)])
+
+    def test_compiler_whose_driver_died_is_killed(self):
+        procs = [P(50, 1, "/usr/lib/systemd/systemd --user"),
+                 P(900, 1, "/usr/bin/clang -c a.c", CLAUDE_PID=100),
+                 P(901, 50, "/usr/libexec/gcc/x/13/cc1plus -quiet a.cpp", CLAUDE_PID=100),
+                 P(902, 999, "swift-frontend -frontend -c a.swift", CLAUDE_PID=100),
+                 P(903, 0, "C:/llvm/bin/clang++.exe -c a.cpp", CLAUDE_PID=100)]
+        self.assertEqual(sorted(self.kills(*procs)), [(p, self.WORKER) for p in (900, 901, 902, 903)])
+
+    def test_compiler_with_a_live_parent_or_outside_an_agent_is_spared(self):
+        procs = [P(800, 101, "make -j8", CLAUDE_PID=100), P(801, 800, "/usr/bin/clang -c a.c", CLAUDE_PID=100),
+                 P(810, 1, "sourcekit-lsp", CLAUDE_PID=100), P(811, 810, "swift-frontend -frontend -c a.swift",
+                                                                 CLAUDE_PID=100),
+                 P(820, 101, "python3 -m pip install x", CLAUDE_PID=100), P(821, 820, "gcc -c ext.c", CLAUDE_PID=100),
+                 P(830, 1, "/Applications/Xcode.app/x/clang -c a.m"),  # Xcode's own, owner nonagent
+                 P(840, 1, "/usr/bin/ld -o x a.o", CLAUDE_PID=100)]
+        self.assertEqual(self.kills(*procs), [])
+
+
 if __name__ == "__main__":
     unittest.main()

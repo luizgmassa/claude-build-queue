@@ -2,7 +2,7 @@
 
 [English](README.md) · **Português**
 
-Fila FIFO de máquina para execuções Gradle/JVM dos agentes Claude, com monitor de memória, limpeza de
+Fila FIFO de máquina para os builds pesados (Gradle/JVM e outras toolchains) dos agentes Claude, com monitor de memória, limpeza de
 processos e página em http://127.0.0.1:8787. Roda em macOS, Linux e Windows.
 
 ![Página da fila: vagas, memória, builds executando e aguardando, agentes](docs/queue.png)
@@ -24,13 +24,26 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
   a próxima subida passa pela mesma análise. Cada subida soma exatamente 1 vaga: se quem não espera (runner,
   build fora de agente) já ocupa essa vaga, ninguém entra até a próxima subida.
 - **Estimativa por tipo de comando** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
-  `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`): maior pico das últimas 5 execuções liberadas
+  `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`, `node`, `cc`, `bazel`, `dotnet`, `msbuild`,
+  `swift`, `cargo`, `go`, `maven`, `sbt`): maior pico das últimas 5 execuções liberadas
   do mesmo tipo; antes disso, a tabela `DEFAULT_GB` de `bq/core.py`. O pico soma a árvore do `gq`, o daemon
   Gradle que atende o cliente, os workers dele e o daemon Kotlin ligado a ele.
 - **Memória**: só a pressão crítica bloqueia (ninguém entra, nem por vaga extra). macOS: nível `critical` do
   kernel (`warn` não bloqueia). Linux: PSI `full avg10` ≥ 10% em `/proc/pressure/memory`. Windows: o aviso de
   memória baixa do kernel (`LowMemoryResourceNotification`). Sem esse sinal: menos de 5% da RAM disponível.
 - Contam como execução: `./gradlew`, `xcodebuild`, `pod install`, `java`/`kotlinc` direto, `uv run`.
+- Também passam pela fila (o gancho exige `gq run`), cada um com seu tipo de comando:
+  - Node/JS: `npm`/`pnpm`/`yarn`/`bun` install, test e scripts com nome de build/test/compile/typecheck/e2e
+    (não dev/watch/serve/start), `npx`/`exec`/`dlx` das ferramentas abaixo, `tsc`, `next build`, `vite build`,
+    `jest`, `vitest` (fora do modo watch);
+  - C/C++: `cmake --build`, `make`, `ninja`, `msbuild`, `clang`/`gcc`/`g++`/`cc` direto com arquivo de entrada,
+    `bazel build|test|coverage`;
+  - .NET: `dotnet build|test|publish|restore|pack|msbuild`;
+  - outros: `swift build|test`, `cargo build|test|bench`, `go build|test|install`, `mvn`/`mvnw`, `sbt`.
+
+  Consultas de versão e ajuda (`--version`, `--help`, `/version`) e subcomandos baratos (`npm run dev`,
+  `cargo check`, `go vet`, `dotnet run`, `cmake -S . -B build`) ficam fora. `mvn` e `sbt` rodam como `java`,
+  então também morrem sem vaga; as outras toolchains só morrem depois que o agente delas morreu.
 - Builds fora de agente (seu terminal, Android Studio) contam vaga, mas nunca são mortos.
 - Nunca tocados: runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), backend do staging
   (`~/.health-hub-local`), processos `claude`, o próprio servidor.
@@ -58,7 +71,13 @@ Em `off` (simulação) a página só lista o que mataria. Em `on`:
 - daemon Gradle de agente ocioso há 20 s (sem cliente conectado) e sem concessão nos últimos 20 s;
 - daemon Kotlin de agente ocioso há 60 s, mesmo com builds rodando (o KGP cai no compilador dentro do Gradle);
 - worker Gradle cujo daemon pai morreu (o pai deixou de ser um processo Gradle: init, subreaper do Linux ou
-  PID reaproveitado no Windows).
+  PID reaproveitado no Windows);
+- execução de toolchain (`npm`, `make`, `cargo`, ...) e servidor de build cujo agente morreu: nós reaproveitados
+  do MSBuild (`MSBuild.dll /nodemode:`), `VBCSCompiler`, o servidor do Razor (`rzc.dll server`), o servidor do
+  bazel, `tsc --watch`, `eslint_d`. Servidores de linguagem de IDE e caches (`tsserver`, `rust-analyzer`,
+  `clangd`, `sourcekit-lsp`, `sccache`) nunca são tocados;
+- compilador (`clang`, `gcc`, `cc1plus`, `swift-frontend`, `rustc`) cujo driver morreu (init ou um subreaper o
+  adotou). Compilador com pai vivo (IDE, `pip install`) fica em paz.
 
 O dono de cada processo vem das variáveis `CLAUDE_PID`, `CLAUDE_CODE_SESSION_ID` e `RALPHY_STATUS_FILE`,
 que todo processo criado por um agente herda, inclusive daemons soltos.

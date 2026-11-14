@@ -18,7 +18,8 @@ PEAK_HISTORY = 5  # estimate = largest of the last N measured peaks of the same 
 # Starting estimates (GB of the whole build: client, daemon, workers, Kotlin daemon) before any measurement.
 DEFAULT_GB = {"gradle-check": 8.0, "gradle-backend": 6.0, "gradle-ios": 6.0, "gradle-test": 5.0,
               "gradle-lint": 3.0, "gradle": 4.0, "xcodebuild": 6.0, "java": 2.0, "pod": 1.0, "uv": 1.0,
-              "other": 4.0}
+              "node": 3.0, "cc": 4.0, "bazel": 6.0, "dotnet": 3.0, "msbuild": 4.0, "swift": 4.0, "cargo": 4.0,
+              "go": 2.0, "maven": 3.0, "sbt": 4.0, "other": 4.0}
 IDLE_GRACE_S = 20
 KOTLIN_IDLE_S = 60  # idle Kotlin daemon dies even mid-build: KGP falls back to in-process compile
 GRANT_QUIET_S = 20
@@ -90,6 +91,14 @@ NONAGENT_EXEC_KINDS = {"gradle_client", "xcodebuild", "pod"}
 INFRA_KINDS = {"gradle_daemon", "kotlin_daemon", "gradle_worker"}
 # A worker under anything else lost its parent: init, a Linux subreaper, or a reused Windows pid adopted it.
 WORKER_PARENTS = INFRA_KINDS | {"gradle_client"}
+# Non-JVM toolchain runs (kind = command type). The hook queues them; the server only kills them once their
+# agent died, because an unqueued `make` under `pip install` or `brew install` is no reason to fail that install.
+TOOLCHAIN_KINDS = {"node", "cc", "bazel", "dotnet", "msbuild", "swift", "cargo", "go", "maven", "sbt"}
+# Build servers these toolchains leave behind; they die with their agent. IDE language servers are not here.
+DAEMON_KINDS = {"msbuild_node", "vbcscompiler", "razor_server", "bazel_server", "tsc_watch", "eslint_d"}
+INFRA_KINDS |= DAEMON_KINDS  # a bazel action or an MSBuild Exec task runs under the server, not under a gq
+# Compiler processes only ever run under a build driver; once init adopted one, nobody reads its output.
+COMPILER = re.compile(r"(cc1(plus|obj)?|clang(\+\+)?|gcc|g\+\+|cc|c\+\+)(-[\d.]+)?|swift-frontend|rustc")
 
 
 @dataclass
@@ -140,11 +149,35 @@ def kind_of(args):
         return "uv_run"
     if exe in ("kotlinc", "kotlinc-jvm", "kotlin") or "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler" in args:
         return "kotlinc"
+    exe, rest = _node_script(words[1:]) if exe in ("node", "nodejs") else (exe, words[1:])
+    if re.search(r"msbuild(\.dll|\.exe)?\s(.*\s)?[-/]+nodemode:", args, re.I):
+        return "msbuild_node"
+    if exe == "vbcscompiler" or re.search(r"vbcscompiler\.dll\b", args, re.I):
+        return "vbcscompiler"
+    if re.search(r"rzc\.dll\s+server\b", args, re.I):
+        return "razor_server"
+    if "A-server.jar" in args:  # the bazel server runs as `bazel(<workspace>)`, a JVM with the server jar
+        return "bazel_server"
+    if exe == "eslint_d" or "/eslint_d/" in args:
+        return "eslint_d"
+    if exe == "tsc" and WATCH & set(rest):
+        return "tsc_watch"
     if exe == "java":
         return "java"
+    if COMPILER.fullmatch(exe):
+        return "compiler"
+    tool = toolchain(exe, rest)
+    if tool:
+        return tool
     if exe == "postgres" and "embedded-pg" in args:
         return "embedded_pg"
     return "other"
+
+
+def parent_gone(p, procs):
+    """Init, a Linux subreaper, or nothing (a dead Windows parent) holds the process now."""
+    parent = procs.get(p.ppid)
+    return p.ppid <= 1 or parent is None or exe_name(parent.args.split(" ", 1)[0]) in ("launchd", "init", "systemd")
 
 
 def command_type(cmd):
@@ -178,6 +211,10 @@ def command_type(cmd):
         return "gradle"
     if "uv" in names and names[names.index("uv") + 1:][:1] == ["run"]:
         return "uv"
+    for i, n in enumerate(names):
+        tool = toolchain(n, words[i + 1:])
+        if tool:
+            return tool
     if any(n in ("java", "kotlinc", "kotlinc-jvm", "kotlin") for n in names):
         return "java"
     return "other"
@@ -358,7 +395,12 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if agent_dead and p.kind in AGENT_EXEC_KINDS | {"gq"} and p.root in (p.pid, None) \
                 and p.pid not in {k[0] for k in out.kills}:
             out.kills.append((p.pid, msg("kill.orphan", pid=cp)))
-        elif p.kind == "gradle_worker" and getattr(procs.get(p.ppid), "kind", None) not in WORKER_PARENTS:
+        elif agent_dead and p.kind in TOOLCHAIN_KINDS | DAEMON_KINDS \
+                and not any(a.kind in AGENT_EXEC_KINDS | TOOLCHAIN_KINDS | INFRA_KINDS | {"gq"}
+                            for a in ancestors(p.pid, procs)):  # top of its tree; a daemon's tasks die with it
+            out.kills.append((p.pid, msg("kill.orphan", pid=cp)))
+        elif p.kind == "gradle_worker" and getattr(procs.get(p.ppid), "kind", None) not in WORKER_PARENTS \
+                or p.kind == "compiler" and parent_gone(p, procs):
             out.kills.append((p.pid, msg("kill.loose_worker")))
 
     local_active = len(granted) + len(nonagent) + len(unqueued)
@@ -425,7 +467,20 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
 
 SEPARATORS = {";", "&&", "||", "|", "&", "|&", "(", ")", "\n", ";;", ";&"}
 TRIGGERS = {"gradlew", "gradle", "xcodebuild", "java", "kotlinc", "kotlinc-jvm", "kotlin"}
-VERSION_ONLY = {("-version",), ("--version",), ("-v",), ("version",)}
+VERSION_ONLY = {("-version",), ("--version",), ("-v",), ("version",), ("--help",), ("/version",)}
+WATCH = {"--watch", "-w", "--watchAll"}
+JS_PMS = {"npm", "pnpm", "yarn", "bun"}
+JS_INSTALL_TEST = {"install", "i", "ci", "add", "rebuild", "test", "t", "tst"}
+JS_BUILD_SCRIPT = re.compile(r"(^|[:_-])(build|test|compile|typecheck|type-check|e2e)")
+JS_LONG_SCRIPT = re.compile(r"watch|dev|serve|start")  # a dev server or watcher would hold its slot forever
+# Toolchains queued for any arguments but a version or help query, and those queued for some subcommands only.
+TOOL_ANY = {"make": "cc", "gmake": "cc", "ninja": "cc", "msbuild": "msbuild", "mvn": "maven", "mvnw": "maven",
+            "sbt": "sbt", "swift-build": "swift", "swift-test": "swift"}
+TOOL_SUBS = {"next": ("node", {"build"}), "vite": ("node", {"build"}),
+             "bazel": ("bazel", {"build", "test", "coverage"}), "bazelisk": ("bazel", {"build", "test", "coverage"}),
+             "dotnet": ("dotnet", {"build", "test", "publish", "restore", "pack", "msbuild"}),
+             "swift": ("swift", {"build", "test"}), "cargo": ("cargo", {"build", "b", "test", "t", "bench"}),
+             "go": ("go", {"build", "test", "install"})}
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
@@ -457,6 +512,48 @@ def _segments(cmd):
             seg.append(tok)
     if seg:
         yield seg
+
+
+def _node_script(rest):
+    """Tool a `node` process runs: `node --max-old-space-size=4096 /p/npm/bin/npm-cli.js ci` -> (npm, [ci])."""
+    for i, w in enumerate(rest):
+        if not w.startswith("-"):
+            return re.sub(r"(-cli)?\.[cm]?js$", "", exe_name(w)), rest[i + 1:]
+    return "", []
+
+
+def toolchain(prog, rest):
+    """Command type of a heavy non-JVM toolchain run (`npm ci`, `cargo test`, `make`), or None for a cheap one."""
+    if prog in ("node", "nodejs"):
+        return toolchain(*_node_script(rest))
+    if tuple(rest) in VERSION_ONLY:
+        return None
+    # shortcut: a flag's separate value (`pnpm --filter web build`) reads as the subcommand, so that run is not
+    # queued; parse per-tool flags if real runs slip through.
+    words = [w for w in rest if not w.startswith(("-", "+"))]  # `cargo +nightly build`
+    sub = words[0] if words else ""
+
+    def then(tool):  # `npx tsc`, `pnpm exec jest`, `yarn vitest run`
+        return toolchain(exe_name(tool[0]), rest[rest.index(tool[0]) + 1:]) if tool else None
+
+    if prog in ("npx", "pnpx", "bunx"):
+        return then(words[:1])
+    if prog in JS_PMS:
+        script = words[1] if sub in ("run", "run-script") and len(words) > 1 else sub
+        if sub in JS_INSTALL_TEST or prog == "yarn" and not words or prog == "bun" and sub == "build" \
+                or JS_BUILD_SCRIPT.search(script) and not JS_LONG_SCRIPT.search(script) and not WATCH & set(rest):
+            return "node"
+        return then(words[1:2] if sub in ("exec", "dlx", "x") else [] if sub in ("run", "run-script") else words[:1])
+    if prog in ("tsc", "jest", "vitest"):
+        return None if WATCH & set(rest) or sub in ("watch", "dev") else "node"
+    if prog == "cmake":
+        return "cc" if "--build" in rest else None  # configuring is cheap
+    if COMPILER.fullmatch(prog):
+        return "cc" if words else None  # no input file: `clang -print-resource-dir`, `gcc -dumpmachine`
+    if prog in TOOL_ANY:
+        return TOOL_ANY[prog]
+    ctype, subs = TOOL_SUBS.get(prog, (None, ()))
+    return ctype if sub in subs else None
 
 
 def _program(words):
@@ -526,7 +623,7 @@ def analyze_command(cmd, depth=0):
             uses_gq = uses_gq or g
             continue
         trig = prog in TRIGGERS or (prog == "pod" and rest[:1] in (["install"], ["update"])) \
-            or (prog == "uv" and rest[:1] == ["run"])
+            or (prog == "uv" and rest[:1] == ["run"]) or toolchain(prog, rest)
         if trig and tuple(rest) not in VERSION_ONLY:
             offending.append(" ".join(words)[:120])
     return offending, uses_gq
