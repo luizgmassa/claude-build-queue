@@ -18,7 +18,7 @@ def P(pid, ppid, args, **env):
 
 def world(*procs):
     base = [P(1, 0, "/sbin/launchd"), P(100, 1, "/Users/u/.local/bin/claude --settings /s/sessions/7.settings.json"),
-            P(101, 100, "/bin/zsh -c source snapshot")]
+            P(101, 100, "/bin/zsh -c source /u/.claude/shell-snapshots/snapshot-zsh-1.sh")]
     return {p.pid: p for p in base + list(procs)}
 
 
@@ -72,6 +72,14 @@ class Scheduling(unittest.TestCase):
 
 
 class Cleanup(unittest.TestCase):
+    def test_hook_process_is_not_a_build_but_bash_tool_and_orphan_runs_are(self):
+        hook = P(400, 100, "uv run --quiet --script /u/.claude/plugins/x/hooks/langfuse_hook.py", CLAUDE_PID=100)
+        tool = P(401, 101, "uv run scripts/t.py", CLAUDE_PID=100)
+        orphan = P(402, 1, "uv run scripts/o.py", CLAUDE_PID=100)
+        pl = tick(world(hook, tool, orphan))
+        self.assertEqual(sorted(k[0] for k in pl.kills), [401, 402])
+        self.assertEqual(pl.used, 2)
+
     def test_unqueued_agent_build_is_killed_and_counts_as_a_slot(self):
         pl = tick(world(P(400, 101, CLIENT, CLAUDE_PID=100)))
         self.assertEqual(pl.kills, [(400, "build sem vaga")])

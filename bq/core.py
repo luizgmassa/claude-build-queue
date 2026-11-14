@@ -156,6 +156,16 @@ def descendants(pid, procs):
     return out
 
 
+def started_by_claude_itself(anc):
+    """Hook and MCP processes reach their claude process without passing a Bash-tool shell."""
+    for a in anc:
+        if "/shell-snapshots/" in a.args:
+            return False
+        if a.kind == "claude":
+            return True
+    return False  # orphaned (ppid 1) builds still count
+
+
 def classify(procs, protected_pids=()):
     """Sets kind, owner and root on every process. Returns the exec roots."""
     for p in procs.values():
@@ -182,6 +192,8 @@ def classify(procs, protected_pids=()):
         if p.kind not in kinds:
             continue
         anc = list(ancestors(p.pid, procs))
+        if p.owner == "agent" and started_by_claude_itself(anc):
+            continue  # a Stop hook's `uv run` is not a build; killing it fails the hook
         if any(a.kind in AGENT_EXEC_KINDS | INFRA_KINDS or a.owner in ("runner", "protected") and a.kind != "claude"
                for a in anc):
             continue
