@@ -1,3 +1,5 @@
+import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -39,7 +41,7 @@ class Scheduling(unittest.TestCase):
     def test_fifo_grants_head_first_up_to_two_slots(self):
         pl = tick(world(*self.gqs(3, 1, 2)), self.waiting(3, 1, 2))
         self.assertEqual(pl.grants, [1, 2])
-        self.assertIn("sem vaga", pl.blocked)
+        self.assertIn("no slot", core.render(pl.blocked))
 
     def test_runner_takes_a_slot(self):
         runner = P(300, 1, "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient")
@@ -80,7 +82,7 @@ class Cleanup(unittest.TestCase):
 
     def test_unqueued_agent_build_is_killed_and_counts_as_a_slot(self):
         pl = tick(world(P(400, 101, CLIENT, CLAUDE_PID=100)))
-        self.assertEqual(pl.kills, [(400, "build sem vaga")])
+        self.assertEqual(pl.kills, [(400, core.msg("kill.no_slot"))])
         self.assertEqual(pl.used, 1)
 
     def test_queued_build_is_left_alone(self):
@@ -100,13 +102,13 @@ class Cleanup(unittest.TestCase):
 
     def test_orphan_of_dead_agent_is_killed(self):
         pl = tick(world(P(600, 1, CLIENT, CLAUDE_PID=4242)))
-        self.assertIn((600, "build sem vaga"), pl.kills)
+        self.assertIn((600, core.msg("kill.no_slot")), pl.kills)
         self.assertEqual(len([k for k in pl.kills if k[0] == 600]), 1)
 
     def test_idle_agent_daemon_is_killed_after_grace_busy_one_is_not(self):
         procs = world(P(700, 1, DAEMON, CLAUDE_PID=100), P(701, 1, DAEMON, CLAUDE_PID=100), P(702, 1, DAEMON))
         pl = tick(procs, busy={701}, idle_since={700: 900, 702: 900})
-        self.assertEqual(pl.kills, [(700, "daemon ocioso")])
+        self.assertEqual(pl.kills, [(700, core.msg("kill.idle_daemon"))])
         self.assertEqual(tick(world(P(700, 1, DAEMON, CLAUDE_PID=100)), idle_since={700: 995}).kills, [])
 
     def test_no_daemon_kill_right_after_a_grant(self):
@@ -118,7 +120,7 @@ class Cleanup(unittest.TestCase):
         procs = world(P(800, 1, KOTLIN, CLAUDE_PID=100), gq)
         busy_queue = [core.Ticket(id=1, pid=201, state="granted", created=0)]
         self.assertEqual(tick(procs, busy_queue, idle_since={800: 950}).kills, [])
-        self.assertEqual(tick(procs, busy_queue, idle_since={800: 900}).kills, [(800, "daemon ocioso")])
+        self.assertEqual(tick(procs, busy_queue, idle_since={800: 900}).kills, [(800, core.msg("kill.idle_daemon"))])
         self.assertEqual(tick(procs, busy_queue, busy={800}, idle_since={800: 0}).kills, [])
 
     def test_test_worker_under_daemon_is_not_a_root_but_orphaned_worker_dies(self):
@@ -129,7 +131,7 @@ class Cleanup(unittest.TestCase):
                       P(712, 1, "/jdk/bin/java worker.org.gradle.process.internal.worker.GradleWorkerMain",
                         CLAUDE_PID=100))
         pl = tick(procs, busy={700})
-        self.assertEqual(pl.kills, [(712, "worker solto (pai morreu)")])
+        self.assertEqual(pl.kills, [(712, core.msg("kill.loose_worker"))])
 
 
 class CrossPlatform(unittest.TestCase):
@@ -163,7 +165,7 @@ class CrossPlatform(unittest.TestCase):
                       P(60, 101, CLIENT, CLAUDE_PID=100),
                       P(711, 50, worker, CLAUDE_PID=100), P(712, 999, worker, CLAUDE_PID=100),
                       P(713, 60, worker, CLAUDE_PID=100))
-        kills = [k for k in tick(procs).kills if k[1] == "worker solto (pai morreu)"]
+        kills = [k for k in tick(procs).kills if k[1] == core.msg("kill.loose_worker")]
         self.assertEqual(sorted(k[0] for k in kills), [711, 712])
 
 class Hook(unittest.TestCase):
@@ -213,14 +215,14 @@ class DynamicLimit(unittest.TestCase):
     def test_raises_one_slot_when_memory_covers_estimate_plus_headroom(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
         self.assertEqual((pl.grants, pl.limit), ([3], 3))
-        self.assertIn("20.0 GB disponíveis − 8.0 GB", pl.raised)
-        self.assertIn("próxima vaga extra", pl.blocked)  # gradual: the second raise waits RAISE_GAP_S
+        self.assertIn("20.0 GB available − 8.0 GB", core.render(pl.raised))
+        self.assertIn("next extra slot", core.render(pl.blocked))  # gradual: the second raise waits RAISE_GAP_S
 
     def test_raise_adds_one_slot_even_above_the_limit(self):
         runner = P(300, 1, "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient")
         pl = self.run_tick([1, 2], [4], extra=[runner])  # 3 in use, limit 2
         self.assertEqual((pl.limit, pl.grants), (3, []))
-        self.assertIn("ninguém entra", pl.raised)
+        self.assertIn("nobody enters", core.render(pl.raised))
         pl = self.run_tick([1, 2], [4], extra=[runner], limit=3, last_raise=1000 - core.RAISE_GAP_S)
         self.assertEqual((pl.limit, pl.grants), (4, [4]))
 
@@ -230,25 +232,25 @@ class DynamicLimit(unittest.TestCase):
     def test_used_counts_this_ticks_grants(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
         self.assertEqual(pl.used, 3)
-        self.assertIn(f"({pl.used}/{pl.limit} em uso)", pl.blocked)
+        self.assertIn(f"({pl.used}/{pl.limit} in use)", core.render(pl.blocked))
 
     def test_no_raise_when_headroom_would_drop_below_6_gb(self):
         pl = self.run_tick([1, 2], [3], avail=13.9, est=8)
         self.assertEqual((pl.grants, pl.limit), ([], 2))
-        self.assertIn("< 6 GB de folga", pl.blocked)
+        self.assertIn("< 6 GB headroom", core.render(pl.blocked))
 
     def test_warn_pressure_still_raises_but_critical_does_not(self):
         self.assertEqual(self.run_tick([1, 2], [3], pressure=2).grants, [3])
         pl = self.run_tick([1, 2], [3], pressure=4)
         self.assertEqual(pl.grants, [])
-        self.assertIn("crítica", pl.blocked)
+        self.assertIn("critical", core.render(pl.blocked))
 
     def test_no_raise_within_gap_or_above_ceiling(self):
         self.assertEqual(self.run_tick([1, 2], [3], last_raise=950).grants, [])
         self.assertEqual(self.run_tick([1, 2], [3], last_raise=900).grants, [3])
         pl = self.run_tick([1, 2, 3, 4], [5], limit=4, avail=40)
         self.assertEqual(pl.grants, [])
-        self.assertIn("teto de 4", pl.blocked)
+        self.assertIn("ceiling of 4", core.render(pl.blocked))
         self.assertEqual(self.run_tick([], [3], pressure=2, avail=0, limit=2).grants, [3])  # base slot, warn
 
     def test_limit_drops_one_per_finished_holder_and_rises_again_only_by_analysis(self):
@@ -311,6 +313,59 @@ class SubagentCall(unittest.TestCase):
         self.assertIsNone(core.match_call(self.RECS, "S", 110.0, {"a", "b"}))
         self.assertIsNone(core.match_call(self.RECS, "S", 105.0 + core.CALL_WINDOW_S + 1, set()))
         self.assertIsNone(core.match_call(self.RECS, None, 110.0, set()))
+
+
+class Messages(unittest.TestCase):
+    PAGE = Path(__file__).resolve().parent.parent / "bq/page.html"
+    # Portuguese accents, plus words of the old pt-BR server texts that carry no accent
+    PT = re.compile(r"[ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔ]|\b(vaga|vagas|sem|fila|ocioso|ocupado|entrou|liberou|solto|morreu|"
+                    r"encerrado|folga|disponíveis|estimados|limite|teto|ninguém|permissão|matar|após|erro)\b", re.I)
+
+    def page_i18n(self):
+        html = self.PAGE.read_text(encoding="utf-8")
+        return json.loads(re.search(r'<script type="application/json" id="i18n">(.*?)</script>', html, re.S).group(1))
+
+    def test_message_is_a_key_with_params_and_renders_nested_messages_in_english(self):
+        m = core.msg("blocked.no_slot", used=3, limit=3, why=core.msg("refusal.gap", s=81))
+        self.assertEqual(json.loads(json.dumps(m)), {"key": "blocked.no_slot", "params": {
+            "used": 3, "limit": 3, "why": {"key": "refusal.gap", "params": {"s": 81}}}})
+        self.assertEqual(core.render(m), "no slot (3/3 in use); next extra slot in 81s")
+        self.assertEqual(core.render(core.msg("event.release", id=3, exit=None)), "ticket #3 released its slot (exit )")
+        self.assertEqual(core.render("ticket #3 liberou a vaga (exit 0)"), "ticket #3 liberou a vaga (exit 0)")
+        self.assertEqual(core.render(None), "")
+        self.assertEqual(core.render(core.msg("end.unknown reason")), "end.unknown reason")
+
+    def test_every_plan_message_has_an_english_template_and_renders(self):
+        gqs = [P(200 + i, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for i in (1, 2, 3)]
+        procs = world(*gqs, P(400, 101, CLIENT, CLAUDE_PID=100), P(600, 1, CLIENT, CLAUDE_PID=4242),
+                      P(700, 1, DAEMON, CLAUDE_PID=100), P(701, 1, DAEMON, CLAUDE_PID=100),
+                      P(712, 1, "/jdk/bin/java worker.org.gradle.process.internal.worker.GradleWorkerMain",
+                        CLAUDE_PID=100))
+        tickets = [core.Ticket(id=i, pid=200 + i, state="waiting", created=0) for i in (1, 2, 3)]
+        pl = tick(procs, tickets, busy={701}, idle_since={700: 0})
+        msgs = [pl.blocked] + [k[1] for k in pl.kills] + [p.status for p in procs.values() if p.status]
+        self.assertGreater(len(msgs), 5)
+        for m in msgs:
+            self.assertIsInstance(m, dict)
+            self.assertIn(m["key"], core.EN)
+            self.assertFalse(self.PT.search(core.render(m)), core.render(m))
+
+    def test_server_sources_emit_no_portuguese_text(self):
+        self.assertTrue(self.PT.search('f"ticket #{tid} entrou na vaga"'))  # positive control: the scan fires
+        self.assertTrue(self.PT.search("sem vaga (3/3 em uso)"))
+        root = Path(__file__).resolve().parent.parent / "bq"
+        for name in ("core.py", "server.py", "system.py"):
+            for n, line in enumerate((root / name).read_text(encoding="utf-8").splitlines(), 1):
+                self.assertFalse(self.PT.search(line), f"{name}:{n}: {line.strip()}")
+
+    def test_page_has_every_server_key_in_both_languages_with_the_same_english_text(self):
+        i18n = self.page_i18n()
+        self.assertEqual(set(i18n), {"en-US", "pt-BR"})
+        self.assertEqual(set(i18n["en-US"]), set(i18n["pt-BR"]))
+        for key, text in core.EN.items():
+            self.assertEqual(i18n["en-US"].get(key), text, key)
+            placeholders = set(re.findall(r"\{(\w+)\}", text))
+            self.assertEqual(set(re.findall(r"\{(\w+)\}", i18n["pt-BR"][key])), placeholders, key)
 
 
 if __name__ == "__main__":

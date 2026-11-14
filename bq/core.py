@@ -30,6 +30,58 @@ CALLS = DATA / "calls.jsonl"  # the hook's record of each `gq run` Bash call: se
 
 PRESSURE_CRITICAL = 4  # kern.memorystatus_vm_pressure_level; warn (2) does not block
 
+# English text of every message the server emits. A message travels as {"key", "params"}: the log renders it
+# with this table, the page with its own copy per language (page.html, `i18n` block; tests keep them in step).
+# Templates use only `{name}` placeholders, so Python's str.format and the page's replace read the same text.
+EN = {
+    "status.outside_queue": "outside the queue (non-agent)",
+    "status.in_slot": "in a slot",
+    "status.no_slot": "NO SLOT",
+    "status.busy": "busy",
+    "status.idle": "idle {s}s",
+    "kill.no_slot": "build without a slot",
+    "kill.orphan": "orphan: agent {pid} ended",
+    "kill.loose_worker": "loose worker (parent died)",
+    "kill.idle_daemon": "idle daemon",
+    "refusal.ceiling": "ceiling of {ceiling} slots",
+    "refusal.gap": "next extra slot in {s}s",
+    "refusal.headroom": "extra slot refused: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) "
+                        "< {headroom_gb} GB headroom",
+    "refusal.taken": "extra slot taken by runs that do not wait",
+    "blocked.pressure": "critical memory pressure",
+    "blocked.daemon": "waiting for an idle daemon to end",
+    "blocked.no_slot": "no slot ({used}/{limit} in use); {why}",
+    "limit.raised": "limit {old}→{new}: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) "
+                    "≥ {headroom_gb} GB headroom",
+    "limit.raised_taken": "limit {old}→{new}: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) "
+                          "≥ {headroom_gb} GB headroom; nobody enters: {used} in use "
+                          "(runner or build outside the queue)",
+    "limit.lowered": "limit {old}→{new}: {n} run(s) ended",
+    "event.enqueue": "ticket #{id} pid {pid}: {cmd}",
+    "event.grant": "ticket #{id} got a slot",
+    "event.release": "ticket #{id} released its slot (exit {exit})",
+    "event.reap": "ticket #{id}: {reason}",
+    "event.sigterm": "SIGTERM {pid} ({kind}): {reason}",
+    "event.sigkill": "SIGKILL {pid} after {s}s: {reason}",
+    "error.no_permission": "no permission to kill {pid}: {detail}",
+    "error.pid_gone": "PID {pid} no longer exists",
+    "end.released": "released",  # end_reason values stored in the tickets table, as "end." + value
+    "end.owner process gone": "owner process gone",
+}
+
+
+def msg(key, **params):
+    return {"key": key, "params": params}
+
+
+def render(m):
+    """English text of a message; a plain string (or nothing) passes through."""
+    if not isinstance(m, dict):
+        return "" if m is None else str(m)
+    params = {k: render(v) if isinstance(v, dict) or v is None else v for k, v in m.get("params", {}).items()}
+    return EN.get(m["key"], m["key"]).format(**params)
+
+
 ENV_KEYS = ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "RALPHY_STATUS_FILE", "BQ_TICKET", "GITHUB_ACTIONS")
 
 AGENT_EXEC_KINDS = {"gradle_client", "xcodebuild", "pod", "uv_run", "kotlinc", "java"}
@@ -53,7 +105,7 @@ class Proc:
     kind: str = "other"
     owner: str = "nonagent"  # agent | runner | protected | nonagent
     root: int | None = None  # pid of the exec root this process runs under
-    status: str = ""
+    status: dict | str = ""  # a message once classified
 
 
 def exe_name(path):
@@ -225,12 +277,12 @@ class Plan:
     kills: list = field(default_factory=list)  # (pid, reason)
     reaps: list = field(default_factory=list)  # (ticket id, reason)
     pid_starts: dict = field(default_factory=dict)  # ticket id -> lstart seen first
-    blocked: str = ""
+    blocked: dict | None = None  # message
     used: int = 0
     runner_busy: bool = False
     counts: dict = field(default_factory=dict)
     limit: int = SLOTS
-    raised: str = ""  # explanation of this tick's raise, if any
+    raised: dict | None = None  # message explaining this tick's raise, if any
     lowered: int = 0  # slot holders that ended since the last tick
     holders: set = field(default_factory=set)  # slot holders after this tick's grants
 
@@ -241,16 +293,16 @@ def max_slots(total_gb):
 
 
 def raise_refusal(*, used, limit, now, last_raise_ts, avail_gb, est, ceiling):
-    """Why one more slot cannot open now, or "" when it can."""
+    """Message saying why one more slot cannot open now, or None when it can."""
     ctype, gb = est
     if limit + 1 > ceiling:
-        return f"teto de {ceiling} vagas"
+        return msg("refusal.ceiling", ceiling=ceiling)
     if last_raise_ts is not None and now - last_raise_ts < RAISE_GAP_S:
-        return f"próxima vaga extra em {int(RAISE_GAP_S - (now - last_raise_ts))}s"
+        return msg("refusal.gap", s=int(RAISE_GAP_S - (now - last_raise_ts)))
     if avail_gb - gb < HEADROOM_GB:
-        return (f"vaga extra recusada: {avail_gb:.1f} GB disponíveis − {gb:.1f} GB estimados ({ctype}) "
-                f"< {HEADROOM_GB:.0f} GB de folga")
-    return ""
+        return msg("refusal.headroom", avail_gb=f"{avail_gb:.1f}", est_gb=f"{gb:.1f}", ctype=ctype,
+                   headroom_gb=f"{HEADROOM_GB:.0f}")
+    return None
 
 
 def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idle_since, last_grant_ts,
@@ -288,15 +340,15 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
     unqueued = []
     for r in roots:
         if r.owner != "agent":
-            r.status = "fora da fila (não-agente)"
+            r.status = msg("status.outside_queue")
             continue
         if queued(r):
-            r.status = "na vaga"
+            r.status = msg("status.in_slot")
         else:
-            r.status = "SEM VAGA"
+            r.status = msg("status.no_slot")
             unqueued.append(r)
     for r in unqueued:
-        out.kills.append((r.pid, "build sem vaga"))
+        out.kills.append((r.pid, msg("kill.no_slot")))
 
     for p in procs.values():
         if p.owner != "agent":
@@ -305,9 +357,9 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         agent_dead = cp is not None and cp not in live_claude_pids
         if agent_dead and p.kind in AGENT_EXEC_KINDS | {"gq"} and p.root in (p.pid, None) \
                 and p.pid not in {k[0] for k in out.kills}:
-            out.kills.append((p.pid, f"órfão: agente {cp} terminou"))
+            out.kills.append((p.pid, msg("kill.orphan", pid=cp)))
         elif p.kind == "gradle_worker" and getattr(procs.get(p.ppid), "kind", None) not in WORKER_PARENTS:
-            out.kills.append((p.pid, "worker solto (pai morreu)"))
+            out.kills.append((p.pid, msg("kill.loose_worker")))
 
     local_active = len(granted) + len(nonagent) + len(unqueued)
     recent_grant = last_grant_ts is not None and now - last_grant_ts < GRANT_QUIET_S
@@ -316,14 +368,14 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         if p.owner != "agent" or p.kind not in ("gradle_daemon", "kotlin_daemon"):
             continue
         if p.pid in busy_daemons:
-            p.status = "ocupado"
+            p.status = msg("status.busy")
             continue
         idle = now - idle_since.get(p.pid, now)
-        p.status = f"ocioso {int(idle)}s"
+        p.status = msg("status.idle", s=int(idle))
         grace = KOTLIN_IDLE_S if p.kind == "kotlin_daemon" else IDLE_GRACE_S
         if idle < grace or recent_grant:
             continue
-        out.kills.append((p.pid, "daemon ocioso"))
+        out.kills.append((p.pid, msg("kill.idle_daemon")))
         killed_daemon = True
 
     out.used = int(out.runner_busy) + local_active
@@ -338,25 +390,25 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
     used = out.used
     for t in waiting:  # strict FIFO: only the head may enter, so stop at the first refusal
         if pressure >= PRESSURE_CRITICAL:
-            out.blocked = "pressão de memória crítica"
+            out.blocked = msg("blocked.pressure")
             break
         if killed_daemon:
-            out.blocked = "aguardando daemon ocioso encerrar"
+            out.blocked = msg("blocked.daemon")
             break
         if used >= limit:
             est = estimates.get(t.id, ("other", DEFAULT_GB["other"]))
             why = raise_refusal(used=used, limit=limit, now=now, last_raise_ts=last_raise_ts,
                                 avail_gb=avail_gb, est=est, ceiling=ceiling)
             if why:
-                out.blocked = f"sem vaga ({used}/{limit} em uso); {why}"
+                out.blocked = msg("blocked.no_slot", used=used, limit=limit, why=why)
                 break
-            out.raised = (f"limite {limit}→{limit + 1}: {avail_gb:.1f} GB disponíveis − {est[1]:.1f} GB "
-                          f"estimados ({est[0]}) ≥ {HEADROOM_GB:.0f} GB de folga")
+            out.raised = msg("limit.raised", old=limit, new=limit + 1, avail_gb=f"{avail_gb:.1f}",
+                             est_gb=f"{est[1]:.1f}", ctype=est[0], headroom_gb=f"{HEADROOM_GB:.0f}")
             limit += 1  # one slot per raise, even when runs that never wait already hold more than the limit
             last_raise_ts = now  # one raise per RAISE_GAP_S, so at most one per tick
             if used >= limit:
-                out.raised += f"; ninguém entra: {used} em uso (runner ou build fora da fila)"
-                out.blocked = f"sem vaga ({used}/{limit} em uso); vaga extra ocupada por quem não espera"
+                out.raised = msg("limit.raised_taken", **out.raised["params"], used=used)
+                out.blocked = msg("blocked.no_slot", used=used, limit=limit, why=msg("refusal.taken"))
                 break
         out.grants.append(t.id)
         holders.add(f"t{t.id}")

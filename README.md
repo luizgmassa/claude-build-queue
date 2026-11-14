@@ -9,7 +9,8 @@ and a page at http://127.0.0.1:8787. Runs on macOS, Linux and Windows.
 
 ![Agent dialog: session, every process with its memory share, tickets](docs/agent-dialog.png)
 
-The page is in Portuguese; command lines and session ids are masked in these screenshots.
+The page speaks English (EN-US) and Portuguese (PT-BR): it starts in the browser language and keeps the choice
+made in its selector. The screenshots show it in Portuguese, with command lines and session ids masked.
 
 ## Rules
 

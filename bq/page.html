@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="pt-BR">
+<html lang="en-US">
 <head>
 <meta charset="utf-8">
-<title>Fila de builds</title>
+<title>Build queue</title>
 <style>
   body { font: 13px -apple-system, system-ui, sans-serif; margin: 16px; background: #111; color: #ddd; }
   h1 { font-size: 18px; margin: 0 0 8px; }
@@ -40,28 +40,296 @@
   #dlg-body { padding: 4px 14px 14px; }
   .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 8px 0; }
   .kv > div:nth-child(odd) { color: #888; }
+  #lang { float: right; background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; }
 </style>
 </head>
 <body>
-<h1>Fila de builds <span id="ts" class="muted"></span></h1>
+<select id="lang" data-i18n-title="language"><option value="en-US">EN-US</option><option value="pt-BR">PT-BR</option></select>
+<h1><span data-i18n="title"></span> <span id="ts" class="muted"></span></h1>
 <div class="cards" id="cards"></div>
 <div id="blocked" class="warn"></div>
-<h2>Executando</h2><div class="wrap"><table id="running"></table></div>
-<h2>Aguardando (FIFO)</h2><div class="wrap"><table id="waiting"></table></div>
-<h2>Agentes</h2><div class="wrap"><table id="agents"></table></div>
-<h2>Processos</h2><div class="wrap"><table id="procs"></table></div>
-<h2 id="wk-title">Limpeza</h2><div class="wrap"><table id="would"></table></div>
-<h2>Terminados na última hora</h2><div class="wrap"><table id="done"></table></div>
-<h2>Estimativa por tipo (maior pico das últimas 5 execuções, ou tabela inicial)</h2>
+<h2 data-i18n="h.running"></h2><div class="wrap"><table id="running"></table></div>
+<h2 data-i18n="h.waiting"></h2><div class="wrap"><table id="waiting"></table></div>
+<h2 data-i18n="h.agents"></h2><div class="wrap"><table id="agents"></table></div>
+<h2 data-i18n="h.procs"></h2><div class="wrap"><table id="procs"></table></div>
+<h2 id="wk-title"></h2><div class="wrap"><table id="would"></table></div>
+<h2 data-i18n="h.done"></h2><div class="wrap"><table id="done"></table></div>
+<h2 data-i18n="h.est"></h2>
 <div class="wrap"><table id="est"></table></div>
-<h2>Eventos</h2><div class="wrap"><table id="events"></table></div>
+<h2 data-i18n="h.events"></h2><div class="wrap"><table id="events"></table></div>
 
 <dialog id="dlg">
-  <div class="dh"><button id="dlg-back" title="voltar">←</button><b id="dlg-title"></b>
-    <button id="dlg-x" title="fechar (Esc)">×</button></div>
+  <div class="dh"><button id="dlg-back" data-i18n-title="back">←</button><b id="dlg-title"></b>
+    <button id="dlg-x" data-i18n-title="close">×</button></div>
   <div id="dlg-body"></div>
 </dialog>
 
+<!-- Every text the page shows, per language. Server messages arrive as {"key", "params"}; their en-US
+     templates match bq/core.py EN (tests/test_core.py checks both key sets). -->
+<script type="application/json" id="i18n">
+{
+ "en-US": {
+  "title": "Build queue",
+  "language": "Language",
+  "h.running": "Running",
+  "h.waiting": "Waiting (FIFO)",
+  "h.agents": "Agents",
+  "h.procs": "Processes",
+  "h.cleanup_on": "Cleanup (on: see events)",
+  "h.cleanup_dry": "Cleanup in dry run: would kill",
+  "h.done": "Finished in the last hour",
+  "h.est": "Estimate by type (largest peak of the last 5 runs, or the starting table)",
+  "h.events": "Events",
+  "h.agent_procs": "Agent processes",
+  "h.agent_tickets": "Tickets (active and from the last hour)",
+  "h.cmd": "Command",
+  "h.ancestors": "Ancestors",
+  "h.tree": "Tree",
+  "h.ticket": "Ticket",
+  "back": "back",
+  "close": "close (Esc)",
+  "sort_by": "sort by {col}",
+  "empty": "empty",
+  "server_down": "server down",
+  "updated": "updated {ts}",
+  "loading": "loading…",
+  "client": "client",
+  "agent_ended": "(ended)",
+  "dead": "(dead)",
+  "this_proc": "this process",
+  "queue_stopped": "Queue stopped: {why}",
+  "dlg.agent": "Agent {pid}",
+  "pressure.critical": "critical",
+  "pressure.warn": "warning",
+  "pressure.normal": "normal",
+  "card.slots": "Slots",
+  "card.slots_val": "{used}/{slots} (base {base}, max {max})",
+  "card.avail": "Available for an extra slot",
+  "card.avail_val": "{avail} GB (headroom {headroom} GB)",
+  "card.runner": "GitHub runner",
+  "card.busy": "busy",
+  "card.idle": "idle",
+  "card.pressure": "Memory pressure",
+  "card.free": "Free memory",
+  "card.cleanup": "Cleanup",
+  "card.cleanup_on": "on",
+  "card.cleanup_dry": "dry run",
+  "col.type": "type",
+  "col.owner": "owner",
+  "col.state": "state",
+  "col.age": "age",
+  "col.cmd": "command",
+  "col.agent": "agent",
+  "col.gq_pid": "gq PID",
+  "col.estimate": "estimate",
+  "col.peak": "peak",
+  "col.end": "end",
+  "col.running_for": "running for",
+  "col.position": "position",
+  "col.waiting_for": "waiting for",
+  "col.ended_ago": "ended ago",
+  "col.claude_pid": "claude PID",
+  "col.total_rss": "total RSS (MB)",
+  "col.procs": "processes",
+  "col.reason": "reason",
+  "col.estimate_gb": "estimate (GB)",
+  "col.time": "time",
+  "col.detail": "detail",
+  "col.subagent": "subagent",
+  "kv.ralphy": "ralphy session",
+  "kv.session_id": "Session ID",
+  "kv.transcript": "Transcript",
+  "kv.start": "Start",
+  "kv.age": "Age",
+  "kv.rss": "Memory (RSS)",
+  "kv.ram_total": "% of total RAM",
+  "kv.pct_of": "{pct}% of {gb} GB",
+  "kv.avail_now": "% of the memory available now",
+  "kv.agent": "Agent",
+  "kv.root": "Build root",
+  "kv.type": "Type",
+  "kv.state": "State",
+  "kv.rss_val": "{mb} MB ({pct}% of RAM)",
+  "kv.tree": "Tree (it + descendants)",
+  "kv.tree_val": "{n} processes, {mb} MB ({pct}% of RAM)",
+  "kv.dir": "Directory",
+  "kv.env": "Environment",
+  "state.waiting": "waiting",
+  "state.granted": "granted",
+  "state.done": "done",
+  "owner.agent": "agent",
+  "owner.nonagent": "non-agent",
+  "owner.runner": "runner",
+  "owner.protected": "protected",
+  "kind.enqueue": "enqueue",
+  "kind.grant": "grant",
+  "kind.release": "release",
+  "kind.reap": "reap",
+  "kind.kill": "kill",
+  "kind.limit": "limit",
+  "kind.error": "error",
+  "status.outside_queue": "outside the queue (non-agent)",
+  "status.in_slot": "in a slot",
+  "status.no_slot": "NO SLOT",
+  "status.busy": "busy",
+  "status.idle": "idle {s}s",
+  "kill.no_slot": "build without a slot",
+  "kill.orphan": "orphan: agent {pid} ended",
+  "kill.loose_worker": "loose worker (parent died)",
+  "kill.idle_daemon": "idle daemon",
+  "refusal.ceiling": "ceiling of {ceiling} slots",
+  "refusal.gap": "next extra slot in {s}s",
+  "refusal.headroom": "extra slot refused: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) < {headroom_gb} GB headroom",
+  "refusal.taken": "extra slot taken by runs that do not wait",
+  "blocked.pressure": "critical memory pressure",
+  "blocked.daemon": "waiting for an idle daemon to end",
+  "blocked.no_slot": "no slot ({used}/{limit} in use); {why}",
+  "limit.raised": "limit {old}→{new}: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) ≥ {headroom_gb} GB headroom",
+  "limit.raised_taken": "limit {old}→{new}: {avail_gb} GB available − {est_gb} GB estimated ({ctype}) ≥ {headroom_gb} GB headroom; nobody enters: {used} in use (runner or build outside the queue)",
+  "limit.lowered": "limit {old}→{new}: {n} run(s) ended",
+  "event.enqueue": "ticket #{id} pid {pid}: {cmd}",
+  "event.grant": "ticket #{id} got a slot",
+  "event.release": "ticket #{id} released its slot (exit {exit})",
+  "event.reap": "ticket #{id}: {reason}",
+  "event.sigterm": "SIGTERM {pid} ({kind}): {reason}",
+  "event.sigkill": "SIGKILL {pid} after {s}s: {reason}",
+  "error.no_permission": "no permission to kill {pid}: {detail}",
+  "error.pid_gone": "PID {pid} no longer exists",
+  "end.released": "released",
+  "end.owner process gone": "owner process gone"
+ },
+ "pt-BR": {
+  "title": "Fila de builds",
+  "language": "Idioma",
+  "h.running": "Executando",
+  "h.waiting": "Aguardando (FIFO)",
+  "h.agents": "Agentes",
+  "h.procs": "Processos",
+  "h.cleanup_on": "Limpeza (ligada: ver eventos)",
+  "h.cleanup_dry": "Limpeza em simulação: mataria",
+  "h.done": "Terminados na última hora",
+  "h.est": "Estimativa por tipo (maior pico das últimas 5 execuções, ou tabela inicial)",
+  "h.events": "Eventos",
+  "h.agent_procs": "Processos do agente",
+  "h.agent_tickets": "Tickets (ativos e da última hora)",
+  "h.cmd": "Comando",
+  "h.ancestors": "Ancestrais",
+  "h.tree": "Árvore",
+  "h.ticket": "Ticket",
+  "back": "voltar",
+  "close": "fechar (Esc)",
+  "sort_by": "ordenar por {col}",
+  "empty": "vazio",
+  "server_down": "servidor fora do ar",
+  "updated": "atualizado {ts}",
+  "loading": "carregando…",
+  "client": "cliente",
+  "agent_ended": "(encerrado)",
+  "dead": "(morto)",
+  "this_proc": "este processo",
+  "queue_stopped": "Fila parada: {why}",
+  "dlg.agent": "Agente {pid}",
+  "pressure.critical": "crítica",
+  "pressure.warn": "alerta",
+  "pressure.normal": "normal",
+  "card.slots": "Vagas",
+  "card.slots_val": "{used}/{slots} (base {base}, teto {max})",
+  "card.avail": "Disponível p/ vaga extra",
+  "card.avail_val": "{avail} GB (folga {headroom} GB)",
+  "card.runner": "Runner GitHub",
+  "card.busy": "ocupado",
+  "card.idle": "livre",
+  "card.pressure": "Pressão de memória",
+  "card.free": "Memória livre",
+  "card.cleanup": "Limpeza",
+  "card.cleanup_on": "ligada",
+  "card.cleanup_dry": "simulação",
+  "col.type": "tipo",
+  "col.owner": "dono",
+  "col.state": "estado",
+  "col.age": "idade",
+  "col.cmd": "comando",
+  "col.agent": "agente",
+  "col.gq_pid": "PID gq",
+  "col.estimate": "estimativa",
+  "col.peak": "pico",
+  "col.end": "fim",
+  "col.running_for": "rodando há",
+  "col.position": "posição",
+  "col.waiting_for": "esperando há",
+  "col.ended_ago": "terminou há",
+  "col.claude_pid": "PID claude",
+  "col.total_rss": "RSS total (MB)",
+  "col.procs": "processos",
+  "col.reason": "motivo",
+  "col.estimate_gb": "estimativa (GB)",
+  "col.time": "hora",
+  "col.detail": "detalhe",
+  "col.subagent": "subagente",
+  "kv.ralphy": "Sessão ralphy",
+  "kv.session_id": "ID da sessão",
+  "kv.transcript": "Transcrição",
+  "kv.start": "Início",
+  "kv.age": "Idade",
+  "kv.rss": "Memória (RSS)",
+  "kv.ram_total": "% da RAM total",
+  "kv.pct_of": "{pct}% de {gb} GB",
+  "kv.avail_now": "% da memória disponível agora",
+  "kv.agent": "Agente",
+  "kv.root": "Raiz do build",
+  "kv.type": "Tipo",
+  "kv.state": "Estado",
+  "kv.rss_val": "{mb} MB ({pct}% da RAM)",
+  "kv.tree": "Árvore (ele + descendentes)",
+  "kv.tree_val": "{n} processos, {mb} MB ({pct}% da RAM)",
+  "kv.dir": "Diretório",
+  "kv.env": "Ambiente",
+  "state.waiting": "aguardando",
+  "state.granted": "na vaga",
+  "state.done": "terminado",
+  "owner.agent": "agente",
+  "owner.nonagent": "não-agente",
+  "owner.runner": "runner",
+  "owner.protected": "protegido",
+  "kind.enqueue": "entrada",
+  "kind.grant": "vaga",
+  "kind.release": "liberação",
+  "kind.reap": "descarte",
+  "kind.kill": "encerramento",
+  "kind.limit": "limite",
+  "kind.error": "erro",
+  "status.outside_queue": "fora da fila (não-agente)",
+  "status.in_slot": "na vaga",
+  "status.no_slot": "SEM VAGA",
+  "status.busy": "ocupado",
+  "status.idle": "ocioso {s}s",
+  "kill.no_slot": "build sem vaga",
+  "kill.orphan": "órfão: agente {pid} terminou",
+  "kill.loose_worker": "worker solto (pai morreu)",
+  "kill.idle_daemon": "daemon ocioso",
+  "refusal.ceiling": "teto de {ceiling} vagas",
+  "refusal.gap": "próxima vaga extra em {s}s",
+  "refusal.headroom": "vaga extra recusada: {avail_gb} GB disponíveis − {est_gb} GB estimados ({ctype}) < {headroom_gb} GB de folga",
+  "refusal.taken": "vaga extra ocupada por quem não espera",
+  "blocked.pressure": "pressão de memória crítica",
+  "blocked.daemon": "aguardando daemon ocioso encerrar",
+  "blocked.no_slot": "sem vaga ({used}/{limit} em uso); {why}",
+  "limit.raised": "limite {old}→{new}: {avail_gb} GB disponíveis − {est_gb} GB estimados ({ctype}) ≥ {headroom_gb} GB de folga",
+  "limit.raised_taken": "limite {old}→{new}: {avail_gb} GB disponíveis − {est_gb} GB estimados ({ctype}) ≥ {headroom_gb} GB de folga; ninguém entra: {used} em uso (runner ou build fora da fila)",
+  "limit.lowered": "limite {old}→{new}: {n} execução(ões) terminou(aram)",
+  "event.enqueue": "ticket #{id} pid {pid}: {cmd}",
+  "event.grant": "ticket #{id} entrou na vaga",
+  "event.release": "ticket #{id} liberou a vaga (exit {exit})",
+  "event.reap": "ticket #{id}: {reason}",
+  "event.sigterm": "SIGTERM {pid} ({kind}): {reason}",
+  "event.sigkill": "SIGKILL {pid} após {s}s: {reason}",
+  "error.no_permission": "sem permissão para matar {pid}: {detail}",
+  "error.pid_gone": "PID {pid} não existe mais",
+  "end.released": "liberado",
+  "end.owner process gone": "processo dono sumiu"
+ }
+}
+</script>
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const secs = ts => ts ? Math.round(Date.now() / 1000 - ts) : null;
@@ -69,15 +337,41 @@ const dur = s => s == null ? "" : s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 6
   : Math.floor(s / 3600) + "h" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m";
 const etimeSecs = e => { if (!e) return null; const [d, rest] = e.includes("-") ? e.split("-") : [0, e];
   return rest.split(":").map(Number).reduce((a, x) => a * 60 + x, 0) + Number(d) * 86400; };
+// ---------------------------------------------------------------- language
+const I18N = JSON.parse(document.getElementById("i18n").textContent);
+let lang = I18N[localStorage.bqLang] ? localStorage.bqLang
+  : (navigator.language || "").toLowerCase().startsWith("pt") ? "pt-BR" : "en-US";
+const fill = (s, p) => s.replace(/\{(\w+)\}/g, (_, k) => {
+  const v = (p || {})[k];
+  return v && typeof v === "object" ? tr(v) : String(v ?? "");
+});
+// text of a key in the current language; a key no language has (e.g. "PID") is shown as the fallback or as itself
+function T(key, params, fallback) {
+  const s = I18N[lang][key] ?? I18N["en-US"][key];
+  return s == null ? (fallback ?? key) : fill(s, params);
+}
+// a server message {key, params}; a plain string is text from before messages had keys, shown as it is
+function tr(m) { return m && typeof m === "object" ? T(m.key, m.params) : String(m ?? ""); }
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.getElementById("lang").value = lang;
+  document.title = T("title");
+  document.querySelectorAll("[data-i18n]").forEach(e => e.textContent = T(e.dataset.i18n));
+  document.querySelectorAll("[data-i18n-title]").forEach(e => e.title = T(e.dataset.i18nTitle));
+}
+
 const procLink = pid => pid ? `<a class="lnk" data-proc="${pid}">${pid}</a>` : "";
-const agentLink = (pid, label) => pid ? `<a class="lnk" data-agent="${pid}">${esc(label || "claude " + pid)}</a>` : esc(label);
+const agentLink = (pid, label, alive) => pid ? `<a class="lnk" data-agent="${pid}">${esc(label || "claude " + pid)}`
+  + (alive === false ? " " + esc(T("agent_ended")) : "") + "</a>" : esc(label);
+const clientOf = r => r.serving ? " → " + esc(T("client")) + " " + procLink(r.serving) : "";
+const ownerOf = r => r.agent_pid ? agentLink(r.agent_pid, r.owner, r.agent_alive) : esc(T("owner." + r.owner, null, r.owner));
 
 // ---------------------------------------------------------------- sortable, resizable tables
 const S = { sort: JSON.parse(localStorage.bqSort || "{}"), widths: JSON.parse(localStorage.bqWidths || "{}") };
 const save = () => { localStorage.bqSort = JSON.stringify(S.sort); localStorage.bqWidths = JSON.stringify(S.widths); };
 const tables = {};  // id -> {cols, rows}, kept to re-render on sort without waiting for the next refresh
 const cmp = (a, b) => (typeof a === "number" && typeof b === "number") ? a - b
-  : String(a ?? "").localeCompare(String(b ?? ""), "pt-BR", { numeric: true, sensitivity: "base" });
+  : String(a ?? "").localeCompare(String(b ?? ""), lang, { numeric: true, sensitivity: "base" });
 const widthOf = (id, c) => (S.widths[id] || {})[c.k] || c.w || 110;
 
 function grid(id, cols, rows) {
@@ -91,12 +385,12 @@ function grid(id, cols, rows) {
   }
   el.style.width = cols.reduce((sum, c) => sum + widthOf(id, c), 0) + "px";
   el.innerHTML = "<colgroup>" + cols.map(c => `<col style="width:${widthOf(id, c)}px">`).join("") + "</colgroup>"
-    + "<thead><tr>" + cols.map((c, i) => `<th data-t="${id}" data-k="${c.k}" title="ordenar por ${esc(c.t)}">`
-      + esc(c.t) + (col && st.k === c.k ? (st.d > 0 ? " ▲" : " ▼") : "")
+    + "<thead><tr>" + cols.map((c, i) => `<th data-t="${id}" data-k="${c.k}" title="${esc(T("sort_by", { col: T(c.t) }))}">`
+      + esc(T(c.t)) + (col && st.k === c.k ? (st.d > 0 ? " ▲" : " ▼") : "")
       + `<span class="rz" data-t="${id}" data-i="${i}"></span></th>`).join("") + "</tr></thead><tbody>"
     + (rows.length ? rows.map(r => "<tr>" + cols.map(c =>
         `<td class="${c.num ? "num" : ""}${c.cls ? " " + c.cls(r) : ""}">${c.f ? c.f(r) : esc(r[c.k])}</td>`).join("") + "</tr>").join("")
-      : `<tr><td class="muted" colspan="${cols.length}">vazio</td></tr>`) + "</tbody>";
+      : `<tr><td class="muted" colspan="${cols.length}">${esc(T("empty"))}</td></tr>`) + "</tbody>";
 }
 
 let drag = null, justDragged = false;
@@ -137,78 +431,92 @@ document.addEventListener("click", e => {
 });
 
 // ---------------------------------------------------------------- column sets
+// `t` is a translation key; a header no language translates (PID, % RAM) is its own text
 const PROC_COLS = [
   { k: "pid", t: "PID", num: true, w: 70, f: r => procLink(r.pid) },
   { k: "ppid", t: "PPID", num: true, w: 70, f: r => procLink(r.ppid) },
-  { k: "kind", t: "tipo", w: 110 },
-  { k: "owner", t: "dono", w: 200, f: r => r.agent_pid ? agentLink(r.agent_pid, r.owner) : esc(r.owner) },
-  { k: "status", t: "estado", w: 150, cls: r => r.status === "SEM VAGA" ? "bad" : "",
-    f: r => esc(r.status) + (r.serving ? " → cliente " + procLink(r.serving) : "") },
+  { k: "kind", t: "col.type", w: 110 },
+  { k: "owner", t: "col.owner", w: 200, f: ownerOf },
+  { k: "status", t: "col.state", w: 150, v: r => tr(r.status), cls: r => r.status?.key === "status.no_slot" ? "bad" : "",
+    f: r => esc(tr(r.status)) + clientOf(r) },
   { k: "rss_mb", t: "RSS (MB)", num: true, w: 85 },
   { k: "ram_pct", t: "% RAM", num: true, w: 70 },
   { k: "cpu", t: "CPU%", num: true, w: 65 },
-  { k: "etime", t: "idade", w: 90, v: r => etimeSecs(r.etime) },
+  { k: "etime", t: "col.age", w: 90, v: r => etimeSecs(r.etime) },
   { k: "ticket", t: "ticket", w: 60, num: true, v: r => r.ticket ? +r.ticket : null },
-  { k: "cmd", t: "comando", w: 520, f: r => `<code>${esc(r.cmd)}</code>` },
+  { k: "cmd", t: "col.cmd", w: 520, f: r => `<code>${esc(r.cmd)}</code>` },
 ];
 const T_ID = { k: "id", t: "#", num: true, w: 50 };
-const T_AGENT = { k: "agent", t: "agente", w: 220, f: t => agentLink(t.claude_pid, t.agent) };
-const T_PID = { k: "pid", t: "PID gq", num: true, w: 70, f: t => procLink(t.pid) };
-const T_TYPE = { k: "ctype", t: "tipo", w: 110 };
-const T_EST = { k: "estimate_gb", t: "estimativa", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
-const T_PEAK = { k: "peak_gb", t: "pico", num: true, w: 75, f: t => t.peak_gb != null ? t.peak_gb + " GB" : "" };
-const T_CMD = { k: "cmd", t: "comando", w: 520, f: t => `<code>${esc(t.cwd)}$ ${esc(t.cmd)}</code>` };
-const T_END = { k: "end_reason", t: "fim", w: 160,
-  f: t => esc(t.end_reason ?? "") + (t.exit_code != null ? " (exit " + t.exit_code + ")" : "") };
+const T_AGENT = { k: "agent", t: "col.agent", w: 220, f: t => agentLink(t.claude_pid, t.agent, t.agent_alive) };
+const T_PID = { k: "pid", t: "col.gq_pid", num: true, w: 70, f: t => procLink(t.pid) };
+const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
+const T_STATE = { k: "state", t: "col.state", w: 80, v: t => T("state." + t.state, null, t.state),
+  f: t => esc(T("state." + t.state, null, t.state)) };
+const T_EST = { k: "estimate_gb", t: "col.estimate", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
+const T_PEAK = { k: "peak_gb", t: "col.peak", num: true, w: 75, f: t => t.peak_gb != null ? t.peak_gb + " GB" : "" };
+const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${esc(t.cwd)}$ ${esc(t.cmd)}</code>` };
+// end_reason is stored as a plain value ("released", "owner process gone"); unknown values show as stored
+const endReason = t => T("end." + t.end_reason, null, t.end_reason ?? "");
+const T_END = { k: "end_reason", t: "col.end", w: 160, v: endReason,
+  f: t => esc(endReason(t)) + (t.exit_code != null ? " (exit " + t.exit_code + ")" : "") };
 
 // ---------------------------------------------------------------- main view
-const pressure = p => p >= 4 ? ["crítica", "bad"] : p >= 2 ? ["alerta", "warn"] : ["normal", "ok"];
+const pressure = p => p >= 4 ? ["pressure.critical", "bad"] : p >= 2 ? ["pressure.warn", "warn"] : ["pressure.normal", "ok"];
+let last = null;  // the last state, so a language switch re-renders without waiting for the next refresh
 async function refresh() {
   let v;
   try { v = await (await fetch("/api/state")).json(); } catch (e) {
-    document.getElementById("ts").textContent = "servidor fora do ar"; return; }
+    document.getElementById("ts").textContent = T("server_down"); return; }
   if (!v.memory) return;
+  last = v;
+  render(v);
+}
+
+function render(v) {
   const m = v.memory, [pl, pc] = pressure(m.pressure);
-  document.getElementById("ts").textContent = "atualizado " + v.ts;
+  document.getElementById("ts").textContent = T("updated", { ts: v.ts });
   const swapCls = m.swap_used_gb / Math.max(m.swap_total_gb, 1) > .8 ? "bad" : "ok";
   document.getElementById("cards").innerHTML = [
-    ["Vagas", `${v.used}/${v.slots} (base ${v.base_slots}, teto ${v.max_slots})`, v.used >= v.slots ? "warn" : "ok"],
-    ["Disponível p/ vaga extra", `${v.avail_gb} GB (folga ${v.headroom_gb} GB)`, v.avail_gb < v.headroom_gb ? "bad" : "ok"],
-    ["Runner GitHub", v.counts.runner ? "ocupado" : "livre", v.counts.runner ? "warn" : "ok"],
-    ["Pressão de memória", pl, pc],
-    ["Memória livre", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
+    ["card.slots", T("card.slots_val", { used: v.used, slots: v.slots, base: v.base_slots, max: v.max_slots }),
+      v.used >= v.slots ? "warn" : "ok"],
+    ["card.avail", T("card.avail_val", { avail: v.avail_gb, headroom: v.headroom_gb }), v.avail_gb < v.headroom_gb ? "bad" : "ok"],
+    ["card.runner", T(v.counts.runner ? "card.busy" : "card.idle"), v.counts.runner ? "warn" : "ok"],
+    ["card.pressure", T(pl), pc],
+    ["card.free", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],
     ["RAM", [`${m.app_gb} app`, m.wired_gb != null && `${m.wired_gb} wired`, m.compressed_gb != null && `${m.compressed_gb} comp`]
       .filter(Boolean).join(" · ") + ` / ${m.total_gb} GB`, ""],
     ["Swap", `${m.swap_used_gb}/${m.swap_total_gb} GB`, swapCls],
-    ["Limpeza", v.enforce ? "ligada" : "simulação", v.enforce ? "ok" : "warn"],
-  ].map(([k, val, c]) => `<div class="card">${k}<b class="${c}">${esc(val)}</b></div>`).join("");
-  document.getElementById("blocked").textContent = v.blocked ? "Fila parada: " + v.blocked : "";
+    ["card.cleanup", T(v.enforce ? "card.cleanup_on" : "card.cleanup_dry"), v.enforce ? "ok" : "warn"],
+  ].map(([k, val, c]) => `<div class="card">${esc(T(k))}<b class="${c}">${esc(val)}</b></div>`).join("");
+  const blocked = v.blocked_msg || v.blocked;  // blocked_msg carries the key; blocked is the English text gq prints
+  document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
   const waiting = v.tickets.filter(t => t.state === "waiting").sort((a, b) => a.id - b.id);
   waiting.forEach((t, i) => t.position = i + 1);
   grid("running", [T_ID, T_AGENT, T_PID,
-    { k: "granted", t: "rodando há", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
+    { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
     T_TYPE, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
-  grid("waiting", [{ k: "position", t: "posição", num: true, w: 65 }, T_ID, T_AGENT, T_PID,
-    { k: "created", t: "esperando há", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
+  grid("waiting", [{ k: "position", t: "col.position", num: true, w: 65 }, T_ID, T_AGENT, T_PID,
+    { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
     T_TYPE, T_EST, T_CMD], waiting);
   grid("done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,
-    { k: "ended", t: "terminou há", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD],
+    { k: "ended", t: "col.ended_ago", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD],
     v.tickets.filter(t => t.state === "done"));
   grid("agents", [
-    { k: "label", t: "agente", w: 280, f: a => agentLink(a.pid, a.label) },
-    { k: "pid", t: "PID claude", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " (morto)") },
-    { k: "rss_mb", t: "RSS total (MB)", num: true, w: 110 },
+    { k: "label", t: "col.agent", w: 280, f: a => agentLink(a.pid, a.label) },
+    { k: "pid", t: "col.claude_pid", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " " + esc(T("dead"))) },
+    { k: "rss_mb", t: "col.total_rss", num: true, w: 110 },
     { k: "ram_pct", t: "% RAM", num: true, w: 70 },
-    { k: "procs", t: "processos", num: true, w: 80 }], v.agents);
+    { k: "procs", t: "col.procs", num: true, w: 80 }], v.agents);
   grid("procs", PROC_COLS, v.processes);
-  document.getElementById("wk-title").textContent = v.enforce ? "Limpeza (ligada: ver eventos)" : "Limpeza em simulação: mataria";
-  grid("would", [{ k: "pid", t: "PID", num: true, w: 80, f: k => procLink(k.pid) }, { k: "reason", t: "motivo", w: 300 }],
-    v.would_kill);
-  grid("est", [{ k: "type", t: "tipo", w: 140 }, { k: "gb", t: "estimativa (GB)", num: true, w: 120 }],
+  document.getElementById("wk-title").textContent = T(v.enforce ? "h.cleanup_on" : "h.cleanup_dry");
+  grid("would", [{ k: "pid", t: "PID", num: true, w: 80, f: k => procLink(k.pid) },
+    { k: "reason", t: "col.reason", w: 300, v: k => tr(k.reason), f: k => esc(tr(k.reason)) }], v.would_kill);
+  grid("est", [{ k: "type", t: "col.type", w: 140 }, { k: "gb", t: "col.estimate_gb", num: true, w: 120 }],
     Object.entries(v.estimates).map(([type, gb]) => ({ type, gb })));
-  grid("events", [{ k: "ts", t: "hora", w: 75 }, { k: "kind", t: "tipo", w: 75 }, { k: "text", t: "detalhe", w: 700 }],
-    v.events);
+  grid("events", [{ k: "ts", t: "col.time", w: 75 },
+    { k: "kind", t: "col.type", w: 90, v: e => T("kind." + e.kind, null, e.kind), f: e => esc(T("kind." + e.kind, null, e.kind)) },
+    { k: "msg", t: "col.detail", w: 700, v: e => tr(e.msg ?? e.text), f: e => esc(tr(e.msg ?? e.text)) }], v.events);
   // keep the open dialog live, except while text is selected in it (a rebuild would drop the selection)
   if (dlg.open && current && !String(getSelection())) openDetail(current.type, current.pid, false);
 }
@@ -217,20 +525,20 @@ async function refresh() {
 const dlg = document.getElementById("dlg");
 let current = null, trail = [];
 const kv = pairs => `<div class="kv">${pairs.filter(p => p[1] !== undefined && p[1] !== null && p[1] !== "")
-  .map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join("")}</div>`;
+  .map(([k, v]) => `<div>${esc(T(k))}</div><div>${v}</div>`).join("")}</div>`;
 
 async function openDetail(type, pid, push) {
   if (push && dlg.open && current && (current.type !== type || current.pid !== pid)) trail.push(current);
   current = { type, pid };
-  if (!dlg.open) { trail = []; document.getElementById("dlg-body").innerHTML = "carregando…"; dlg.showModal(); }
+  if (!dlg.open) { trail = []; document.getElementById("dlg-body").innerHTML = esc(T("loading")); dlg.showModal(); }
   let d;
-  try { d = await (await fetch(`/api/${type}?pid=${pid}`)).json(); } catch (e) { d = { error: "servidor fora do ar" }; }
+  try { d = await (await fetch(`/api/${type}?pid=${pid}`)).json(); } catch (e) { d = { error_msg: { key: "server_down" } }; }
   if (!current || current.type !== type || current.pid !== pid) return;  // the user moved on while this loaded
   document.getElementById("dlg-back").disabled = !trail.length;
   const body = document.getElementById("dlg-body"), scroll = dlg.scrollTop;
-  if (d.error) {
-    document.getElementById("dlg-title").textContent = (type === "agent" ? "Agente " : "PID ") + pid;
-    body.innerHTML = `<p class="bad">${esc(d.error)}</p>`;
+  if (d.error || d.error_msg) {
+    document.getElementById("dlg-title").textContent = type === "agent" ? T("dlg.agent", { pid }) : "PID " + pid;
+    body.innerHTML = `<p class="bad">${esc(tr(d.error_msg || d.error))}</p>`;
   } else if (type === "agent") renderAgent(d, body); else renderProc(d, body);
   dlg.scrollTop = scroll;
 }
@@ -238,41 +546,41 @@ async function openDetail(type, pid, push) {
 function renderAgent(a, body) {
   document.getElementById("dlg-title").textContent = a.label;
   body.innerHTML = kv([
-    ["PID claude", procLink(a.pid) + (a.alive ? "" : ' <span class="bad">(encerrado)</span>')],
-    ["Sessão ralphy", a.ralphy ? "#" + esc(a.ralphy) : ""],
-    ["ID da sessão", esc(a.session_id)],
-    ["Transcrição", a.transcript ? `<code>${esc(a.transcript)}</code>` : ""],
-    ["Início", esc(a.lstart)], ["Idade", esc(a.etime)],
-    ["Processos", a.procs.length],
-    ["Memória (RSS)", `${a.rss_mb} MB`],
-    ["% da RAM total", `${a.ram_pct}% de ${a.total_gb} GB`],
-    ["% da memória disponível agora", `${a.avail_pct}% de ${a.avail_gb} GB`],
-  ]) + `<h3>Processos do agente</h3><div class="wrap"><table id="dlg-procs"></table></div>`
-     + `<h3>Tickets (ativos e da última hora)</h3><div class="wrap"><table id="dlg-tickets"></table></div>`;
+    ["col.claude_pid", procLink(a.pid) + (a.alive ? "" : ` <span class="bad">${esc(T("agent_ended"))}</span>`)],
+    ["kv.ralphy", a.ralphy ? "#" + esc(a.ralphy) : ""],
+    ["kv.session_id", esc(a.session_id)],
+    ["kv.transcript", a.transcript ? `<code>${esc(a.transcript)}</code>` : ""],
+    ["kv.start", esc(a.lstart)], ["kv.age", esc(a.etime)],
+    ["h.procs", a.procs.length],
+    ["kv.rss", `${a.rss_mb} MB`],
+    ["kv.ram_total", esc(T("kv.pct_of", { pct: a.ram_pct, gb: a.total_gb }))],
+    ["kv.avail_now", esc(T("kv.pct_of", { pct: a.avail_pct, gb: a.avail_gb }))],
+  ]) + `<h3>${esc(T("h.agent_procs"))}</h3><div class="wrap"><table id="dlg-procs"></table></div>`
+     + `<h3>${esc(T("h.agent_tickets"))}</h3><div class="wrap"><table id="dlg-tickets"></table></div>`;
   grid("dlg-procs", PROC_COLS, a.procs);
-  grid("dlg-tickets", [T_ID, { k: "state", t: "estado", w: 80 }, { k: "subagent", t: "subagente", w: 110 }, T_PID, T_TYPE, T_PEAK, T_CMD, T_END], a.tickets);
+  grid("dlg-tickets", [T_ID, T_STATE, { k: "subagent", t: "col.subagent", w: 110 }, T_PID, T_TYPE, T_PEAK, T_CMD, T_END], a.tickets);
 }
 
 function renderProc(p, body) {
   document.getElementById("dlg-title").textContent = `PID ${p.pid} · ${p.kind}`;
   body.innerHTML = kv([
-    ["Agente", p.agent_pid ? agentLink(p.agent_pid, p.owner) : esc(p.owner)],
+    ["kv.agent", ownerOf(p)],
     ["PID", p.pid], ["PPID", procLink(p.ppid)],
-    ["Raiz do build", p.root && p.root !== p.pid ? procLink(p.root) : p.root ? "este processo" : ""],
-    ["Tipo", esc(p.kind)], ["Estado", esc(p.status) + (p.serving ? " → cliente " + procLink(p.serving) : "")],
-    ["Memória (RSS)", `${p.rss_mb} MB (${p.ram_pct}% da RAM)`],
-    ["Árvore (ele + descendentes)", `${p.tree.length} processos, ${p.tree_rss_mb} MB (${p.tree_ram_pct}% da RAM)`],
-    ["CPU", p.cpu + "%"], ["Início", esc(p.lstart)], ["Idade", esc(p.etime)],
-    ["Ticket", esc(p.ticket)], ["Diretório", p.cwd ? `<code>${esc(p.cwd)}</code>` : ""],
-    ["Ambiente", Object.keys(p.env).length
+    ["kv.root", p.root && p.root !== p.pid ? procLink(p.root) : p.root ? esc(T("this_proc")) : ""],
+    ["kv.type", esc(p.kind)], ["kv.state", esc(tr(p.status)) + clientOf(p)],
+    ["kv.rss", esc(T("kv.rss_val", { mb: p.rss_mb, pct: p.ram_pct }))],
+    ["kv.tree", esc(T("kv.tree_val", { n: p.tree.length, mb: p.tree_rss_mb, pct: p.tree_ram_pct }))],
+    ["CPU", p.cpu + "%"], ["kv.start", esc(p.lstart)], ["kv.age", esc(p.etime)],
+    ["h.ticket", esc(p.ticket)], ["kv.dir", p.cwd ? `<code>${esc(p.cwd)}</code>` : ""],
+    ["kv.env", Object.keys(p.env).length
       ? `<code>${Object.entries(p.env).map(([k, v]) => esc(k + "=" + v)).join("<br>")}</code>` : ""],
-  ]) + `<h3>Comando</h3><pre>${esc(p.cmd)}</pre>`
-     + `<h3>Ancestrais</h3><div class="wrap"><table id="dlg-anc"></table></div>`
-     + `<h3>Árvore</h3><div class="wrap"><table id="dlg-tree"></table></div>`
-     + (p.tickets.length ? `<h3>Ticket</h3><div class="wrap"><table id="dlg-tickets"></table></div>` : "");
+  ]) + `<h3>${esc(T("h.cmd"))}</h3><pre>${esc(p.cmd)}</pre>`
+     + `<h3>${esc(T("h.ancestors"))}</h3><div class="wrap"><table id="dlg-anc"></table></div>`
+     + `<h3>${esc(T("h.tree"))}</h3><div class="wrap"><table id="dlg-tree"></table></div>`
+     + (p.tickets.length ? `<h3>${esc(T("h.ticket"))}</h3><div class="wrap"><table id="dlg-tickets"></table></div>` : "");
   grid("dlg-anc", PROC_COLS, p.ancestors);
   grid("dlg-tree", PROC_COLS, p.tree);
-  if (p.tickets.length) grid("dlg-tickets", [T_ID, { k: "state", t: "estado", w: 80 }, T_TYPE, T_PEAK, T_CMD, T_END], p.tickets);
+  if (p.tickets.length) grid("dlg-tickets", [T_ID, T_STATE, T_TYPE, T_PEAK, T_CMD, T_END], p.tickets);
 }
 
 document.getElementById("dlg-x").onclick = () => dlg.close();
@@ -282,6 +590,12 @@ dlg.addEventListener("close", () => { current = null; trail = []; });
 
 const deep = location.hash.match(/^#(agent|proc)=(\d+)$/);  // direct link to a dialog: #agent=PID or #proc=PID
 if (deep) openDetail(deep[1], +deep[2], true);
+document.getElementById("lang").onchange = e => {
+  lang = localStorage.bqLang = e.target.value;
+  applyLang();
+  if (last) render(last);  // also re-renders the open dialog
+};
+applyLang();
 refresh(); setInterval(refresh, 2000);
 </script>
 </body>

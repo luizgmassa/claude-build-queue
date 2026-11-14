@@ -161,12 +161,12 @@ def cwd_of(pid):
 def stop(pid, hard=False):
     """SIGTERM, or SIGKILL when hard. Windows has no graceful stop: both end the process at once.
 
-    Returns an error message, or "" (also when the process is already gone)."""
+    Returns an error message (see core.EN), or "" (also when the process is already gone)."""
     try:
         p = psutil.Process(pid)
         p.kill() if hard else p.terminate()
     except psutil.NoSuchProcess:
         pass
     except psutil.AccessDenied as e:
-        return f"sem permissão para matar {pid}: {e}"
+        return core.msg("error.no_permission", pid=pid, detail=str(e))
     return ""

@@ -145,7 +145,7 @@ class Queue:
         self.pending_kills = {}  # pid -> (lstart, sigkill deadline, reason)
         self.last_grant = None
         self.view = {}
-        self.blocked = ""
+        self.blocked = None  # message
         self.limit = core.SLOTS  # restarts at the base: running builds above it just block new ones
         self.holders = set()
         self.last_raise = None
@@ -155,9 +155,10 @@ class Queue:
         self.procs, self.mem = {}, {"total_gb": 0, "free_pct": 0}  # last snapshot, for the detail dialogs
         self.titles = Titles()
 
-    def event(self, kind, text):
-        self.events.appendleft({"ts": time.strftime("%H:%M:%S"), "kind": kind, "text": text})
-        log(f"{kind}: {text}")
+    def event(self, kind, m):
+        """Keeps the message for the page, which translates it, and logs it in English."""
+        self.events.appendleft({"ts": time.strftime("%H:%M:%S"), "kind": kind, "msg": m})
+        log(f"{kind}: {core.render(m)}")
 
     def enforce(self):
         try:
@@ -224,20 +225,20 @@ class Queue:
                            last_raise_ts=self.last_raise, avail_gb=avail, estimates=self.estimates(),
                            ceiling=core.max_slots(mem["total_gb"]))
             if pl.lowered and pl.limit < self.limit:
-                self.event("limite", f"limite {self.limit}→{pl.limit}: {pl.lowered} execução(ões) terminou(aram)")
+                self.event("limit", core.msg("limit.lowered", old=self.limit, new=pl.limit, n=pl.lowered))
             if pl.raised:
                 self.last_raise = now
-                self.event("limite", pl.raised)
+                self.event("limit", pl.raised)
             self.limit, self.holders = pl.limit, pl.holders
             for tid, start in pl.pid_starts.items():
                 self.db.execute("update tickets set pid_start=? where id=?", (start, tid))
             for tid, reason in pl.reaps:
                 self.finish(tid, reason)
-                self.event("reap", f"ticket #{tid}: {reason}")
+                self.event("reap", core.msg("event.reap", id=tid, reason=core.msg("end." + reason)))
             for tid in pl.grants:
                 self.db.execute("update tickets set state='granted', granted=? where id=?", (now, tid))
                 self.last_grant = now
-                self.event("grant", f"ticket #{tid} entrou na vaga")
+                self.event("grant", core.msg("event.grant", id=tid))
             if pl.grants or pl.reaps:
                 self.cond.notify_all()
             self.blocked = pl.blocked
@@ -246,7 +247,7 @@ class Queue:
                 if enforce:
                     self.kill(pid, reason, procs)
                 else:
-                    would_kill.append({"pid": pid, "reason": reason})
+                    would_kill.append({"pid": pid, "reason": reason})  # reason is a message
             self.escalate(procs)
             self.procs, self.mem, self.serving = procs, mem, serving
             self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill)
@@ -261,11 +262,11 @@ class Queue:
                 continue
             err = system.stop(pid)
             if err:
-                self.event("erro", err)
+                self.event("error", err)
             else:
                 self.pending_kills[pid] = (p.lstart, time.time() + core.TERM_GRACE_S, reason)
         p = procs.get(root)
-        self.event("kill", f"SIGTERM {root} ({p.kind if p else '?'}): {reason}")
+        self.event("kill", core.msg("event.sigterm", pid=root, kind=p.kind if p else "?", reason=reason))
 
     def escalate(self, procs):
         now = time.time()
@@ -275,16 +276,18 @@ class Queue:
                 del self.pending_kills[pid]
             elif now >= deadline:
                 err = system.stop(pid, hard=True)
-                self.event("erro" if err else "kill", err or f"SIGKILL {pid} após {core.TERM_GRACE_S}s: {reason}")
+                self.event("error" if err else "kill",
+                           err or core.msg("event.sigkill", pid=pid, s=core.TERM_GRACE_S, reason=reason))
                 del self.pending_kills[pid]
 
     # ------------------------------------------------------------ view
 
     def agent_label(self, claude_pid, procs, subagent=None):
+        """Language-neutral label; whether the agent ended travels as a separate flag the page translates."""
         sub = " subagent" if subagent else ""
         p = procs.get(claude_pid)
         if not p:
-            return f"claude {claude_pid}{sub} (encerrado)"
+            return f"claude {claude_pid}{sub}"
         m = re.search(r"/sessions/(\d+)\.settings\.json", p.args)
         if not m:
             return f"claude {claude_pid}{sub}"
@@ -299,6 +302,7 @@ class Queue:
         sub = self.sub_tickets.get(int(tid)) if tid.isdigit() and p.kind != "claude" else None
         owner = self.agent_label(agent_pid, procs, sub) if agent_pid else p.owner
         return {"pid": p.pid, "ppid": p.ppid, "kind": p.kind, "owner": owner, "agent_pid": agent_pid,
+                "agent_alive": agent_pid in procs if agent_pid else None,
                 "rss_mb": p.rss_kb // 1024, "ram_pct": round(100 * p.rss_kb / total_kb, 2) if total_kb else 0,
                 "cpu": p.cpu, "etime": p.etime, "status": p.status, "ticket": p.env.get("BQ_TICKET", ""),
                 "serving": (serving or {}).get(p.pid), "cmd": p.args[:220]}
@@ -316,7 +320,8 @@ class Queue:
             procs, mem, serving = self.procs, self.mem, getattr(self, "serving", {})
             p = procs.get(pid)
             if p is None:
-                return {"error": f"PID {pid} não existe mais"}
+                m = core.msg("error.pid_gone", pid=pid)
+                return {"error": core.render(m), "error_msg": m}
             total_kb = mem["total_gb"] * 1024 ** 2
             tree = [p] + [procs[d] for d in core.descendants(pid, procs)]
             out = self.proc_row(p, procs, total_kb, serving)
@@ -379,6 +384,7 @@ class Queue:
         peaks = self.peaks()
         for t in tickets:
             t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] else "?"
+            t["agent_alive"] = t["claude_pid"] in procs if t["claude_pid"] else None
             t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
             if t["state"] == "granted":
                 t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
@@ -387,7 +393,8 @@ class Queue:
             "base_slots": core.SLOTS, "max_slots": core.max_slots(mem["total_gb"]), "headroom_gb": core.HEADROOM_GB,
             "avail_gb": round(mem["total_gb"] * mem["free_pct"] / 100, 1),
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
-            "counts": pl.counts, "blocked": pl.blocked, "memory": mem, "would_kill": would_kill,
+            "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
+            "would_kill": would_kill,
             "agents": sorted(({"pid": k, "label": self.agent_label(k, procs), "rss_mb": v["rss"] // 1024,
                                "ram_pct": round(100 * v["rss"] / total_kb, 1) if total_kb else 0,
                                "procs": v["procs"], "alive": k in procs} for k, v in agents.items()),
@@ -421,7 +428,7 @@ class Queue:
                  str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], now,
                  core.command_type(str(body.get("cmd", ""))), subagent))
             tid = cur.lastrowid
-        self.event("enqueue", f"ticket #{tid} pid {body['pid']}: {str(body.get('cmd', ''))[:100]}")
+        self.event("enqueue", core.msg("event.enqueue", id=tid, pid=body["pid"], cmd=str(body.get("cmd", ""))[:100]))
         self.wake.set()
         return {"id": tid}
 
@@ -432,7 +439,7 @@ class Queue:
         ahead = self.db.execute("select count(*) from tickets where state='waiting' and id<?", (tid,)).fetchone()
         waiting = self.db.execute("select count(*) from tickets where state='waiting'").fetchone()
         return {"state": row[0], "reason": row[1], "position": ahead[0] + 1, "waiting": waiting[0],
-                "blocked": self.blocked}
+                "blocked": core.render(self.blocked)}  # English text: gq prints it
 
     def wait(self, tid, timeout):
         deadline = time.time() + min(timeout, 30)
@@ -448,7 +455,7 @@ class Queue:
         with self.lock:
             self.finish(tid, "released", exit_code)
             self.cond.notify_all()
-        self.event("release", f"ticket #{tid} liberou a vaga (exit {exit_code})")
+        self.event("release", core.msg("event.release", id=tid, exit=exit_code))
         self.wake.set()
         return {"ok": True}
 

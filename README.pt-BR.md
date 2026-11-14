@@ -9,7 +9,8 @@ processos e página em http://127.0.0.1:8787. Roda em macOS, Linux e Windows.
 
 ![Dialog do agente: sessão, cada processo com sua parcela de memória, tickets](docs/agent-dialog.png)
 
-Linhas de comando e IDs de sessão estão mascarados nestes prints.
+A página fala inglês (EN-US) e português (PT-BR): abre no idioma do navegador e guarda a escolha feita no
+seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 
 ## Regras
 
