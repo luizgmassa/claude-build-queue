@@ -14,7 +14,8 @@ limpeza de processos e página em http://127.0.0.1:8787.
   (16 GB → 3, 24 GB → 4, 32 GB → 6, 48 GB → 8; nunca abaixo de 2). Com a fila cheia, o limite sobe 1 vaga para o primeiro da fila só se:
   a pressão está normal, passaram 90 s desde a última subida, e a memória disponível do macOS menos a
   estimativa do item deixa ≥ 6 GB de folga. Cada execução que termina baixa o limite em 1 (nunca abaixo de 2);
-  a próxima subida passa pela mesma análise.
+  a próxima subida passa pela mesma análise. Cada subida soma exatamente 1 vaga: se quem não espera (runner,
+  build fora de agente) já ocupa essa vaga, ninguém entra até a próxima subida.
 - **Estimativa por tipo de comando** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
   `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`): maior pico das últimas 5 execuções liberadas
   do mesmo tipo; antes disso, a tabela `DEFAULT_GB` de `bq/core.py`. O pico soma a árvore do `gq`, o daemon

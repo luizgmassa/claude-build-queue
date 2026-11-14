@@ -239,7 +239,7 @@ def max_slots(total_gb):
 def raise_refusal(*, used, limit, pressure, now, last_raise_ts, avail_gb, est, ceiling):
     """Why one more slot cannot open now, or "" when it can."""
     ctype, gb = est
-    if used + 1 > ceiling:
+    if limit + 1 > ceiling:
         return f"teto de {ceiling} vagas"
     if pressure != PRESSURE_NORMAL:
         return "vaga extra só com pressão normal"
@@ -351,10 +351,14 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
             if why:
                 out.blocked = f"sem vaga ({used}/{limit} em uso); {why}"
                 break
-            out.raised = (f"limite {limit}→{used + 1}: {avail_gb:.1f} GB disponíveis − {est[1]:.1f} GB "
+            out.raised = (f"limite {limit}→{limit + 1}: {avail_gb:.1f} GB disponíveis − {est[1]:.1f} GB "
                           f"estimados ({est[0]}) ≥ {HEADROOM_GB:.0f} GB de folga")
-            limit = used + 1
+            limit += 1  # one slot per raise, even when runs that never wait already hold more than the limit
             last_raise_ts = now  # one raise per RAISE_GAP_S, so at most one per tick
+            if used >= limit:
+                out.raised += f"; ninguém entra: {used} em uso (runner ou build fora da fila)"
+                out.blocked = f"sem vaga ({used}/{limit} em uso); vaga extra ocupada por quem não espera"
+                break
         out.grants.append(t.id)
         holders.add(f"t{t.id}")
         used += 1

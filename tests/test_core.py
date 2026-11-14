@@ -167,8 +167,9 @@ class DynamicLimit(unittest.TestCase):
     def gqs(self, *ids):
         return [P(200 + i, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for i in ids]
 
-    def run_tick(self, granted, waiting, *, limit=2, avail=20.0, est=8.0, last_raise=None, prev=(), pressure=1):
-        procs = world(*self.gqs(*granted, *waiting))
+    def run_tick(self, granted, waiting, *, limit=2, avail=20.0, est=8.0, last_raise=None, prev=(), pressure=1,
+                 extra=()):
+        procs = world(*self.gqs(*granted, *waiting), *extra)
         tickets = [core.Ticket(id=i, pid=200 + i, state="granted", created=0) for i in granted] + \
                   [core.Ticket(id=i, pid=200 + i, state="waiting", created=0) for i in waiting]
         now = 1000.0
@@ -182,6 +183,14 @@ class DynamicLimit(unittest.TestCase):
         self.assertEqual((pl.grants, pl.limit), ([3], 3))
         self.assertIn("20.0 GB disponíveis − 8.0 GB", pl.raised)
         self.assertIn("próxima vaga extra", pl.blocked)  # gradual: the second raise waits RAISE_GAP_S
+
+    def test_raise_adds_one_slot_even_above_the_limit(self):
+        runner = P(300, 1, "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient")
+        pl = self.run_tick([1, 2], [4], extra=[runner])  # 3 in use, limit 2
+        self.assertEqual((pl.limit, pl.grants), (3, []))
+        self.assertIn("ninguém entra", pl.raised)
+        pl = self.run_tick([1, 2], [4], extra=[runner], limit=3, last_raise=1000 - core.RAISE_GAP_S)
+        self.assertEqual((pl.limit, pl.grants), (4, [4]))
 
     def test_ceiling_follows_ram(self):
         self.assertEqual([core.max_slots(gb) for gb in (8.0, 16.0, 24.0, 32.0, 48.0, 64.0)], [2, 3, 4, 6, 8, 11])

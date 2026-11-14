@@ -14,7 +14,8 @@ process cleanup and a page at http://127.0.0.1:8787.
   (16 GB → 3, 24 GB → 4, 32 GB → 6, 48 GB → 8; never below 2). With every slot taken, the limit rises by 1 slot for the head of the queue
   only if: memory pressure is normal, 90 s have passed since the last raise, and macOS available memory minus
   the item's estimate leaves ≥ 6 GB of headroom. Each run that ends lowers the limit by 1 (never below 2);
-  the next raise goes through the same analysis.
+  the next raise goes through the same analysis. A raise always adds exactly 1 slot: when runs that never
+  wait (runner, builds outside an agent) already hold it, nobody enters until the next raise.
 - **Estimate per command type** (`gradle-check`, `gradle-backend`, `gradle-ios`, `gradle-test`,
   `gradle-lint`, `gradle`, `xcodebuild`, `java`, `pod`, `uv`): the largest peak of the last 5 released runs
   of the same type; before that, the `DEFAULT_GB` table in `bq/core.py`. The peak adds up the `gq` tree, the
