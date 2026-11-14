@@ -77,12 +77,15 @@ class Cleanup(unittest.TestCase):
         tool = P(401, 101, "uv run scripts/t.py", CLAUDE_PID=100)
         orphan = P(402, 1, "uv run scripts/o.py", CLAUDE_PID=100)
         pl = tick(world(hook, tool, orphan))
-        self.assertEqual(sorted(k[0] for k in pl.kills), [401, 402])
+        self.assertEqual(pl.counts["unqueued"], 2)  # the hook is not a build; the two runs are, and take slots
+        self.assertEqual(pl.kills, [])
         self.assertEqual(pl.used, 2)
 
-    def test_unqueued_agent_build_is_killed_and_counts_as_a_slot(self):
-        pl = tick(world(P(400, 101, CLIENT, CLAUDE_PID=100)))
-        self.assertEqual(pl.kills, [(400, core.msg("kill.no_slot"))])
+    def test_unqueued_agent_build_is_not_killed_but_counts_as_a_slot(self):
+        procs = world(P(400, 101, CLIENT, CLAUDE_PID=100))
+        pl = tick(procs)
+        self.assertEqual(pl.kills, [])  # the hook is the only enforcement
+        self.assertEqual(procs[400].status, core.msg("status.no_slot"))
         self.assertEqual(pl.used, 1)
 
     def test_queued_build_is_left_alone(self):
@@ -102,7 +105,7 @@ class Cleanup(unittest.TestCase):
 
     def test_orphan_of_dead_agent_is_killed(self):
         pl = tick(world(P(600, 1, CLIENT, CLAUDE_PID=4242)))
-        self.assertIn((600, core.msg("kill.no_slot")), pl.kills)
+        self.assertIn((600, core.msg("kill.orphan", pid=4242)), pl.kills)
         self.assertEqual(len([k for k in pl.kills if k[0] == 600]), 1)
 
     def test_idle_agent_daemon_is_killed_after_grace_busy_one_is_not(self):
@@ -379,16 +382,21 @@ class Toolchains(unittest.TestCase):
               "bazelisk test //x:y": "bazel", "dotnet build": "dotnet", "dotnet test x.sln": "dotnet",
               "dotnet publish -c Release": "dotnet", "dotnet restore": "dotnet", "msbuild x.sln": "msbuild",
               "swift build": "swift", "swift test --parallel": "swift", "cargo build --release": "cargo",
-              "cargo +nightly test": "cargo", "go build ./...": "go", "go test ./...": "go", "mvn -q test": "maven",
+              "cargo +nightly test": "cargo", "go build ./...": "go", "go test ./...": "go", "mvn -q test": "maven", "cargo check": "cargo", "cargo clippy --all": "cargo",
+              "nx build web": "node", "nx run web:build": "node", "nx run-many -t build test": "node",
+              "nx affected --target=test": "node", "turbo run build": "node", "turbo build --filter=web": "node",
+              "webpack": "node", "webpack --mode production": "node", "pnpm --filter web build": "node",
+              "npm -w web run build": "node", "pnpm -C app install": "node", "yarn --cwd app test": "node",
               "./mvnw package": "maven", "sbt compile": "sbt"}
     CHEAP = ["npm --version", "npm ls", "npm run dev", "npm run lint", "npm start", "npm run build:watch",
              "npm run build -- --watch", "npx create-next-app x", "node -e 'console.log(1)'", "node server.js",
              "tsc --watch", "tsc -v", "jest --watch", "vitest watch", "next dev", "vite", "cmake -S . -B build",
              "clang --version", "clang -print-resource-dir", "make --version", "bazel query //...",
              "bazel shutdown", "dotnet --info", "dotnet run", "dotnet build-server shutdown", "msbuild /version",
-             "swift package resolve", "swift --version", "cargo --version", "cargo fmt", "cargo check",
+             "swift package resolve", "swift --version", "cargo --version", "cargo fmt",
              "go fmt ./...", "go vet ./...", "go run .", "mvn --version", "git status", "ls", "which make",
-             "brew install cmake", "echo cargo build", "grep -r 'npm ci' ."]
+             "brew install cmake", "nx serve web", "nx run web:serve", "turbo run dev",
+             "turbo run lint", "nx graph", "webpack serve", "webpack --watch", "pnpm --filter web dev", "echo cargo build", "grep -r 'npm ci' ."]
 
     def test_heavy_commands_get_their_command_type_and_the_hook_queues_them(self):
         for cmd, want in self.QUEUED.items():
@@ -435,7 +443,7 @@ class Toolchains(unittest.TestCase):
                 ("node /u/.vscode/extensions/ts/tsserver.js", "other"), ("rust-analyzer", "other"),
                 ("sccache", "other"), ("clangd --background-index", "other"), ("sourcekit-lsp", "other"),
                 ("node /w/node_modules/.bin/eslint .", "other"), ("node server.js", "other"),
-                ("cargo check --message-format=json", "other"), ("dotnet /sdk/MSBuild.dll x.sln", "other")]:
+                ("cargo check --message-format=json", "cargo"), ("dotnet /sdk/MSBuild.dll x.sln", "other")]:
             self.assertEqual(core.kind_of(args), kind, args)
 
 
@@ -478,8 +486,7 @@ class ToolchainCleanup(unittest.TestCase):
                                     P(902, 1, "node /u/.vscode/extensions/ts/tsserver.js", CLAUDE_PID=4242),
                                     P(903, 1, "clangd --background-index", CLAUDE_PID=4242),
                                     P(904, 1, "sourcekit-lsp", CLAUDE_PID=4242),
-                                    P(905, 1, "node /w/node_modules/.bin/eslint .", CLAUDE_PID=4242),
-                                    P(906, 1, "cargo check --message-format=json", CLAUDE_PID=4242)), [])
+                                    P(905, 1, "node /w/node_modules/.bin/eslint .", CLAUDE_PID=4242)), [])
 
     def test_nested_toolchain_under_a_queued_run_dies_with_its_gq_only(self):
         gq = P(201, 101, "python3 /u/.local/bin/gq run -- npm run build", CLAUDE_PID=4242)

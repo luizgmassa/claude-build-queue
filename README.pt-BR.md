@@ -35,15 +35,17 @@ seletor. Linhas de comando e IDs de sessão estão mascarados nestes prints.
 - Também passam pela fila (o gancho exige `gq run`), cada um com seu tipo de comando:
   - Node/JS: `npm`/`pnpm`/`yarn`/`bun` install, test e scripts com nome de build/test/compile/typecheck/e2e
     (não dev/watch/serve/start), `npx`/`exec`/`dlx` das ferramentas abaixo, `tsc`, `next build`, `vite build`,
-    `jest`, `vitest` (fora do modo watch);
+    `jest`, `vitest` (fora do modo watch), tarefas de build/test do `nx`/`turbo`, `webpack` (não `serve`/watch);
+    valores de `--filter`/`--workspace`/`--cwd` são entendidos (`pnpm --filter web build`);
   - C/C++: `cmake --build`, `make`, `ninja`, `msbuild`, `clang`/`gcc`/`g++`/`cc` direto com arquivo de entrada,
     `bazel build|test|coverage`;
   - .NET: `dotnet build|test|publish|restore|pack|msbuild`;
-  - outros: `swift build|test`, `cargo build|test|bench`, `go build|test|install`, `mvn`/`mvnw`, `sbt`.
+  - outros: `swift build|test`, `cargo build|test|bench|check|clippy`, `go build|test|install`, `mvn`/`mvnw`, `sbt`.
 
   Consultas de versão e ajuda (`--version`, `--help`, `/version`) e subcomandos baratos (`npm run dev`,
-  `cargo check`, `go vet`, `dotnet run`, `cmake -S . -B build`) ficam fora. `mvn` e `sbt` rodam como `java`,
-  então também morrem sem vaga; as outras toolchains só morrem depois que o agente delas morreu.
+  `go vet`, `dotnet run`, `cmake -S . -B build`) ficam fora.
+- Build sem vaga nunca é morto, Gradle incluído: o gancho é a única imposição. Ele ainda ocupa vaga, então a
+  fila espera por ele.
 - Builds fora de agente (seu terminal, Android Studio) contam vaga, mas nunca são mortos.
 - Nunca tocados: runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), backend do staging
   (`~/.health-hub-local`), processos `claude`, o próprio servidor.
@@ -65,9 +67,8 @@ e todo `gq run` sem `run_in_background`.
 
 Em `off` (simulação) a página só lista o que mataria. Em `on`:
 
-- build de agente sem vaga: SIGTERM na árvore, SIGKILL após 10 s (o Windows não tem término gracioso: morre
-  na hora);
-- processo de agente cuja sessão `claude` já morreu;
+- processo de agente cuja sessão `claude` já morreu: SIGTERM na árvore, SIGKILL após 10 s (o Windows não tem
+  término gracioso: morre na hora);
 - daemon Gradle de agente ocioso há 20 s (sem cliente conectado) e sem concessão nos últimos 20 s;
 - daemon Kotlin de agente ocioso há 60 s, mesmo com builds rodando (o KGP cai no compilador dentro do Gradle);
 - worker Gradle cujo daemon pai morreu (o pai deixou de ser um processo Gradle: init, subreaper do Linux ou

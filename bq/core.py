@@ -40,7 +40,6 @@ EN = {
     "status.no_slot": "NO SLOT",
     "status.busy": "busy",
     "status.idle": "idle {s}s",
-    "kill.no_slot": "build without a slot",
     "kill.orphan": "orphan: agent {pid} ended",
     "kill.loose_worker": "loose worker (parent died)",
     "kill.idle_daemon": "idle daemon",
@@ -383,9 +382,7 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
             r.status = msg("status.in_slot")
         else:
             r.status = msg("status.no_slot")
-            unqueued.append(r)
-    for r in unqueued:
-        out.kills.append((r.pid, msg("kill.no_slot")))
+            unqueued.append(r)  # not killed: the hook is the enforcement; it still takes a slot
 
     for p in procs.values():
         if p.owner != "agent":
@@ -473,13 +470,15 @@ JS_PMS = {"npm", "pnpm", "yarn", "bun"}
 JS_INSTALL_TEST = {"install", "i", "ci", "add", "rebuild", "test", "t", "tst"}
 JS_BUILD_SCRIPT = re.compile(r"(^|[:_-])(build|test|compile|typecheck|type-check|e2e)")
 JS_LONG_SCRIPT = re.compile(r"watch|dev|serve|start")  # a dev server or watcher would hold its slot forever
+JS_VALUE_FLAGS = {"--filter", "-F", "--dir", "-C", "--prefix", "--workspace", "-w", "--cwd"}  # `pnpm --filter web build`
+JS_TASK_RUNNERS = {"nx", "turbo"}  # `nx run web:build`, `nx run-many -t build`, `turbo run build`
 # Toolchains queued for any arguments but a version or help query, and those queued for some subcommands only.
 TOOL_ANY = {"make": "cc", "gmake": "cc", "ninja": "cc", "msbuild": "msbuild", "mvn": "maven", "mvnw": "maven",
             "sbt": "sbt", "swift-build": "swift", "swift-test": "swift"}
 TOOL_SUBS = {"next": ("node", {"build"}), "vite": ("node", {"build"}),
              "bazel": ("bazel", {"build", "test", "coverage"}), "bazelisk": ("bazel", {"build", "test", "coverage"}),
              "dotnet": ("dotnet", {"build", "test", "publish", "restore", "pack", "msbuild"}),
-             "swift": ("swift", {"build", "test"}), "cargo": ("cargo", {"build", "b", "test", "t", "bench"}),
+             "swift": ("swift", {"build", "test"}), "cargo": ("cargo", {"build", "b", "test", "t", "bench", "check", "c", "clippy"}),
              "go": ("go", {"build", "test", "install"})}
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
@@ -528,8 +527,10 @@ def toolchain(prog, rest):
         return toolchain(*_node_script(rest))
     if tuple(rest) in VERSION_ONLY:
         return None
-    # shortcut: a flag's separate value (`pnpm --filter web build`) reads as the subcommand, so that run is not
-    # queued; parse per-tool flags if real runs slip through.
+    if prog in JS_PMS:  # drop a value flag and its value, so `pnpm --filter web build` reads as `pnpm build`
+        rest = [w for i, w in enumerate(rest) if w not in JS_VALUE_FLAGS and (i == 0 or rest[i - 1] not in JS_VALUE_FLAGS)]
+    # shortcut: other tools' separate flag values (`go test -run X ./...` is fine, `cargo -p x build` is not) read
+    # as the subcommand, so that run is not queued; parse per-tool flags if real runs slip through.
     words = [w for w in rest if not w.startswith(("-", "+"))]  # `cargo +nightly build`
     sub = words[0] if words else ""
 
@@ -544,6 +545,12 @@ def toolchain(prog, rest):
                 or JS_BUILD_SCRIPT.search(script) and not JS_LONG_SCRIPT.search(script) and not WATCH & set(rest):
             return "node"
         return then(words[1:2] if sub in ("exec", "dlx", "x") else [] if sub in ("run", "run-script") else words[:1])
+    if prog in JS_TASK_RUNNERS:
+        tasks = [w.split("=")[-1].split(":")[-1] for w in rest]  # `--target=build`, `web:build`
+        return "node" if any(JS_BUILD_SCRIPT.search(t) for t in tasks) \
+            and not any(JS_LONG_SCRIPT.search(t) for t in tasks) and not WATCH & set(rest) else None
+    if prog == "webpack":
+        return None if sub in ("serve", "watch") or WATCH & set(rest) else "node"
     if prog in ("tsc", "jest", "vitest"):
         return None if WATCH & set(rest) or sub in ("watch", "dev") else "node"
     if prog == "cmake":

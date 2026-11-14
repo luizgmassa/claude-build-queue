@@ -35,15 +35,17 @@ made in its selector. The screenshots show it in Portuguese, with command lines 
 - These also go through the queue (the hook demands `gq run`), with their own command type:
   - Node/JS: `npm`/`pnpm`/`yarn`/`bun` install, test and scripts named like build/test/compile/typecheck/e2e
     (not dev/watch/serve/start), `npx`/`exec`/`dlx` of the tools below, `tsc`, `next build`, `vite build`,
-    `jest`, `vitest` (not in watch mode);
+    `jest`, `vitest` (not in watch mode), `nx`/`turbo` build/test tasks, `webpack` (not `serve`/watch);
+    `--filter`/`--workspace`/`--cwd` values are understood (`pnpm --filter web build`);
   - C/C++: `cmake --build`, `make`, `ninja`, `msbuild`, direct `clang`/`gcc`/`g++`/`cc` with an input file,
     `bazel build|test|coverage`;
   - .NET: `dotnet build|test|publish|restore|pack|msbuild`;
-  - others: `swift build|test`, `cargo build|test|bench`, `go build|test|install`, `mvn`/`mvnw`, `sbt`.
+  - others: `swift build|test`, `cargo build|test|bench|check|clippy`, `go build|test|install`, `mvn`/`mvnw`, `sbt`.
 
   Version and help queries (`--version`, `--help`, `/version`) and cheap subcommands (`npm run dev`,
-  `cargo check`, `go vet`, `dotnet run`, `cmake -S . -B build`) stay outside. `mvn` and `sbt` run as `java`,
-  so they are also killed without a slot; the other toolchains are killed only once their agent died.
+  `go vet`, `dotnet run`, `cmake -S . -B build`) stay outside.
+- A build without a slot is never killed, Gradle included: the hook is the only enforcement. It still takes a
+  slot, so the queue waits for it.
 - Builds outside an agent (your terminal, Android Studio) take a slot, but are never killed.
 - Never touched: the runner (`GITHUB_ACTIONS`, `~/.gradle-health-hub-ci`), the staging backend
   (`~/.health-hub-local`), `claude` processes, the server itself.
@@ -65,9 +67,8 @@ The global `PreToolUse` hook (`bq/hook.py`) denies every Bash call that runs the
 
 In `off` (dry run) the page only lists what it would kill. In `on`:
 
-- agent build without a slot: SIGTERM on the tree, SIGKILL after 10 s (Windows has no graceful stop: it dies
-  at once);
-- agent process whose `claude` session has already died;
+- agent process whose `claude` session has already died: SIGTERM on the tree, SIGKILL after 10 s (Windows has
+  no graceful stop: it dies at once);
 - agent Gradle daemon idle for 20 s (no client connected) and no grant in the last 20 s;
 - agent Kotlin daemon idle for 60 s, even with builds running (KGP falls back to the compiler inside Gradle);
 - Gradle worker whose parent daemon died (its parent is no longer a Gradle process: init, a Linux subreaper,

@@ -57,7 +57,7 @@ ends = {k[4:]: t for k, t in times.items() if k.startswith("end-")}
 order = sorted(starts, key=starts.get)
 peak = max(sum(1 for n in starts if starts[n] <= t < ends[n]) for t in starts.values())
 print("start order:", order, "| peak concurrency:", peak, "| exit codes:", codes)
-assert order == ["1", "2", "3", "5"], order
+assert set(order[:2]) == {"1", "2"} and order[2:] == ["3", "5"], order  # 1 and 2 enter in the same tick
 assert peak == 2, peak
 assert codes[3] != 0 and all(c == 0 for i, c in enumerate(codes) if i != 3), codes
 
