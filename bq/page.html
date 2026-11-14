@@ -124,7 +124,6 @@
   "h.est": "Estimate by type (largest peak of the last {n} runs, or the starting table)",
   "h.events": "Events",
   "h.agent_procs": "Agent processes",
-  "h.agent_tickets": "Tickets (active and from the last hour)",
   "h.cmd": "Command",
   "h.ancestors": "Ancestors",
   "h.tree": "Tree",
@@ -186,7 +185,6 @@
   "col.estimate_gb": "estimate (GB)",
   "col.time": "time",
   "col.detail": "detail",
-  "col.subagent": "subagent",
   "kv.ralphy": "ralphy session",
   "kv.session_id": "Session ID",
   "kv.transcript": "Transcript",
@@ -205,9 +203,6 @@
   "kv.tree_val": "{n} processes, {gb} GB ({pct}% of RAM)",
   "kv.dir": "Directory",
   "kv.env": "Environment",
-  "state.waiting": "waiting",
-  "state.granted": "granted",
-  "state.done": "done",
   "owner.agent": "agent",
   "owner.nonagent": "non-agent",
   "owner.runner": "runner",
@@ -346,7 +341,6 @@
   "h.est": "Estimativa por tipo (maior pico das últimas {n} execuções, ou tabela inicial)",
   "h.events": "Eventos",
   "h.agent_procs": "Processos do agente",
-  "h.agent_tickets": "Tickets (ativos e da última hora)",
   "h.cmd": "Comando",
   "h.ancestors": "Ancestrais",
   "h.tree": "Árvore",
@@ -408,7 +402,6 @@
   "col.estimate_gb": "estimativa (GB)",
   "col.time": "hora",
   "col.detail": "detalhe",
-  "col.subagent": "subagente",
   "kv.ralphy": "Sessão ralphy",
   "kv.session_id": "ID da sessão",
   "kv.transcript": "Transcrição",
@@ -427,9 +420,6 @@
   "kv.tree_val": "{n} processos, {gb} GB ({pct}% da RAM)",
   "kv.dir": "Diretório",
   "kv.env": "Ambiente",
-  "state.waiting": "aguardando",
-  "state.granted": "na vaga",
-  "state.done": "terminado",
   "owner.agent": "agente",
   "owner.nonagent": "não-agente",
   "owner.runner": "runner",
@@ -682,8 +672,6 @@ const T_AGENT = { k: "agent", t: "col.agent", w: 220, f: t => agentLink(t.claude
 const T_PID = { k: "pid", t: "col.gq_pid", num: true, w: 70, f: t => procLink(t.pid) };
 const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
 const T_PROJ = { k: "project", t: "col.project", w: 180 };
-const T_STATE = { k: "state", t: "col.state", w: 80, v: t => T("state." + t.state, null, t.state),
-  f: t => esc(T("state." + t.state, null, t.state)) };
 const T_EST = { k: "estimate_gb", t: "col.estimate", num: true, w: 85, f: t => t.estimate_gb != null ? t.estimate_gb + " GB" : "" };
 const T_CPU = { k: "cpu_pct", t: "% CPU", num: true, w: 70, f: r => r.cpu_pct != null ? r.cpu_pct + "%" : "" };
 const T_RAM = { k: "rss_gb", t: "col.ram_now", num: true, w: 85, f: t => t.rss_gb != null ? t.rss_gb + " GB" : "" };
@@ -693,6 +681,23 @@ const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${esc(t.cwd)}$ ${
 const endReason = t => T("end." + t.end_reason, null, t.end_reason ?? "");
 const T_END = { k: "end_reason", t: "col.end", w: 160, v: endReason,
   f: t => esc(endReason(t)) + (t.exit_code != null ? " (exit " + t.exit_code + ")" : "") };
+// one column set per ticket state, shared by the main page and the dialogs
+const TICKET_TABLES = [
+  ["running", "h.running", t => t.state === "granted", [T_ID, T_AGENT, T_PROJ, T_PID,
+    { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
+    T_TYPE, T_RAM, T_CPU, T_EST, T_PEAK, T_CMD]],
+  ["waiting", "h.waiting", t => t.state === "waiting", [{ k: "position", t: "col.position", num: true, w: 65 },
+    T_ID, T_AGENT, T_PROJ, T_PID,
+    { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
+    T_TYPE, T_CPU, T_EST, T_CMD]],
+  ["done", "h.done", t => t.state === "done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,
+    { k: "ended", t: "col.ended_ago", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD]],
+];
+// the dialog's tickets, one table per state that has any, with the main page's columns
+const dlgTicketsHtml = tickets => TICKET_TABLES.filter(([, , has]) => tickets.some(has)).map(([id, h]) =>
+  `<h3>${esc(T(h))}</h3><div class="wrap"><table id="dlg-${id}"></table></div>`).join("");
+const dlgTicketsGrid = tickets => TICKET_TABLES.forEach(([id, , has, cols]) => {
+  if (tickets.some(has)) grid("dlg-" + id, cols, tickets.filter(has)); });
 
 // ---------------------------------------------------------------- main view
 const pressure = p => p >= 4 ? ["pressure.critical", "bad"] : p >= 2 ? ["pressure.warn", "warn"] : ["pressure.normal", "ok"];
@@ -744,17 +749,7 @@ function render(v) {
   const blocked = v.blocked_msg || v.blocked;  // blocked_msg carries the key; blocked is the English text gq prints
   document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
-  const waiting = v.tickets.filter(t => t.state === "waiting").sort((a, b) => a.id - b.id);
-  waiting.forEach((t, i) => t.position = i + 1);
-  grid("running", [T_ID, T_AGENT, T_PROJ, T_PID,
-    { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
-    T_TYPE, T_RAM, T_CPU, T_EST, T_PEAK, T_CMD], v.tickets.filter(t => t.state === "granted"));
-  grid("waiting", [{ k: "position", t: "col.position", num: true, w: 65 }, T_ID, T_AGENT, T_PROJ, T_PID,
-    { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
-    T_TYPE, T_CPU, T_EST, T_CMD], waiting);
-  grid("done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,
-    { k: "ended", t: "col.ended_ago", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD],
-    v.tickets.filter(t => t.state === "done"));
+  TICKET_TABLES.forEach(([id, , has, cols]) => grid(id, cols, v.tickets.filter(has)));
   grid("agents", [
     { k: "label", t: "col.agent", w: 280, f: a => agentLink(a.pid, a.label) },
     { k: "pid", t: "col.claude_pid", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " " + esc(T("dead"))) },
@@ -813,9 +808,9 @@ function renderAgent(a, body) {
     ["kv.ram_total", esc(T("kv.pct_of", { pct: a.ram_pct, gb: a.total_gb }))],
     ["kv.avail_now", esc(T("kv.pct_of", { pct: a.avail_pct, gb: a.avail_gb }))],
   ]) + `<h3>${esc(T("h.agent_procs"))}</h3><div class="wrap"><table id="dlg-procs"></table></div>`
-     + `<h3>${esc(T("h.agent_tickets"))}</h3><div class="wrap"><table id="dlg-tickets"></table></div>`;
+     + dlgTicketsHtml(a.tickets);
   grid("dlg-procs", PROC_COLS, a.procs);
-  grid("dlg-tickets", [T_ID, T_STATE, { k: "subagent", t: "col.subagent", w: 110 }, T_PID, T_TYPE, T_PEAK, T_CMD, T_END], a.tickets);
+  dlgTicketsGrid(a.tickets);
 }
 
 function renderProc(p, body) {
@@ -834,10 +829,10 @@ function renderProc(p, body) {
   ]) + `<h3>${esc(T("h.cmd"))}</h3><pre>${esc(p.cmd)}</pre>`
      + `<h3>${esc(T("h.ancestors"))}</h3><div class="wrap"><table id="dlg-anc"></table></div>`
      + `<h3>${esc(T("h.tree"))}</h3><div class="wrap"><table id="dlg-tree"></table></div>`
-     + (p.tickets.length ? `<h3>${esc(T("h.ticket"))}</h3><div class="wrap"><table id="dlg-tickets"></table></div>` : "");
+     + dlgTicketsHtml(p.tickets);
   grid("dlg-anc", PROC_COLS, p.ancestors);
   grid("dlg-tree", PROC_COLS, p.tree);
-  if (p.tickets.length) grid("dlg-tickets", [T_ID, T_STATE, T_TYPE, T_PEAK, T_CMD, T_END], p.tickets);
+  dlgTicketsGrid(p.tickets);
 }
 
 document.getElementById("dlg-x").onclick = () => dlg.close();

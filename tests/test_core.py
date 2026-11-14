@@ -362,16 +362,25 @@ class TicketMemory(unittest.TestCase):
         self.assertEqual(loads["outside"]["builds"],
                          [{"pid": 400, "project": "repo-wt", "ctype": core.command_type(CLIENT)}])
 
-    def test_done_ticket_peak_is_rounded_and_missing_peak_stays_empty(self):
+    def test_tickets_carry_the_main_page_values_and_a_rounded_peak(self):
         import sqlite3
-        from types import SimpleNamespace
+        from types import MethodType, SimpleNamespace
         from bq.server import Queue
         db = sqlite3.connect(":memory:")
         db.execute("create table tickets (id, pid, claude_pid, ralphy, cwd, cmd, state, created, granted, ended,"
                    " end_reason, exit_code, ctype, peak_gb, subagent)")
-        db.execute("insert into tickets (id, state, peak_gb) values (1, 'done', 3.923477172851), (2, 'done', null)")
-        rows = Queue.ticket_rows(SimpleNamespace(db=db), "1=1", ())
-        self.assertEqual([r["peak_gb"] for r in rows], [3.9, None])
+        db.execute("insert into tickets (id, claude_pid, state, ctype, peak_gb) values (1, 5, 'done', 'other', 3.923477),"
+                   " (2, 5, 'granted', 'other', null), (3, 5, 'waiting', 'other', null), (4, 7, 'waiting', 'other', null),"
+                   " (5, 5, 'done', 'other', null)")
+        q = SimpleNamespace(db=db, peak={2: 5.04}, now_gb={2: 4.96}, now_cpu={2: 12.34}, peaks=dict)
+        q.ticket_rows, q.agent_label = MethodType(Queue.ticket_rows, q), MethodType(Queue.agent_label, q)
+        # an agent's waiting ticket keeps its place in the whole line, not among its agent's tickets
+        self.assertEqual(Queue.tickets_view(q, "claude_pid=?", (7,), {})[0]["position"], 2)
+        done, granted, waiting, _, done_no_peak = Queue.tickets_view(q, "1=1", (), {})  # ordered by id
+        self.assertEqual((granted["rss_gb"], granted["peak_gb"], granted["cpu_pct"]), (5.0, 5.0, 12.3))
+        # a waiting ticket has no CPU before its gq runs; a done one keeps its stored peak, rounded
+        self.assertEqual((done["position"], granted["position"], waiting["position"], waiting["cpu_pct"],
+                          done["peak_gb"], done_no_peak["peak_gb"]), (None, None, 1, None, 3.9, None))
 
 
 

@@ -393,6 +393,22 @@ class Queue:
         rows = self.db.execute(f"select {', '.join(exprs)} from tickets where {where} order by id", args)
         return [dict(zip(cols, r)) for r in rows.fetchall()]
 
+    def tickets_view(self, where, args, procs):
+        """Ticket rows with what the page shows of them: agent, project, place in line, memory, CPU, estimate."""
+        tickets, peaks = self.ticket_rows(where, args), self.peaks()
+        line = [tid for (tid,) in self.db.execute("select id from tickets where state='waiting' order by id")]
+        for t in tickets:
+            t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] else "?"
+            t["agent_alive"] = t["claude_pid"] in procs if t["claude_pid"] else None
+            t["project"] = project_of(t["cwd"])
+            t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
+            t["position"] = line.index(t["id"]) + 1 if t["id"] in line else None
+            granted = t["state"] == "granted"
+            t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1) if granted else t["peak_gb"]
+            t["rss_gb"] = round(self.now_gb[t["id"]], 1) if t["id"] in self.now_gb else None  # granted ones only
+            t["cpu_pct"] = round(self.now_cpu[t["id"]], 1) if t["id"] in self.now_cpu else None
+        return tickets
+
     def proc_details(self, pid):
         """Everything known about one process, for the page's dialog."""
         with self.lock:
@@ -409,8 +425,9 @@ class Queue:
                        ancestors=[self.proc_row(a, procs, total_kb, serving) for a in core.ancestors(pid, procs)],
                        tree=[self.proc_row(q, procs, total_kb, serving) for q in tree],
                        tree_rss_gb=round(tree_kb / 1024 ** 2, 2), tree_ram_pct=round(100 * tree_kb / total_kb, 2) if total_kb else 0,
-                       tickets=self.ticket_rows("id=?", (int(p.env["BQ_TICKET"]),))
-                       if p.env.get("BQ_TICKET", "").isdigit() else [])
+                       tickets=self.tickets_view("id=?", (int(p.env["BQ_TICKET"]),), procs)
+                       if p.env.get("BQ_TICKET", "").isdigit()  # gq itself has no BQ_TICKET: its live ticket by pid
+                       else self.tickets_view("pid=? and state!='done'", (pid,), procs))
         out["cwd"] = system.cwd_of(pid)  # outside the lock: it can take a moment
         return out
 
@@ -428,8 +445,8 @@ class Queue:
             claude = procs.get(claude_pid)
             m = re.search(r"/sessions/(\d+)\.settings\.json", claude.args) if claude else None
             sid = self.titles.session_of(m.group(1)) if m else None
-            tickets = self.ticket_rows("claude_pid=? and (state!='done' or ended>?)",
-                                       (claude_pid, time.time() - 3600))
+            tickets = self.tickets_view("claude_pid=? and (state!='done' or ended>?)",
+                                        (claude_pid, time.time() - 3600), procs)
             transcript = glob(str(Path.home() / f".claude/projects/*/{sid}.jsonl")) if sid else []
             return {"pid": claude_pid, "label": self.agent_label(claude_pid, procs), "alive": claude is not None,
                     "ralphy": m.group(1) if m else None, "session_id": sid,
@@ -462,17 +479,8 @@ class Queue:
                     or p.root is not None:
                 relevant.append(self.proc_row(p, procs, total_kb, serving))
         relevant.sort(key=lambda r: -r["rss_gb"])
-        tickets = self.ticket_rows("state!='done' or ended>?", (time.time() - 3600,))
+        tickets = self.tickets_view("state!='done' or ended>?", (time.time() - 3600,), procs)
         peaks = self.peaks()
-        for t in tickets:
-            t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] else "?"
-            t["agent_alive"] = t["claude_pid"] in procs if t["claude_pid"] else None
-            t["project"] = project_of(t["cwd"])
-            t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)
-            if t["state"] == "granted":
-                t["peak_gb"] = round(self.peak.get(t["id"], 0.0), 1)
-                t["rss_gb"] = round(self.now_gb[t["id"]], 1) if t["id"] in self.now_gb else None
-            t["cpu_pct"] = round(self.now_cpu[t["id"]], 1) if t["id"] in self.now_cpu else None
         return {
             "ts": time.strftime("%H:%M:%S"), "enforce": enforce, "used": pl.used,
             "base_slots": core.SLOTS, "max_slots": ceiling, "headroom_gb": core.HEADROOM_GB,
