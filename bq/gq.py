@@ -28,7 +28,9 @@ CONFIG = settings.CONFIG
 UNREACHABLE_LIMIT_S = SETTINGS["unreachable_limit_s"]
 EX_TEMPFAIL = 75
 BASE_SLOTS = SETTINGS["base_slots"]
-SIGNALS = [getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK") if hasattr(signal, n)]
+# SIGALRM: a timeout wrapper outside gq (perl -e 'alarm N; exec @ARGV' gq run -- ...) would kill gq by default
+# and leave the build running without a slot; it stops the child with SIGTERM instead
+SIGNALS = [getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK", "SIGALRM") if hasattr(signal, n)]
 
 
 def say(msg):
@@ -133,7 +135,7 @@ def run(cmd):
         if os.name == "nt" and signum != signal.SIGTERM:
             return  # Ctrl+C and Ctrl+Break already reach the child through the shared console
         try:
-            child.send_signal(signum)
+            child.send_signal(signal.SIGTERM if signum == getattr(signal, "SIGALRM", None) else signum)
         except (ProcessLookupError, OSError):
             pass
 

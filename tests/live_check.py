@@ -69,7 +69,23 @@ nested = subprocess.run(gq + [sys.executable, str(ROOT / "bq/gq.py"), "run", "--
                               sys.executable, "-c", "print('nested-ok')"],
                         env=env, capture_output=True, text=True, timeout=30)
 assert "nested-ok" in nested.stdout, nested
+if os.name != "nt":  # an alarm armed outside gq (perl -e 'alarm N; exec @ARGV' gq run -- ...) must stop the child
+    pid_file = marks / "alarm-child"
+    alarmed = subprocess.run([sys.executable, "-c", "import os, signal, sys; signal.alarm(2); "
+                              "os.execv(sys.executable, [sys.executable] + sys.argv[1:])", *gq[1:],
+                              sys.executable, "-c", "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+                              "time.sleep(60)", str(pid_file)], env=env, timeout=30)
+    child = int(pid_file.read_text())
+    time.sleep(0.5)
+    try:
+        os.kill(child, 0)
+        child_alive = True
+    except ProcessLookupError:
+        child_alive = False
+    assert alarmed.returncode != 0 and not child_alive, (alarmed.returncode, child)
+
 with server.Q.lock:
     left = server.Q.db.execute("select count(*) from tickets where state!='done'").fetchone()[0]
 assert left == 0, left
-print("live check OK: FIFO order, max 2 concurrent, dead waiter reaped, nested run reuses the slot")
+print("live check OK: FIFO order, max 2 concurrent, dead waiter reaped, nested run reuses the slot, "
+      "outside alarm stops the child")
