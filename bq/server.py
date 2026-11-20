@@ -134,8 +134,31 @@ def root_project(pid, lstart):
     return project_of(root_cwd(pid, lstart))
 
 
-def outside_and_runner(outside_roots, trees, procs, total_gb):
-    """Memory and CPU of the builds running without a slot, each one named, and of the runner's job."""
+@functools.lru_cache(maxsize=32)
+def runner_name(root):
+    """The name the runner was registered with (its .runner file), or its folder's name."""
+    try:
+        return json.loads(Path(root, ".runner").read_text(encoding="utf-8-sig"))["agentName"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return Path(root).name
+
+
+def runner_job(pid, tree, procs):
+    """The Running table's row of one GitHub runner job: the step it runs now, its Gradle command when it has one."""
+    w = procs[pid]
+    steps = [procs[x] for x in tree if procs[x].kind == "gradle_client"] \
+        or [procs[x] for x in tree if procs[x].ppid == pid] or [w]
+    step = max(steps, key=lambda p: p.started)
+    root = re.match(r"(.*)/bin[^/]*/Runner\.Worker", w.args)
+    cwd = root_cwd(step.pid, step.lstart)
+    return {"pid": pid, "runner_name": runner_name(root.group(1)) if root else "", "project": project_of(cwd),
+            "ctype": core.command_type(step.args), "cwd": cwd, "cmd": step.args, "granted": w.started,
+            "rss_gb": round(rss_gb(tree, procs), 1), "cpu_pct": round(cpu_pct(tree, procs), 1)}
+
+
+def outside_and_runner(outside_roots, trees, procs, total_gb, jobs):
+    """Memory and CPU of the builds running without a slot, each one named, and of the runner's jobs (worker pid ->
+    its tree)."""
     outside = set().union(*(trees[f"p{pid}"] for pid in outside_roots))  # a shared daemon counts once
     builds = []
     for pid in outside_roots:
@@ -144,7 +167,8 @@ def outside_and_runner(outside_roots, trees, procs, total_gb):
                        "cwd": root_cwd(pid, r.lstart), "cmd": r.args, "granted": r.started, "status": r.status,
                        "rss_gb": round(rss_gb(tree, procs), 1), "cpu_pct": round(cpu_pct(tree, procs), 1)})
     return {"outside": {**load(outside, procs, total_gb), "n": len(outside_roots), "builds": builds},
-            "runner": load(trees["runner"], procs, total_gb)}
+            "runner": load(trees["runner"], procs, total_gb),
+            "runners": [runner_job(pid, tree, procs) for pid, tree in jobs.items()]}
 
 
 def read_calls():
@@ -249,6 +273,7 @@ class Queue:
         self.now_gb = {}  # granted ticket id -> memory at the last tick, GB
         self.now_cpu = {}  # active ticket id -> CPU at the last tick, % of the machine
         self.loads = {}  # "outside" / "runner" -> memory and CPU at the last tick
+        self.runner_peak = {}  # runner worker pid -> most GB its job reached
         self.cpu_total = 0.0
         self.taken_calls = set()  # hook records already matched to a ticket
         self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
@@ -354,6 +379,7 @@ class Queue:
         trees = {f"p{r.pid}": tree_pids({r.pid}, procs, serving, kotlin_of) for r in roots}
         workers = {p.pid for p in procs.values() if p.kind == "runner_worker"}
         trees["runner"] = tree_pids(workers, procs, serving, kotlin_of)
+        jobs = {w: tree_pids({w}, procs, serving, kotlin_of) for w in workers}
         rss = {k: rss_gb(v, procs) for k, v in trees.items()}
         self.cpu_total = system.cpu_total()
         self.swap_samples.append((now, mem["swap_used_gb"]))
@@ -373,7 +399,12 @@ class Queue:
                            estimates=self.estimates(peaks), ceiling=ceiling, swap_gb=swap_gb, rss_gb=rss,
                            peaks=peaks, remaining={k: gb for k, gb in remaining.items() if gb is not None})
             self.end_outside(pl.outside, roots, procs)
-            self.loads = outside_and_runner(pl.outside, trees, procs, mem["total_gb"])
+            self.loads = outside_and_runner(pl.outside, trees, procs, mem["total_gb"], jobs)
+            self.runner_peak = {r["pid"]: max(r["rss_gb"], self.runner_peak.get(r["pid"], 0.0))
+                                for r in self.loads["runners"]}
+            for r in self.loads["runners"]:  # the queue reserves the runner_ctype estimate for the runner
+                r["estimate_gb"] = round(core.estimate_gb(core.RUNNER_CTYPE, peaks), 1)
+                r["peak_gb"] = self.runner_peak[r["pid"]]
             for b in self.loads["outside"]["builds"]:  # the Running table's row of each build without a ticket
                 cp = procs[b["pid"]].env.get("CLAUDE_PID", "")
                 b["claude_pid"] = int(cp) if cp.isdigit() else None
@@ -609,6 +640,7 @@ class Queue:
             "cpu_total_pct": round(self.cpu_total, 1), "builds_gb": round(sum(self.now_gb.values()), 1),
             "builds_cpu_pct": round(sum(c for tid, c in self.now_cpu.items() if tid in self.now_gb), 1),
             "outside": self.loads.get("outside", {"n": 0, "builds": []}), "runner_load": self.loads.get("runner"),
+            "runners": self.loads.get("runners", []),
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
             "would_kill": would_kill,

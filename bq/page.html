@@ -668,7 +668,8 @@ const PROC_COLS = [
   { k: "cmd", t: "col.cmd", w: 520, f: r => `<code>${esc(r.cmd)}</code>` },
 ];
 // a build outside the queue has no ticket: its # is the warning triangle, its state the tooltip
-const T_ID = { k: "id", t: "#", num: true, w: 50, f: t => t.outside ? triangle(tr(t.status)) : esc(t.id) };
+const T_ID = { k: "id", t: "#", num: true, w: 50,
+  f: t => t.outside ? triangle(tr(t.status)) : t.runner ? "CI" : esc(t.id) };
 const T_AGENT = { k: "agent", t: "col.agent", w: 220, f: t => agentLink(t.claude_pid, t.agent, t.agent_alive) };
 const T_PID = { k: "pid", t: "col.gq_pid", num: true, w: 70, f: t => procLink(t.pid) };
 const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
@@ -751,8 +752,10 @@ function render(v) {
   document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
   const outsideRows = (v.outside.builds || []).map(b => ({ ...b, outside: true }));
+  const runnerRows = (v.runners || []).map(r =>
+    ({ ...r, runner: true, agent: [T("card.runner"), r.runner_name].filter(Boolean).join(" · ") }));
   TICKET_TABLES.forEach(([id, , has, cols]) =>
-    grid(id, cols, [...v.tickets.filter(has), ...(id === "running" ? outsideRows : [])]));
+    grid(id, cols, [...v.tickets.filter(has), ...(id === "running" ? [...runnerRows, ...outsideRows] : [])]));
   grid("agents", [
     { k: "label", t: "col.agent", w: 280, f: a => agentLink(a.pid, a.label) },
     { k: "pid", t: "col.claude_pid", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " " + esc(T("dead"))) },

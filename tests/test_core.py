@@ -400,12 +400,34 @@ class TicketMemory(unittest.TestCase):
             self.assertEqual(server.project_of(""), "")
             procs = world(P(400, 1, CLIENT), P(410, 400, "java GradleWorkerMain"))
             with mock.patch.object(server.system, "cwd_of", return_value=str(wt / "backend")):
-                loads = server.outside_and_runner([400], {"p400": {400, 410}, "runner": set()}, procs, total_gb=1)
+                loads = server.outside_and_runner([400], {"p400": {400, 410}, "runner": set()}, procs, 1, {})
         self.assertEqual(loads["outside"]["n"], 1)
         self.assertEqual(loads["outside"]["builds"],
                          [{"pid": 400, "project": "repo-wt", "ctype": core.command_type(CLIENT),
                            "cwd": str(wt / "backend"), "cmd": CLIENT, "granted": 0.0, "status": "",
                            "rss_gb": 0.0, "cpu_pct": 0.0}])
+
+    def test_each_runner_job_is_a_row_named_by_the_runner_with_its_gradle_step(self):
+        from unittest import mock
+        from bq import server
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, agent in (("a", "mac-a"), ("b", None)):
+                Path(tmp, name).mkdir()
+                if agent:
+                    Path(tmp, name, ".runner").write_text('\ufeff{"agentName": "%s"}' % agent, encoding="utf-8")
+            step = "/bin/bash -e /r/_work/_temp/s.sh"
+            procs = world(P(300, 1, f"{tmp}/a/bin.2.338.2/Runner.Worker spawnclient 163 166"),
+                          P(310, 300, step), P(320, 310, CLIENT), P(330, 1, DAEMON),
+                          P(400, 1, f"{tmp}/b/bin/Runner.Worker spawnclient 1 2"), P(410, 400, step))
+            procs[310].started, procs[410].started = 5.0, 6.0
+            jobs = {300: {300, 310, 320, 330}, 400: {400, 410}}
+            core.classify(procs)
+            server.root_cwd.cache_clear()  # other tests looked up the same pids
+            with mock.patch.object(server.system, "cwd_of", return_value="/r/_work/Health-Hub/Health-Hub"):
+                rows = server.outside_and_runner([], {"runner": {300, 310, 320, 330, 400, 410}}, procs, 1, jobs)["runners"]
+        self.assertEqual([(r["pid"], r["runner_name"], r["cmd"], r["ctype"], r["project"], r["rss_gb"]) for r in rows],
+                         [(300, "mac-a", CLIENT, core.command_type(CLIENT), "Health-Hub", 0.0),
+                          (400, "b", step, "other", "Health-Hub", 0.0)])
 
     def test_every_worktree_of_a_repo_shares_the_main_checkout(self):
         from bq import server
