@@ -102,6 +102,11 @@ TOOLCHAIN_KINDS = {"node", "cc", "bazel", "dotnet", "msbuild", "swift", "cargo",
 # Build servers these toolchains leave behind; they die with their agent. IDE language servers are not here.
 DAEMON_KINDS = {"msbuild_node", "vbcscompiler", "razor_server", "bazel_server", "tsc_watch", "eslint_d"}
 INFRA_KINDS |= DAEMON_KINDS  # a bazel action or an MSBuild Exec task runs under the server, not under a gq
+# A booted Android emulator (`emulator -avd X` execs into qemu-system-*) or iOS simulator device (one launchd_sim each,
+# with every process of the device under it). Shown in the Running table; never queued nor killed.
+DEVICE_KINDS = {"android_emulator", "ios_simulator"}
+AVD = re.compile(r"(?:^|\s)(?:-avd\s+|@)(\S+)")
+SIM_DEVICE = re.compile(r"(\S*/Devices/([0-9A-Fa-f-]{36}))/")
 # Compiler processes only ever run under a build driver; once init adopted one, nobody reads its output.
 COMPILER = re.compile(r"(cc1(plus|obj)?|clang(\+\+)?|gcc|g\+\+|cc|c\+\+)(-[\d.]+)?|swift-frontend|rustc")
 
@@ -143,6 +148,10 @@ def kind_of(args):
         return "gradle_client"
     if "Runner.Worker" in args:
         return "runner_worker"
+    if (exe == "emulator" or exe.startswith("qemu-system")) and AVD.search(args):
+        return "android_emulator"
+    if exe == "launchd_sim":
+        return "ios_simulator"
     if exe == "claude" or "/.local/share/claude/versions/" in first:
         return "claude"
     if re.search(r"/gq(\.py)? run(\s|$)", args) or args.startswith("gq run"):
@@ -319,6 +328,32 @@ def classify(procs, protected_pids=()):
         for d in descendants(r.pid, procs):
             procs[d].root = r.pid
     return roots
+
+
+def device_roots(procs):
+    """The top process of each running emulator or simulator; a launcher that did not exec stands for its qemu."""
+    return [p for p in procs.values() if p.kind in DEVICE_KINDS
+            and not any(a.kind in DEVICE_KINDS for a in ancestors(p.pid, procs))]
+
+
+def claude_of(p, procs):
+    """The agent's claude pid: CLAUDE_PID, else the claude process above it. macOS hides the env of Apple's own
+    tools (`simctl`), and the Bash tool's shell exports CLAUDE_PID only to its children."""
+    cp = p.env.get("CLAUDE_PID", "")
+    if cp.isdigit():
+        return int(cp)
+    return next((a.pid for a in ancestors(p.pid, procs) if a.kind == "claude"), None) if p.kind != "claude" else None
+
+
+def device_user(names, procs, mine):
+    """First agent or runner process outside the device (`mine`) whose command line names it by UDID or name
+    (`xcodebuild -destination id=<udid>`, `simctl spawn 'iPhone 16'`); "iPhone 16" does not match "iPhone 16 Pro"."""
+    names = [n for n in names if n]
+    if not names:
+        return None
+    pat = re.compile("|".join(rf"(?<![\w-]){re.escape(n)}(?![\w-]|\s+[\w(])" for n in names), re.I)
+    return next((p for _pid, p in sorted(procs.items()) if p.pid not in mine and p.owner != "protected"
+                 and pat.search(p.args) and (p.owner in ("agent", "runner") or claude_of(p, procs))), None)
 
 
 @dataclass

@@ -7,6 +7,7 @@ read, so agents never race each other: the lock serializes them and the tick dec
 import functools
 import json
 import os
+import plistlib
 import re
 import socket
 import sqlite3
@@ -143,15 +144,55 @@ def runner_name(root):
         return Path(root).name
 
 
+def worker_name(w):
+    """Registered name of the runner a Runner.Worker belongs to; "" when its path does not tell."""
+    root = re.match(r"(.*)/bin[^/]*/Runner\.Worker", w.args)
+    return runner_name(root.group(1)) if root else ""
+
+
+@functools.lru_cache(maxsize=64)
+def sim_info(device_dir, lstart):  # lstart keys the cache, so a renamed device is read again at its next boot
+    """(name, runtime) of a simulator device from its device.plist: ("iPhone 16", "iOS 18.5")."""
+    try:
+        with open(Path(device_dir, "device.plist"), "rb") as f:
+            d = plistlib.load(f)
+        runtime = str(d.get("runtime", "")).rsplit(".", 1)[-1]  # com.apple.CoreSimulator.SimRuntime.iOS-18-5
+        return str(d.get("name", "")), re.sub(r"-(\d+)-(\d+)$", r" \1.\2", runtime)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return "", ""
+
+
+def device_row(p, procs):
+    """The Running table's row of one emulator or simulator: its name, its memory and CPU, and who uses it — the
+    agent or runner that started it (the env it inherited), else the one naming it in a command line."""
+    tree = {p.pid, *core.descendants(p.pid, procs)}
+    if p.kind == "android_emulator":
+        name = core.AVD.search(p.args).group(1)
+        names, cmd = [name], p.args
+    else:
+        m = core.SIM_DEVICE.search(p.args)
+        name, runtime = sim_info(m.group(1), p.lstart) if m else ("", "")
+        names = [m.group(2), name] if m else [name]
+        cmd = " · ".join(x for x in (name, runtime, m and m.group(2)) if x)
+    user = p if p.owner in ("agent", "runner") else core.device_user(names, procs, tree)
+    cwd = root_cwd(user.pid, user.lstart) if user else ""
+    worker = None if not user or user.owner != "runner" else user if user.kind == "runner_worker" \
+        else next((a for a in core.ancestors(user.pid, procs) if a.kind == "runner_worker"), None)
+    return {"pid": p.pid, "device": "android" if p.kind == "android_emulator" else "ios", "name": name,
+            "ctype": p.kind.replace("_", "-"), "project": project_of(cwd), "cwd": cwd, "cmd": cmd,
+            "granted": p.started, "claude_pid": core.claude_of(user, procs) if user and user.owner != "runner" else None,
+            "runner_name": (worker_name(worker) if worker else "") if user and user.owner == "runner" else None,
+            "rss_gb": round(rss_gb(tree, procs), 1), "cpu_pct": round(cpu_pct(tree, procs), 1)}
+
+
 def runner_job(pid, tree, procs):
     """The Running table's row of one GitHub runner job: the step it runs now, its Gradle command when it has one."""
     w = procs[pid]
     steps = [procs[x] for x in tree if procs[x].kind == "gradle_client"] \
         or [procs[x] for x in tree if procs[x].ppid == pid] or [w]
     step = max(steps, key=lambda p: p.started)
-    root = re.match(r"(.*)/bin[^/]*/Runner\.Worker", w.args)
     cwd = root_cwd(step.pid, step.lstart)
-    return {"pid": pid, "runner_name": runner_name(root.group(1)) if root else "", "project": project_of(cwd),
+    return {"pid": pid, "runner_name": worker_name(w), "project": project_of(cwd),
             "ctype": core.command_type(step.args), "cwd": cwd, "cmd": step.args, "granted": w.started,
             "rss_gb": round(rss_gb(tree, procs), 1), "cpu_pct": round(cpu_pct(tree, procs), 1)}
 
@@ -274,6 +315,7 @@ class Queue:
         self.now_cpu = {}  # active ticket id -> CPU at the last tick, % of the machine
         self.loads = {}  # "outside" / "runner" -> memory and CPU at the last tick
         self.runner_peak = {}  # runner worker pid -> most GB its job reached
+        self.device_peak = {}  # (emulator or simulator pid, start time) -> most GB it reached
         self.cpu_total = 0.0
         self.taken_calls = set()  # hook records already matched to a ticket
         self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
@@ -380,7 +422,9 @@ class Queue:
         trees = {f"p{r.pid}": tree_pids({r.pid}, procs, serving, kotlin_of) for r in roots}
         workers = {p.pid for p in procs.values() if p.kind == "runner_worker"}
         trees["runner"] = tree_pids(workers, procs, serving, kotlin_of)
-        jobs = {w: tree_pids({w}, procs, serving, kotlin_of) for w in workers}
+        devices = core.device_roots(procs)
+        on_device = {x for d in devices for x in (d.pid, *core.descendants(d.pid, procs))}
+        jobs = {w: tree_pids({w}, procs, serving, kotlin_of) - on_device for w in workers}  # an emulator has its own row
         rss = {k: rss_gb(v, procs) for k, v in trees.items()}
         self.cpu_total = system.cpu_total()
         self.swap_samples.append((now, mem["swap_used_gb"]))
@@ -406,6 +450,13 @@ class Queue:
             for r in self.loads["runners"]:  # the queue reserves the runner_ctype estimate for the runner
                 r["estimate_gb"] = round(core.estimate_gb(core.RUNNER_CTYPE, peaks), 1)
                 r["peak_gb"] = self.runner_peak[r["pid"]]
+            self.loads["devices"] = [device_row(d, procs) for d in devices]
+            peak = {(d["pid"], d["granted"]): d["rss_gb"] for d in self.loads["devices"]}
+            self.device_peak = {k: max(gb, self.device_peak.get(k, 0.0)) for k, gb in peak.items()}
+            for d in self.loads["devices"]:
+                d["peak_gb"] = self.device_peak[(d["pid"], d["granted"])]
+                d["agent"] = self.agent_label(d["claude_pid"], procs) if d["claude_pid"] else "—"
+                d["agent_alive"] = d["claude_pid"] in procs if d["claude_pid"] else None
             for b in self.loads["outside"]["builds"]:  # the Running table's row of each build without a ticket
                 cp = procs[b["pid"]].env.get("CLAUDE_PID", "")
                 b["claude_pid"] = int(cp) if cp.isdigit() else None
@@ -628,7 +679,7 @@ class Queue:
                 a["rss"] += p.rss_kb
                 a["cpu"] += p.cpu
                 a["procs"] += 1
-            if p.kind in core.AGENT_EXEC_KINDS | core.INFRA_KINDS | {"gq", "runner_worker", "embedded_pg"} \
+            if p.kind in core.AGENT_EXEC_KINDS | core.INFRA_KINDS | core.DEVICE_KINDS | {"gq", "runner_worker", "embedded_pg"} \
                     or p.root is not None:
                 relevant.append(self.proc_row(p, procs, total_kb, serving))
         relevant.sort(key=lambda r: -r["rss_gb"])
@@ -643,7 +694,7 @@ class Queue:
             "cpu_total_pct": round(self.cpu_total, 1), "builds_gb": round(sum(self.now_gb.values()), 1),
             "builds_cpu_pct": round(sum(c for tid, c in self.now_cpu.items() if tid in self.now_gb), 1),
             "outside": self.loads.get("outside", {"n": 0, "builds": []}), "runner_load": self.loads.get("runner"),
-            "runners": self.loads.get("runners", []),
+            "runners": self.loads.get("runners", []), "devices": self.loads.get("devices", []),
             "estimates": {ct: round(core.estimate_gb(ct, peaks), 1) for ct in core.DEFAULT_GB},
             "counts": pl.counts, "blocked": core.render(pl.blocked), "blocked_msg": pl.blocked, "memory": mem,
             "would_kill": would_kill,

@@ -443,6 +443,38 @@ class TicketMemory(unittest.TestCase):
                          [(300, "mac-a", CLIENT, core.command_type(CLIENT), "Health-Hub", 0.0),
                           (400, "b", step, "other", "Health-Hub", 0.0)])
 
+    def test_emulators_and_simulators_are_rows_owned_by_who_started_or_names_them(self):
+        from unittest import mock
+        from bq import server
+        udid = "71CCFDE2-212F-4BB4-9E30-40207E8A8A5C"
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp, "Devices", udid)
+            dev.mkdir(parents=True)
+            Path(dev, "device.plist").write_bytes(server.plistlib.dumps(
+                {"name": "iPhone 16", "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-18-5"}))
+            sim = f"launchd_sim {dev}/data/var/run/launchd_bootstrap.plist"
+            qemu = "/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd health-hub-ci -no-window"
+            procs = world(P(200, 101, qemu, CLAUDE_PID=100), P(210, 200, "/sdk/emulator/netsimd"),
+                          P(300, 1, sim), P(310, 300, "SpringBoard"),
+                          P(400, 1, "/r/bin.2.338.2/Runner.Worker spawnclient 1 2"),
+                          P(410, 400, "xcrun simctl spawn 'iPhone 16 Pro' x.kexe"),
+                          P(420, 400, "xcodebuild test -destination platform=iOS Simulator,name=iPhone 16,OS=18.5"),
+                          P(500, 1, "/sdk/emulator/emulator @other"), P(510, 500, "qemu-system-x86_64 -avd other"),
+                          P(600, 101, f"simctl spawn {udid} /bin/sleep 9"))  # macOS hides simctl's env
+            core.classify(procs)
+            self.assertEqual(core.claude_of(core.device_user([udid], procs, set()), procs), 100)
+            self.assertEqual([p.pid for p in core.device_roots(procs)], [200, 300, 500])  # 510 runs under its launcher
+            self.assertIsNone(core.device_user(["iPhone 16 Pro Max"], procs, set()))
+            server.root_cwd.cache_clear()
+            with mock.patch.object(server.system, "cwd_of", return_value="/w/Health-Hub"):
+                rows = {r["pid"]: r for r in (server.device_row(p, procs) for p in core.device_roots(procs))}
+        self.assertEqual((rows[200]["name"], rows[200]["ctype"], rows[200]["claude_pid"], rows[200]["runner_name"]),
+                         ("health-hub-ci", "android-emulator", 100, None))
+        self.assertEqual((rows[300]["cmd"], rows[300]["claude_pid"], rows[300]["runner_name"], rows[300]["project"]),
+                         (f"iPhone 16 · iOS 18.5 · {udid}", None, "r", "Health-Hub"))
+        self.assertEqual((rows[500]["name"], rows[500]["claude_pid"], rows[500]["runner_name"], rows[500]["cwd"]),
+                         ("other", None, None, ""))
+
     def test_every_worktree_of_a_repo_shares_the_main_checkout(self):
         from bq import server
         with tempfile.TemporaryDirectory() as tmp:

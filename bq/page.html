@@ -682,7 +682,7 @@ const PROC_COLS = [
 ];
 // a build outside the queue has no ticket: its # is the warning triangle, its state the tooltip
 const T_ID = { k: "id", t: "#", num: true, w: 50,
-  f: t => t.outside ? triangle(tr(t.status)) : t.runner ? "CI" : esc(t.id) };
+  f: t => t.outside ? triangle(tr(t.status)) : t.runner ? "CI" : t.device ? (t.device === "ios" ? "SIM" : "EMU") : esc(t.id) };
 const T_AGENT = { k: "agent", t: "col.agent", w: 220, f: t => agentLink(t.claude_pid, t.agent, t.agent_alive) };
 const T_PID = { k: "pid", t: "col.gq_pid", num: true, w: 70, f: t => procLink(t.pid) };
 const T_TYPE = { k: "ctype", t: "col.type", w: 110 };
@@ -691,7 +691,7 @@ const T_EST = { k: "estimate_gb", t: "col.estimate", num: true, w: 85, f: t => t
 const T_CPU = { k: "cpu_pct", t: "% CPU", num: true, w: 70, f: r => r.cpu_pct != null ? r.cpu_pct + "%" : "" };
 const T_RAM = { k: "rss_gb", t: "col.ram_now", num: true, w: 85, f: t => t.rss_gb != null ? t.rss_gb + " GB" : "" };
 const T_PEAK = { k: "peak_gb", t: "col.peak", num: true, w: 75, f: t => t.peak_gb != null ? t.peak_gb + " GB" : "" };
-const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${esc(t.cwd)}$ ${esc(t.cmd)}</code>` };
+const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${t.cwd ? esc(t.cwd) + "$ " : ""}${esc(t.cmd)}</code>` };
 // end_reason is stored as a plain value ("released", "owner process gone"); unknown values show as stored
 const endReason = t => T("end." + t.end_reason, null, t.end_reason ?? "");
 const T_END = { k: "end_reason", t: "col.end", w: 160, v: endReason,
@@ -767,8 +767,11 @@ function render(v) {
   const outsideRows = (v.outside.builds || []).map(b => ({ ...b, outside: true }));
   const runnerRows = (v.runners || []).map(r =>
     ({ ...r, runner: true, agent: [T("card.runner"), r.runner_name].filter(Boolean).join(" · ") }));
+  // an emulator or simulator: who uses it is a session (agent link) or a runner job (its name)
+  const deviceRows = (v.devices || []).map(d => d.runner_name == null ? d
+    : { ...d, agent: [T("card.runner"), d.runner_name].filter(Boolean).join(" · ") });
   TICKET_TABLES.forEach(([id, , has, cols]) =>
-    grid(id, cols, [...v.tickets.filter(has), ...(id === "running" ? [...runnerRows, ...outsideRows] : [])]));
+    grid(id, cols, [...v.tickets.filter(has), ...(id === "running" ? [...runnerRows, ...deviceRows, ...outsideRows] : [])]));
   grid("agents", [
     { k: "label", t: "col.agent", w: 280, f: a => agentLink(a.pid, a.label) },
     { k: "pid", t: "col.claude_pid", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " " + esc(T("dead"))) },
