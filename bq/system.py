@@ -70,7 +70,8 @@ def snapshot_procs():
         mem = i["memory_info"]
         procs[i["pid"]] = core.Proc(pid=i["pid"], ppid=i["ppid"] or 0, rss_kb=mem.rss // 1024 if mem else 0,
                                     cpu=round(i["cpu_percent"] or 0.0, 1), etime=etime(now - i["create_time"]),
-                                    lstart=lstart(i["create_time"]), args=args, env=env)
+                                    lstart=lstart(i["create_time"]), args=args, env=env,
+                                    started=i["create_time"])
         starts[i["pid"]] = i["create_time"]
     for p in procs.values():  # Windows keeps a dead parent's pid, which a later process may reuse
         if starts.get(p.ppid, 0) > starts[p.pid]:

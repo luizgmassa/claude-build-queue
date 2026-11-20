@@ -115,6 +115,7 @@ class Proc:
     etime: str
     lstart: str
     args: str
+    started: float = 0.0  # create time, epoch seconds
     env: dict = field(default_factory=dict)
     kind: str = "other"
     owner: str = "nonagent"  # agent | runner | protected | nonagent
@@ -235,6 +236,14 @@ def estimate_gb(ctype, peaks):
     """Largest recent measured peak of this command type, or the starting table value."""
     recent = peaks.get(ctype, [])[-PEAK_HISTORY:]
     return max(recent) if recent else DEFAULT_GB.get(ctype, DEFAULT_GB["other"])
+
+
+def remaining_gb(curves, elapsed):
+    """Mean, over past runs of the same build, of the most memory each one still reached from `elapsed` seconds
+    on; a run already over by then counts 0. Each curve is a list of (seconds since start, GB). None without runs."""
+    if not curves:
+        return None
+    return sum(max((gb for t, gb in c if t >= elapsed), default=0.0) for c in curves) / len(curves)
 
 
 def ancestors(pid, procs):
@@ -362,15 +371,17 @@ def extra_refusal(*, used, now, last_extra_ts, avail_gb, reserve_gb, est, ceilin
 
 def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idle_since, last_grant_ts,
          live_claude_pids, last_extra_ts=None, avail_gb=0.0, estimates=None, ceiling=None, swap_gb=0.0,
-         rss_gb=None, peaks=None):
+         rss_gb=None, peaks=None, remaining=None):
     """One scheduling tick. Pure: the caller applies the result under its lock.
 
     The first SLOTS runs enter freely. Each one above them needs memory for its estimate after the peak
     reserve of every running build (`rss_gb`: current GB per holder key, "t<ticket id>", "p<root pid>" or
     "runner"), swap that is not growing, EXTRA_GAP_S since the last extra entry and the configured max.
+    A build with past runs of the same repo and command reserves what those runs still reached from its current
+    age on (`remaining`, by holder key, see remaining_gb) instead of its type estimate.
     """
     out = Plan()
-    estimates, rss_gb, peaks = estimates or {}, rss_gb or {}, peaks or {}
+    estimates, rss_gb, peaks, remaining = estimates or {}, rss_gb or {}, peaks or {}, remaining or {}
     live = []
     for t in tickets:
         p = procs.get(t.pid)
@@ -439,8 +450,9 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
 
     out.used = int(out.runner_busy) + local_active
     default = ("other", DEFAULT_GB["other"])
-    runs = [(estimates.get(t.id, default)[1], rss_gb.get(f"t{t.id}", 0.0)) for t in granted]
-    runs += [(estimate_gb(command_type(r.args), peaks), rss_gb.get(f"p{r.pid}", 0.0)) for r in nonagent + unqueued]
+    runs = [(remaining.get(f"t{t.id}", estimates.get(t.id, default)[1]), rss_gb.get(f"t{t.id}", 0.0)) for t in granted]
+    runs += [(remaining.get(f"p{r.pid}", estimate_gb(command_type(r.args), peaks)), rss_gb.get(f"p{r.pid}", 0.0))
+             for r in nonagent + unqueued]
     if out.runner_busy:
         runs.append((estimate_gb(RUNNER_CTYPE, peaks), rss_gb.get("runner", 0.0)))
     reserve = peak_reserve_gb(runs)
@@ -645,8 +657,68 @@ def analyze_command(cmd, depth=0):
             offending += o
             uses_gq = uses_gq or g
             continue
-        trig = prog in TRIGGERS or (prog == "pod" and rest[:1] in (["install"], ["update"])) \
-            or (prog == "uv" and rest[:1] == ["run"]) or toolchain(prog, rest)
-        if trig and tuple(rest) not in VERSION_ONLY:
+        if _is_build(prog, rest):
             offending.append(" ".join(words)[:120])
     return offending, uses_gq
+
+
+def _is_build(prog, rest):
+    trig = prog in TRIGGERS or (prog == "pod" and rest[:1] in (["install"], ["update"])) \
+        or (prog == "uv" and rest[:1] == ["run"]) or toolchain(prog, rest)
+    return bool(trig) and tuple(rest) not in VERSION_ONLY
+
+
+# `gq` joins its argv without quotes, so `perl -e 'alarm 3000; exec @ARGV' cmd` arrives with a bare `;`
+PERL_ALARM = re.compile(r"\bperl -e alarm\(?\s*\d+\)?;\s*exec\(?\s*@ARGV\)?\s+")
+QUIET = {"-q", "--quiet"}
+SCRIPT_EXT = (".sh", ".bash", ".zsh")
+REDIRECT = re.compile(r"^\d*(>>?|<)")
+
+
+def _build_lines(text):
+    """Each build a shell text runs, as its program and arguments without wrappers, quiet flags or redirections."""
+    try:
+        segs = list(_segments(PERL_ALARM.sub("", text.replace("\\\n", " "))))  # a `\` line continuation
+    except ValueError:
+        return []
+    out = []
+    for words in segs:
+        kept, skip = [], False
+        for w in words:
+            if skip:
+                skip = False
+            elif REDIRECT.match(w):
+                skip = REDIRECT.sub("", w) == ""  # `> f` takes the next word; `>f` and `2>&1` do not
+            else:
+                kept.append(w)
+        prog, rest = _program(kept)
+        if prog and _is_build(prog, rest):
+            out.append(" ".join([prog] + [w for w in rest if w not in QUIET]))
+    return out
+
+
+def script_of(cmd):
+    """(path, arguments) of the shell script a queued command runs (`/tmp/x.sh a`, `zsh x.sh`), or None."""
+    try:
+        words = shlex.split(PERL_ALARM.sub("", cmd))
+    except ValueError:
+        return None
+    prog, rest = _program(words)
+    if prog in ("sh", "bash", "zsh") and rest and not rest[0].startswith("-"):
+        return rest[0], rest[1:]
+    path = words[len(words) - len(rest) - 1] if prog else ""
+    return (path, rest) if path.endswith(SCRIPT_EXT) else None  # shortcut: a script without extension reads as a path
+
+
+def build_key(cmd, script=None):
+    """What, with the repo, groups runs of the same build for its memory curve: the builds the command runs.
+
+    `script` is the text of the shell script the command runs (see script_of): its builds and the script's
+    arguments stand in for its path, so one-off scripts running the same tasks share a key. A command running
+    no build keys by its own words.
+    """
+    inner = _build_lines(script) if script is not None else []
+    if inner:
+        args = [w for w in script_of(cmd)[1] if w not in QUIET]
+        return " ; ".join(inner) + (" | " + " ".join(args) if args else "")
+    return " ; ".join(_build_lines(cmd)) or " ".join(PERL_ALARM.sub("", cmd).split())

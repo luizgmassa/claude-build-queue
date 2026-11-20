@@ -25,7 +25,13 @@ Os números abaixo são os padrões; cada um deles é uma configuração (veja [
   desde a última entrada extra; e a memória disponível do sistema, menos a reserva de pico dos builds em
   execução, menos a estimativa do item, deixa ≥ 6 GB de folga. A reserva de pico de um build em execução é
   a estimativa dele menos a memória que ele usa agora (nunca abaixo de 0): um build recém-iniciado ainda
-  conta a memória que vai tomar. Reservam os builds da fila, o runner (pela estimativa de `gradle-check`) e
+  conta a memória que vai tomar. Um build que já rodou antes (mesmo repo, worktrees juntas, e mesmo build: os
+  comandos de build que ele roda, sem wrappers como `perl -e 'alarm N; exec @ARGV'`, `timeout` ou `env`, flags
+  de silêncio ou redirecionamentos; um script shell vale pelos builds escritos nele mais os seus argumentos; sem
+  execução desse build, as últimas do mesmo repo e tipo de comando) reserva, no lugar da estimativa, a média do maior consumo que cada uma das suas 3 últimas execuções
+  ainda teve daquele segundo em diante, menos o atual: passado o último pico, a reserva cai e a fila anda. Uma
+  execução que já tinha terminado naquele segundo conta 0. Guardam a curva os tickets que saem com exit 0 e
+  os builds sem ticket, desde que medidos desde o início. Reservam os builds da fila, o runner (pela estimativa de `gradle-check`) e
   os builds sem ticket (build de agente sem vaga, build fora de agente, pelo tipo de comando). Quando um
   sinal piora, nada é morto: as entradas extras param até ele passar. `gq config max N` limita as vagas a N
   (no mínimo o número de vagas base); `gq config max off`, o padrão, tira o limite.

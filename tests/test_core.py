@@ -220,7 +220,7 @@ class ExtraSlots(unittest.TestCase):
         return [P(200 + i, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for i in ids]
 
     def run_tick(self, granted, waiting, *, avail=20.0, est=8.0, last_extra=None, pressure=1, extra=(),
-                 rss=None, ceiling=None, swap=0.0, peaks=None):
+                 rss=None, ceiling=None, swap=0.0, peaks=None, remaining=None):
         procs = world(*self.gqs(*granted, *waiting), *extra)
         tickets = [core.Ticket(id=i, pid=200 + i, state="granted", created=0) for i in granted] + \
                   [core.Ticket(id=i, pid=200 + i, state="waiting", created=0) for i in waiting]
@@ -230,7 +230,7 @@ class ExtraSlots(unittest.TestCase):
                          busy_daemons=set(), idle_since={}, last_grant_ts=None, live_claude_pids={100},
                          last_extra_ts=last_extra, avail_gb=avail,
                          estimates={i: ("gradle-check", est) for i in [*granted, *waiting]},
-                         ceiling=ceiling, swap_gb=swap, rss_gb=rss, peaks=peaks or {})
+                         ceiling=ceiling, swap_gb=swap, rss_gb=rss, peaks=peaks or {}, remaining=remaining)
 
     def test_extra_entry_when_memory_covers_estimate_plus_headroom(self):
         pl = self.run_tick([1, 2], [3, 4], avail=20, est=8)
@@ -269,6 +269,35 @@ class ExtraSlots(unittest.TestCase):
         pl = self.run_tick([1], [3], avail=30, est=8, extra=[runner], rss={"t1": 8.0, "runner": 1.0},
                            peaks={"gradle-check": [20.0]})  # the runner's reserve follows the learned estimate
         self.assertIn("19.0 GB reserved", core.render(pl.blocked))
+
+    def test_past_runs_of_the_same_build_lower_the_reserve_after_their_peak(self):
+        curves = [[(0, 1.0), (10, 9.0), (20, 3.0)], [(0, 1.0), (10, 7.0), (30, 2.0)], [(0, 1.0), (15, 5.0)]]
+        self.assertAlmostEqual(core.remaining_gb(curves, 5), 7.0)  # every peak still ahead: (9 + 7 + 5) / 3
+        self.assertAlmostEqual(core.remaining_gb(curves, 20), 5 / 3)  # (3 + 2 + 0): the third run had ended
+        self.assertEqual(core.remaining_gb(curves, 40), 0.0)
+        self.assertIsNone(core.remaining_gb([], 5))
+        rss = {"t1": 2.0, "t2": 8.0}  # t1 is past its peak: 2 GB now, its past runs reached 2.5 GB from here on
+        pl = self.run_tick([1, 2], [3], avail=19, est=8, rss=rss)
+        self.assertEqual(pl.grants, [])
+        pl = self.run_tick([1, 2], [3], avail=19, est=8, rss=rss, remaining={"t1": 2.5})
+        self.assertEqual(pl.grants, [3])
+        self.assertIn("0.5 GB reserved", core.render(pl.extra))
+
+    def test_runs_of_the_same_build_share_a_key_past_wrappers_quiet_flags_and_script_names(self):
+        same = ["perl -e alarm 3000; exec @ARGV ./gradlew :shared:sourceGuardTest -q",  # gq's unquoted argv
+                "./gradlew :shared:sourceGuardTest", "timeout 600 env A=1 ./gradlew --quiet :shared:sourceGuardTest"]
+        self.assertEqual({core.build_key(c) for c in same}, {"gradlew :shared:sourceGuardTest"})
+        self.assertEqual(core.build_key("/usr/bin/git  commit -F -"), "/usr/bin/git commit -F -")  # no build inside
+        script = ("#!/bin/sh\ncd /w || exit 1\n# ./gradlew ignored\n"
+                  "perl -e 'alarm 3000; exec @ARGV' ./gradlew ktlintFormat > /tmp/f.log 2>&1\necho \"EXIT=$?\"\n"
+                  "./gradlew --continue :a:test \\\n  :b:test -q 2>&1 | tail -30\n")
+        self.assertEqual(core.script_of("/tmp/a-1.sh x -q"), ("/tmp/a-1.sh", ["x", "-q"]))
+        self.assertEqual(core.script_of("zsh /tmp/b.sh"), ("/tmp/b.sh", []))
+        self.assertIsNone(core.script_of("./gradlew check"))
+        key = "gradlew ktlintFormat ; gradlew --continue :a:test :b:test"
+        self.assertEqual(core.build_key("/tmp/a-1.sh", script), key)
+        self.assertEqual(core.build_key("perl -e alarm 3000; exec @ARGV /tmp/a-2.sh x -q", script), key + " | x")
+        self.assertEqual(core.build_key("/tmp/c.sh", "git commit -F m\n"), "/tmp/c.sh")  # no build: its own path
 
     def test_growing_swap_stops_extra_entries_but_not_base_slots(self):
         pl = self.run_tick([1, 2], [3], avail=40, swap=core.SWAP_GROWTH_GB)
@@ -360,7 +389,48 @@ class TicketMemory(unittest.TestCase):
                 loads = server.outside_and_runner([400], {"p400": {400, 410}, "runner": set()}, procs, total_gb=1)
         self.assertEqual(loads["outside"]["n"], 1)
         self.assertEqual(loads["outside"]["builds"],
-                         [{"pid": 400, "project": "repo-wt", "ctype": core.command_type(CLIENT)}])
+                         [{"pid": 400, "project": "repo-wt", "ctype": core.command_type(CLIENT),
+                           "cwd": str(wt / "backend"), "cmd": CLIENT, "granted": 0.0, "status": "",
+                           "rss_gb": 0.0, "cpu_pct": 0.0}])
+
+    def test_every_worktree_of_a_repo_shares_the_main_checkout(self):
+        from bq import server
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp, "repo").resolve()
+            (main / ".git/worktrees/wt").mkdir(parents=True)
+            (main / ".git/worktrees/wt/commondir").write_text("../..\n")
+            wt = Path(tmp, "repo-wt").resolve()
+            (wt / "app").mkdir(parents=True)
+            (wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/wt\n")
+            sub = main / "lib"
+            sub.mkdir()
+            (sub / ".git").write_text("gitdir: ../.git/modules/lib")  # a submodule: no commondir
+            self.assertEqual(server.repo_of(str(wt / "app")), str(main))
+            self.assertEqual(server.repo_of(str(main)), str(main))
+            self.assertEqual(server.repo_of(str(sub)), str(sub))
+            self.assertEqual(server.repo_of(str(Path(tmp))), str(Path(tmp)))  # no git: the folder itself
+
+    def test_curves_keep_the_last_three_full_runs_of_each_repo_and_command(self):
+        import sqlite3
+        from types import MethodType, SimpleNamespace
+        from bq import server
+        q = SimpleNamespace(db=sqlite3.connect(":memory:"), curves={})
+        q.db.execute("create table curves (repo text, cmd text, ts real, samples text, ctype text)")
+        for name in ("save_curve", "history", "track", "end_outside"):
+            setattr(q, name, MethodType(getattr(server.Queue, name), q))
+        build = ("/r", "gradlew check", "gradle-check")
+        for peak in (4.0, 6.0, 8.0, 10.0):  # the 4.0 run leaves the history
+            q.save_curve({"build": build, "samples": [(2.0, 1.0), (30.0, peak), (60.0, 2.0)]})
+        q.save_curve({"build": build, "samples": [(server.CURVE_LATE_S + 1, 50.0)]})  # missed its start
+        self.assertEqual(sorted(max(gb for _t, gb in c) for c in q.history(build)), [6.0, 8.0, 10.0])
+        self.assertEqual(q.track("p400", build, "L", 5.0, 1.0), 8.0)  # mean of the peaks still ahead
+        self.assertEqual(q.track("p400", build, "L", 45.0, 1.0), 2.0)
+        self.assertEqual(q.track("p402", ("/r", "gradlew build", "gradle-check"), "L", 5.0, 1.0), 8.0)  # by type
+        self.assertIsNone(q.track("p401", ("/r", "other", "other"), "L", 0.0, 1.0))
+        q.end_outside([400], [], {})  # p400 ran outside the queue and ended; p401 was a root in a slot
+        self.assertEqual(q.curves, {})  # p402 never ran outside the queue either
+        self.assertEqual(len(q.history(build)), 3)
+        self.assertEqual(max(gb for _t, gb in q.history(build)[0]), 1.0)  # the newest run, its two samples
 
     def test_tickets_carry_the_main_page_values_and_a_rounded_peak(self):
         import sqlite3

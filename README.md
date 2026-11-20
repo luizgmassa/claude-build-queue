@@ -25,7 +25,14 @@ The numbers below are the defaults; every one of them is a setting (see [Setting
   passed since the last extra entry; and the system's available memory, minus the peak reserve of the running
   builds, minus the item's estimate, leaves ≥ 6 GB of headroom. A running build's peak reserve is its
   estimate minus its current memory (never below 0): a build that just started still counts the memory it is
-  about to take. Queued builds, the runner (by the `gradle-check` estimate) and builds without a ticket (agent
+  about to take. A build that ran before (same repo, worktrees together, and same build: the build commands it runs,
+  without wrappers such as `perl -e 'alarm N; exec @ARGV'`, `timeout` or `env`, quiet flags or redirections; a
+  shell script counts as the builds written in it plus its arguments; with no run of that build, the last runs
+  of the same repo and command type) reserves,
+  instead of its estimate, the mean of the most memory each of its last 3 runs still used from that second on,
+  minus its current memory: once past the last peak, the reserve drops and the queue moves. A run already over
+  at that second counts 0. Tickets that exit 0 and builds without a ticket keep their curve, when measured from
+  their start. Queued builds, the runner (by the `gradle-check` estimate) and builds without a ticket (agent
   builds without a slot, builds outside an agent, by their command type) all reserve. When a signal turns bad,
   nothing is killed: extra entries stop until it clears. `gq config max N` caps the slots at N (at least the base slots);
   `gq config max off`, the default, removes the cap.

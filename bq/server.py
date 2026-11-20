@@ -30,6 +30,8 @@ PAGE = Path(__file__).with_name("page.html")
 TICK_S = core.SETTINGS["tick_s"]
 STARTED = time.time()  # the page waits for this to change after Save & Apply
 BIND_WAIT_S = 10  # a restart may find the old process still holding the port for a moment
+CURVE_RUNS = 3  # memory curves kept per repo and command
+CURVE_LATE_S = 2 * TICK_S + 5  # a curve whose first sample came later than this missed the start: never stored
 
 
 def busy_daemons(procs, listen, est):
@@ -93,16 +95,54 @@ def project_of(cwd):
     return next((d.name for d in (here, *here.parents) if (d / ".git").exists()), here.name)
 
 
+@functools.lru_cache(maxsize=512)  # shortcut: same as project_of
+def repo_of(cwd):
+    """Main checkout of the git repo holding cwd, so every worktree of a repo shares one history; outside git, cwd."""
+    if not cwd:
+        return ""
+    here = Path(cwd)
+    for d in (here, *here.parents):
+        git = d / ".git"
+        if git.is_dir():
+            return str(d)
+        if git.is_file():  # a worktree: "gitdir: <main>/.git/worktrees/<name>", whose commondir points at <main>/.git
+            try:
+                gitdir = Path(d, git.read_text().split("gitdir:", 1)[1].strip())
+                common = (gitdir / (gitdir / "commondir").read_text().strip()).resolve()
+                return str(common.parent if common.name == ".git" else common)
+            except (OSError, IndexError):  # a submodule has no commondir: its own folder
+                return str(d)
+    return cwd
+
+
+def script_text(cwd, cmd):
+    """Text of the shell script a queued command runs, read when its build starts; None when it runs none."""
+    sc = core.script_of(cmd)
+    try:
+        path = Path(cwd, sc[0]) if sc else None
+        return path.read_text(errors="replace") if path and path.stat().st_size < 256 * 1024 else None
+    except OSError:
+        return None
+
+
 @functools.lru_cache(maxsize=256)
-def root_project(pid, lstart):  # lstart keys the cache, so a reused pid is looked up again
-    return project_of(system.cwd_of(pid))
+def root_cwd(pid, lstart):  # lstart keys the cache, so a reused pid is looked up again
+    return system.cwd_of(pid)
+
+
+def root_project(pid, lstart):
+    return project_of(root_cwd(pid, lstart))
 
 
 def outside_and_runner(outside_roots, trees, procs, total_gb):
     """Memory and CPU of the builds running without a slot, each one named, and of the runner's job."""
     outside = set().union(*(trees[f"p{pid}"] for pid in outside_roots))  # a shared daemon counts once
-    builds = [{"pid": pid, "project": root_project(pid, procs[pid].lstart), "ctype": core.command_type(procs[pid].args)}
-              for pid in outside_roots]
+    builds = []
+    for pid in outside_roots:
+        r, tree = procs[pid], trees[f"p{pid}"]
+        builds.append({"pid": pid, "project": root_project(pid, r.lstart), "ctype": core.command_type(r.args),
+                       "cwd": root_cwd(pid, r.lstart), "cmd": r.args, "granted": r.started, "status": r.status,
+                       "rss_gb": round(rss_gb(tree, procs), 1), "cpu_pct": round(cpu_pct(tree, procs), 1)})
     return {"outside": {**load(outside, procs, total_gb), "n": len(outside_roots), "builds": builds},
             "runner": load(trees["runner"], procs, total_gb)}
 
@@ -185,6 +225,12 @@ class Queue:
         if "subagent" not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
             self.db.execute("alter table tickets add column subagent text")
         self.db.execute("create table if not exists peaks (ctype text, peak_gb real, ts real, ticket int)")
+        self.db.execute("create table if not exists curves (repo text, cmd text, ts real, samples text, ctype text)")
+        if "ctype" not in {r[1] for r in self.db.execute("pragma table_info(curves)")}:
+            self.db.execute("alter table curves add column ctype text")
+            self.db.execute("delete from curves")  # keyed by the raw command line, which one-off scripts never repeat
+        self.db.execute("create index if not exists curves_build on curves (repo, cmd)")
+        self.db.execute("create index if not exists curves_type on curves (repo, ctype)")
         for tid, cmd in self.db.execute("select id, cmd from tickets where ctype is null and state!='done'").fetchall():
             self.db.execute("update tickets set ctype=? where id=?", (core.command_type(cmd or ""), tid))
         self.lock = threading.Lock()
@@ -199,6 +245,7 @@ class Queue:
         self.last_extra = None
         self.swap_samples = deque()  # (ts, swap used GB) within core.SWAP_WINDOW_S
         self.peak = {}  # granted ticket id -> largest memory seen, GB
+        self.curves = {}  # "t<ticket id>" / "p<root pid>" -> {"build": (repo, key, ctype), "lstart", "samples"}
         self.now_gb = {}  # granted ticket id -> memory at the last tick, GB
         self.now_cpu = {}  # active ticket id -> CPU at the last tick, % of the machine
         self.loads = {}  # "outside" / "runner" -> memory and CPU at the last tick
@@ -234,13 +281,44 @@ class Queue:
         return [core.Ticket(*r) for r in rows]
 
     def finish(self, tid, reason, exit_code=None):
-        peak = self.peak.pop(tid, None)
+        peak, curve = self.peak.pop(tid, None), self.curves.pop(f"t{tid}", None)
         cur = self.db.execute("update tickets set state='done', ended=?, end_reason=?, exit_code=?, peak_gb=? "
                               "where id=? and state!='done'", (time.time(), reason, exit_code, peak, tid))
         if cur.rowcount and peak and reason == "released":  # a reaped gq died mid-run: its peak is partial
             ctype = self.db.execute("select ctype from tickets where id=?", (tid,)).fetchone()[0]
             if ctype:
                 self.db.execute("insert into peaks values (?,?,?,?)", (ctype, round(peak, 2), time.time(), tid))
+            if exit_code == 0:
+                self.save_curve(curve)
+
+    def save_curve(self, curve):
+        """Keeps a finished run's memory curve, dropping the build's runs older than the last CURVE_RUNS."""
+        if not curve or not curve["samples"] or curve["samples"][0][0] > CURVE_LATE_S:
+            return
+        repo, key, ctype = curve["build"]
+        self.db.execute("insert into curves (repo, cmd, ts, samples, ctype) values (?,?,?,?,?)",
+                        (repo, key, time.time(), json.dumps(curve["samples"]), ctype))
+        self.db.execute("delete from curves where repo=? and cmd=? and rowid not in "
+                        "(select rowid from curves where repo=? and cmd=? order by rowid desc limit ?)",
+                        (repo, key, repo, key, CURVE_RUNS))
+
+    def history(self, build):
+        """The last CURVE_RUNS curves of the same repo and build key; without any, those of the repo and type."""
+        repo, key, ctype = build
+        for where, args in (("cmd=?", key), ("ctype=?", ctype)):
+            rows = self.db.execute(f"select samples from curves where repo=? and {where} order by rowid desc limit ?",
+                                   (repo, args, CURVE_RUNS)).fetchall()
+            if rows:
+                return [json.loads(s) for (s,) in rows]
+        return []
+
+    def track(self, key, build, lstart, elapsed, gb):
+        """Adds one sample to a running build's curve and returns what its past runs still reached from here on."""
+        c = self.curves.get(key)
+        if not c or c["lstart"] != lstart:  # a reused pid is another build
+            c = self.curves[key] = {"build": build, "lstart": lstart, "samples": []}
+        c["samples"].append((round(elapsed, 1), round(gb, 2)))
+        return core.remaining_gb(self.history(build), elapsed)
 
     def peaks(self):
         out = {}
@@ -288,12 +366,22 @@ class Queue:
             rss.update(self.measure_tickets(tickets, procs, (serving, kotlin_of)))
             avail = mem["total_gb"] * mem["free_pct"] / 100
             peaks = self.peaks()
+            remaining = self.track_all(tickets, roots, procs, rss, now)
             pl = core.plan(procs, roots, tickets, snapshot_ts=snap_ts, now=now, pressure=mem["pressure"],
                            busy_daemons=busy, idle_since=self.idle_since, last_grant_ts=self.last_grant,
                            live_claude_pids=live_claude, last_extra_ts=self.last_extra, avail_gb=avail,
                            estimates=self.estimates(peaks), ceiling=ceiling, swap_gb=swap_gb, rss_gb=rss,
-                           peaks=peaks)
+                           peaks=peaks, remaining={k: gb for k, gb in remaining.items() if gb is not None})
+            self.end_outside(pl.outside, roots, procs)
             self.loads = outside_and_runner(pl.outside, trees, procs, mem["total_gb"])
+            for b in self.loads["outside"]["builds"]:  # the Running table's row of each build without a ticket
+                cp = procs[b["pid"]].env.get("CLAUDE_PID", "")
+                b["claude_pid"] = int(cp) if cp.isdigit() else None
+                b["agent"] = self.agent_label(b["claude_pid"], procs) if b["claude_pid"] else "—"
+                b["agent_alive"] = b["claude_pid"] in procs if b["claude_pid"] else None
+                b["estimate_gb"] = round(core.estimate_gb(b["ctype"], peaks), 1)
+                samples = self.curves.get(f"p{b['pid']}", {}).get("samples") or [(0, 0.0)]
+                b["peak_gb"] = round(max(gb for _t, gb in samples), 1)
             if pl.extra:
                 self.last_extra = now
                 self.event("extra", pl.extra)
@@ -318,6 +406,37 @@ class Queue:
             self.escalate(procs)
             self.procs, self.mem, self.serving = procs, mem, serving
             self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill, ceiling, swap_gb)
+
+    def track_all(self, tickets, roots, procs, rss, now):
+        """Samples every running build's memory; returns, by holder key, what its past runs still reached."""
+        out = {}
+        for t in tickets:
+            key = f"t{t.id}"
+            if t.state == "granted" and t.granted and key in rss:
+                if key in self.curves:
+                    build = self.curves[key]["build"]
+                else:
+                    cwd, cmd, ctype = self.db.execute("select cwd, cmd, ctype from tickets where id=?",
+                                                      (t.id,)).fetchone()
+                    cwd, cmd = cwd or "", cmd or ""
+                    build = (repo_of(cwd), core.build_key(cmd, script_text(cwd, cmd)), ctype or "other")
+                out[key] = self.track(key, build, None, now - t.granted, rss[key])
+        for r in roots:  # the plan reads only the roots outside the queue, known after it runs: sample them all
+            key = f"p{r.pid}"
+            if r.owner in ("agent", "nonagent") and key in rss:
+                build = (repo_of(root_cwd(r.pid, r.lstart)), core.build_key(r.args), core.command_type(r.args))
+                out[key] = self.track(key, build, r.lstart, now - r.started, rss[key])
+        return out
+
+    def end_outside(self, outside, roots, procs):
+        """Stores the curve of each build outside the queue whose process ended; forgets the other roots' curves."""
+        for pid in outside:
+            self.curves[f"p{pid}"]["outside"] = True
+        live = {f"p{r.pid}" for r in roots}
+        for key in [k for k in self.curves if k.startswith("p") and k not in live]:
+            c, p = self.curves.pop(key), procs.get(int(key[1:]))
+            if c.get("outside") and (p is None or p.lstart != c["lstart"]):
+                self.save_curve(c)
 
     def measure_tickets(self, tickets, procs, links):
         """Memory and CPU of each live ticket; keeps the peak of a granted one. Returns its memory by "t<id>"."""
