@@ -407,6 +407,20 @@ class TicketMemory(unittest.TestCase):
                            "cwd": str(wt / "backend"), "cmd": CLIENT, "granted": 0.0, "status": "",
                            "rss_gb": 0.0, "cpu_pct": 0.0}])
 
+    def test_detail_dialog_tree_counts_the_daemons_serving_the_build_like_the_table(self):
+        from unittest import mock
+        from bq import server
+        procs = world(P(600, 101, CLIENT, CLAUDE_PID=100), P(700, 1, DAEMON), P(710, 700, "java GradleWorkerMain"),
+                      P(800, 1, KOTLIN))
+        core.classify(procs)
+        q = server.Queue()
+        q.procs, q.mem, q.serving, q.kotlin_of = procs, {"total_gb": 1, "free_pct": 50}, {700: 600}, {700: {800}}
+        with mock.patch.object(server.system, "cwd_of", return_value=""):
+            d = q.proc_details(600)
+        self.assertEqual([r["pid"] for r in d["tree"]][0], 600)
+        self.assertEqual({r["pid"] for r in d["tree"]}, server.tree_pids({600}, procs, q.serving, q.kotlin_of))
+        self.assertEqual(d["tree_rss_gb"], round(4 * 1024 / 1024 ** 2, 2))  # 4 processes, 1 MB each
+
     def test_each_runner_job_is_a_row_named_by_the_runner_with_its_gradle_step(self):
         from unittest import mock
         from bq import server

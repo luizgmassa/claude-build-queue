@@ -278,6 +278,7 @@ class Queue:
         self.taken_calls = set()  # hook records already matched to a ticket
         self.sub_tickets = {}  # active ticket id -> subagent, so its processes carry the subagent label
         self.procs, self.mem = {}, {"total_gb": 0, "free_pct": 0}  # last snapshot, for the detail dialogs
+        self.serving, self.kotlin_of = {}, {}  # daemon links of that snapshot, see busy_daemons
         self.titles = Titles()
 
     def event(self, kind, m):
@@ -435,7 +436,7 @@ class Queue:
                 else:
                     would_kill.append({"pid": pid, "reason": reason})  # reason is a message
             self.escalate(procs)
-            self.procs, self.mem, self.serving = procs, mem, serving
+            self.procs, self.mem, self.serving, self.kotlin_of = procs, mem, serving, kotlin_of
             self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill, ceiling, swap_gb)
 
     def track_all(self, tickets, roots, procs, rss, now):
@@ -562,13 +563,15 @@ class Queue:
     def proc_details(self, pid):
         """Everything known about one process, for the page's dialog."""
         with self.lock:
-            procs, mem, serving = self.procs, self.mem, getattr(self, "serving", {})
+            procs, mem = self.procs, self.mem
+            serving, kotlin_of = self.serving, self.kotlin_of
             p = procs.get(pid)
             if p is None:
                 m = core.msg("error.pid_gone", pid=pid)
                 return {"error": core.render(m), "error_msg": m}
             total_kb = mem["total_gb"] * 1024 ** 2
-            tree = [p] + [procs[d] for d in core.descendants(pid, procs)]
+            # the Running table's memory: with the Gradle and Kotlin daemons that serve this process's build
+            tree = [p] + [procs[x] for x in tree_pids({pid}, procs, serving, kotlin_of) if x != pid]
             out = self.proc_row(p, procs, total_kb, serving)
             tree_kb = sum(q.rss_kb for q in tree)
             out.update(cmd=p.args, lstart=p.lstart, env=p.env, root=p.root,
