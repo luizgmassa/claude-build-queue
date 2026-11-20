@@ -68,7 +68,10 @@ def snapshot_procs():
             args = args.replace("\\", "/")  # one separator for every path rule in core
         env = {k: v for k, v in (i["environ"] or {}).items() if k in core.ENV_KEYS}
         mem = i["memory_info"]
-        procs[i["pid"]] = core.Proc(pid=i["pid"], ppid=i["ppid"] or 0, rss_kb=mem.rss // 1024 if mem else 0,
+        rss_kb = mem.rss // 1024 if mem else 0
+        if sys.platform == "darwin":
+            rss_kb = footprint_kb(i["pid"]) or rss_kb
+        procs[i["pid"]] = core.Proc(pid=i["pid"], ppid=i["ppid"] or 0, rss_kb=rss_kb,
                                     cpu=round(i["cpu_percent"] or 0.0, 1), etime=etime(now - i["create_time"]),
                                     lstart=lstart(i["create_time"]), args=args, env=env,
                                     started=i["create_time"])
@@ -77,6 +80,26 @@ def snapshot_procs():
         if starts.get(p.ppid, 0) > starts[p.pid]:
             p.ppid = 0
     return procs
+
+
+class RusageInfoV0(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [(n, ctypes.c_uint64) for n in (
+        "user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups", "pageins", "wired_size",
+        "resident_size", "phys_footprint", "proc_start_abstime", "proc_exit_abstime")]
+
+
+@functools.cache
+def proc_pid_rusage():
+    f = ctypes.CDLL("/usr/lib/libSystem.B.dylib").proc_pid_rusage
+    f.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(RusageInfoV0)]
+    return f
+
+
+def footprint_kb(pid):
+    """macOS: the footprint Activity Monitor shows. RSS leaves out compressed and swapped pages, which under
+    pressure are most of an idle JVM. 0 when the process is gone or not readable."""
+    r = RusageInfoV0()
+    return r.phys_footprint // 1024 if proc_pid_rusage()(pid, 0, ctypes.byref(r)) == 0 else 0  # 0 = RUSAGE_INFO_V0
 
 
 def tcp_links(procs, names=("java",)):
@@ -102,7 +125,7 @@ def memory():
     out = {"total_gb": round(vm.total / gb, 1), "swap_used_gb": round(sw.used / gb, 1),
            "swap_total_gb": round(sw.total / gb, 1)}
     if sys.platform == "darwin":
-        out.update(macos_memory())
+        out.update(macos_memory(vm.total))
         return out
     free_pct = int(100 * vm.available / vm.total) if vm.total else 0
     out.update(free_pct=free_pct, pressure=pressure(free_pct), app_gb=round(vm.used / gb, 1),
@@ -111,8 +134,8 @@ def memory():
     return out
 
 
-def macos_memory():
-    names = ["kern.memorystatus_vm_pressure_level", "kern.memorystatus_level", "hw.pagesize"]
+def macos_memory(total):
+    names = ["kern.memorystatus_vm_pressure_level", "hw.pagesize"]
     vals = {}
     for line in run(["sysctl"] + names).splitlines():
         k, _, v = line.partition(":")
@@ -124,13 +147,17 @@ def macos_memory():
         if m:
             vm[m.group(1).strip()] = int(m.group(2)) * page
     gb = 1024 ** 3
+    app = vm.get("Anonymous pages", 0) - vm.get("Pages purgeable", 0)
+    wired, compressed = vm.get("Pages wired down", 0), vm.get("Pages occupied by compressor", 0)
     return {
-        "app_gb": round((vm.get("Anonymous pages", 0) - vm.get("Pages purgeable", 0)) / gb, 1),
-        "wired_gb": round(vm.get("Pages wired down", 0) / gb, 1),
-        "compressed_gb": round(vm.get("Pages occupied by compressor", 0) / gb, 1),
+        "app_gb": round(app / gb, 1),
+        "wired_gb": round(wired / gb, 1),
+        "compressed_gb": round(compressed / gb, 1),
         "cached_gb": round(vm.get("File-backed pages", 0) / gb, 1),
         "free_gb": round(vm.get("Pages free", 0) / gb, 1),
-        "free_pct": int(vals.get("kern.memorystatus_level", "0") or 0),
+        # Activity Monitor's "Memory Used" complement. kern.memorystatus_level is not free memory: it counts
+        # every active and inactive page, so it includes the memory apps are using.
+        "free_pct": int(100 * max(0, total - app - wired - compressed) / total) if total else 0,
         "pressure": int(vals.get("kern.memorystatus_vm_pressure_level", "1") or 1),
     }
 

@@ -79,6 +79,16 @@ class System(unittest.TestCase):
         self.assertIn(m["pressure"], (1, 2, 4))
         self.assertGreaterEqual(m["swap_total_gb"], 0)
 
+    @unittest.skipUnless(sys.platform == "darwin", "phys_footprint is macOS only")
+    def test_footprint_counts_memory_the_process_dirtied(self):
+        c = self.child([sys.executable, "-c", "import time; b = bytearray(200 << 20); time.sleep(60)"])
+        time.sleep(1.5)
+        self.assertGreater(system.footprint_kb(c.pid), 200 << 10)
+        self.assertGreater(system.snapshot_procs()[c.pid].rss_kb, 200 << 10)
+        c.kill()
+        c.wait(timeout=10)
+        self.assertEqual(system.footprint_kb(c.pid), 0)
+
     def test_stop_ends_a_process_and_ignores_one_already_gone(self):
         c = self.child(SLEEPER)
         self.assertEqual(system.stop(c.pid), "")
