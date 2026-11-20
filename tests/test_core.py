@@ -452,7 +452,7 @@ class TicketMemory(unittest.TestCase):
             dev.mkdir(parents=True)
             Path(dev, "device.plist").write_bytes(server.plistlib.dumps(
                 {"name": "iPhone 16", "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-18-5"}))
-            sim = f"launchd_sim {dev}/data/var/run/launchd_bootstrap.plist"
+            sim = f"launchd_sim {dev.as_posix()}/data/var/run/launchd_bootstrap.plist"  # snapshot_procs uses /
             qemu = "/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless -avd health-hub-ci -no-window"
             procs = world(P(200, 101, qemu, CLAUDE_PID=100), P(210, 200, "/sdk/emulator/netsimd"),
                           P(300, 1, sim), P(310, 300, "SpringBoard"),
