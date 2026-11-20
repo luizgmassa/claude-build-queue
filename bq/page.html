@@ -26,8 +26,8 @@
   .card b { display: block; font-size: 20px; overflow: hidden; text-overflow: ellipsis;
             font-variant-numeric: tabular-nums; }
   .tri { margin-left: 5px; vertical-align: -1px; cursor: help; }
-  [data-tip] { position: relative; }
-  [data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); z-index: 5;
+  /* one balloon for every [data-tip], fixed to the viewport: a table cell's overflow would clip it */
+  #tip { position: fixed; z-index: 10; pointer-events: none; display: none;
     white-space: pre; background: #2a2a2a; color: #eee; border: 1px solid #555; border-radius: 6px;
     padding: 6px 9px; font-size: 12px; font-weight: normal; box-shadow: 0 4px 12px rgba(0, 0, 0, .5); }
   .ok { color: #6d6; } .warn { color: #fc4; } .bad { color: #f66; }
@@ -653,6 +653,17 @@ document.addEventListener("click", e => {
 // `t` is a translation key; a header no language translates (PID, % RAM) is its own text
 const gb2 = x => x == null ? "" : x.toFixed(2);
 // a small yellow warning triangle; its tooltip is the text in data-tip
+const tipEl = Object.assign(document.createElement("div"), { id: "tip" });
+document.addEventListener("mouseover", e => {
+  const el = e.target.closest("[data-tip]");
+  if (!el) { tipEl.style.display = "none"; return; }
+  (el.closest("dialog") || document.body).appendChild(tipEl);  // an open modal dialog covers anything outside it
+  tipEl.textContent = el.dataset.tip;
+  tipEl.style.display = "block";
+  const r = el.getBoundingClientRect(), w = tipEl.offsetWidth, h = tipEl.offsetHeight;
+  tipEl.style.left = Math.max(4, Math.min(r.left, innerWidth - w - 4)) + "px";
+  tipEl.style.top = (r.bottom + 6 + h > innerHeight ? r.top - 6 - h : r.bottom + 6) + "px";
+});
 const triangle = tip => `<span class="tri" data-tip="${esc(tip)}"><svg viewBox="0 0 16 16" width="13" height="13">`
   + `<path d="M8 1.2 15.3 14.3H.7Z" fill="#e8b500"/><path d="M8 5.6v4.3M8 11.4v1.3" stroke="#111" stroke-width="1.7"/></svg></span>`;
 const PROC_COLS = [
