@@ -283,6 +283,9 @@ def classify(procs, protected_pids=()):
     """Sets kind, owner and root on every process. Returns the exec roots."""
     for p in procs.values():
         p.kind = kind_of(p.args)
+    for p in procs.values():  # a JVM the daemon forks (KGP's cinterop) inherits its -D flags, the daemon marker too
+        if p.kind == "gradle_daemon" and any(a.kind == "gradle_daemon" for a in ancestors(p.pid, procs)):
+            p.kind = "java"
     for p in procs.values():
         anc = list(ancestors(p.pid, procs))
         if "CLAUDE_PID" not in p.env:  # Gradle starts some workers with a clean env; the parent tells the owner

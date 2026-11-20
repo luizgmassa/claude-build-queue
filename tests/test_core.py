@@ -141,6 +141,20 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(tick(procs, busy_queue, idle_since={800: 900}).kills, [(800, core.msg("kill.idle_daemon"))])
         self.assertEqual(tick(procs, busy_queue, busy={800}, idle_since={800: 0}).kills, [])
 
+    def test_jvm_forked_by_a_daemon_with_its_flags_is_not_an_idle_daemon(self):
+        # Real prefix of KGP's cinterop JVM (2026-11-19, pid 78257); the ps log cut the line, the marker is inherited.
+        child = ("/Users/u/.gradle/jdks/azul_systems__inc_-21-aarch64-os_x.2/zulu21.50.19-ca-jdk21.0.11-macosx_aarch64"
+                 "/Contents/Home/bin/java -Dapple.awt.application.name=GradleDaemon -Dfile.separator=/"
+                 " -Didea.io.use.nio2=true -Djava.awt.headless=true -Djava.class.path=/u/kotlin-native/konan/lib/x.jar"
+                 " -Dsun.java.command=org.gradle.launcher.daemon.bootstrap.GradleDaemon 9.0.0"
+                 " org.jetbrains.kotlin.cli.utilities.MainKt cinterop -o /w/shared/build/FirebaseCore.klib")
+        procs = world(P(700, 1, DAEMON, CLAUDE_PID=100), P(710, 700, child, CLAUDE_PID=100),
+                      P(720, 1, DAEMON, CLAUDE_PID=100))
+        self.assertEqual(core.kind_of(child), "gradle_daemon")
+        pl = tick(procs, busy={700}, idle_since={710: 0, 720: 0})
+        self.assertEqual(procs[710].kind, "java")
+        self.assertEqual(pl.kills, [(720, core.msg("kill.idle_daemon"))])
+
     def test_test_worker_under_daemon_is_not_a_root_but_orphaned_worker_dies(self):
         procs = world(P(700, 1, DAEMON, CLAUDE_PID=100),
                       P(710, 700, "/jdk/bin/java -Dorg.gradle.internal.worker.tmpdir=/w Gradle Test Executor 1",
