@@ -20,7 +20,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # ~/.local/bin/gq is a symlink to this file
-from bq import settings  # noqa: E402  (standard library only, like gq itself)
+from bq import remote, settings  # noqa: E402  (standard library only, like gq itself)
 
 SETTINGS = settings.load()
 URL = os.environ.get("BQ_URL", f"http://127.0.0.1:{SETTINGS['port']}")
@@ -90,6 +90,9 @@ def run(cmd):
             except OSError as e:
                 say(f"cannot start {cmd[0]}: {e}")
                 sys.exit(127)
+    code = remote.run(cmd, say, SIGNALS)
+    if code is not None:  # ran on the build machine, which holds its own slot
+        sys.exit(code)
     tid = call_retrying("/api/enqueue", {"pid": os.getpid(), "cwd": os.getcwd(), "cmd": " ".join(cmd),
                                          **agent_identity()})["id"]
     released = False
