@@ -26,7 +26,9 @@ except ImportError:  # Windows: no flock and no native rsync, so the remote path
 # Gradle options whose next argument is a value, not a task (`check -x :shared:iosSimulatorArm64Test`)
 VALUE_OPTIONS = {"-x", "--exclude-task", "--tests", "-p", "--project-dir", "-I", "--init-script", "-c",
                  "--settings-file", "--console"}
-LOCAL_TASKS = ["ktlintFormat", "ios", "generateDummyFramework", "installDebug", "connected"]
+# the last four read keys, a database or a signing file that exist only on this machine (~/.config, the environment)
+LOCAL_TASKS = ["ktlintFormat", "ios", "generateDummyFramework", "installDebug", "connected", "dependencyCheck",
+               "applyMigrations", "assemble", "bundle"]
 PROBE_LIMIT_S = 180
 PROBE_PAUSE_S = 5
 SSH_LOST = 255

@@ -116,7 +116,10 @@ mantém no Salvar e aplicar.
 - `instance`, `zone`, `project` (opcionais, os três ou nenhum): `gcloud compute instances start` antes de cada
   build remota, para ligar uma VM parada do Compute Engine; depois o `gq` espera até 180 s por `ssh … true`.
 - `local_tasks` (opcional): tarefa que contém um destes, sem diferenciar caixa, roda local. Padrão:
-  `ktlintFormat` (reescreve as fontes daqui), `ios`, `generateDummyFramework`, `installDebug`, `connected`.
+  `ktlintFormat` (reescreve as fontes daqui), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
+  e `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: leem chave, banco ou arquivo de assinatura que
+  só existem aqui (`~/.config`, o ambiente). O `gq` não manda variável de ambiente nem arquivo fora do checkout,
+  então nenhum segredo sai desta máquina.
 
 Elegível: `./gradlew …` ou `perl -e '<código>' ./gradlew …` (repassado inteiro, para o `alarm` valer lá), rodado
 dentro de um checkout git, sem tarefa local e sem `-p`/`--project-dir` fora do checkout. Os valores de `-x`,

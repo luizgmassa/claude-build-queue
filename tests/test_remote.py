@@ -150,7 +150,10 @@ class Eligibility(RemoteBase):
         self.configure(CONFIG)
         for cmd in (["./gradlew", "ktlintFormat"], ["./gradlew", ":shared:linkDebugFrameworkIosArm64"],
                     ["./gradlew", ":shared:generateDummyFramework"], ["./gradlew", ":androidApp:installDebug"],
-                    ["./gradlew", "connectedAndroidTest"], ["xcodebuild", "-scheme", "x"], ["pod", "install"],
+                    ["./gradlew", "connectedAndroidTest"], ["./gradlew", "dependencyCheckAnalyze"],
+                    ["./gradlew", "-p", "backend", ":persistence:applyMigrations"],
+                    ["./gradlew", ":androidApp:assembleDebug"], ["./gradlew", ":androidApp:bundleRelease"],
+                    ["xcodebuild", "-scheme", "x"], ["pod", "install"],
                     ["uv", "run", "x.py"], ["node", "x.mjs"], ["/tmp/x.sh", ":shared:check"],
                     ["perl", "-e", "alarm 3; exec @ARGV", "/tmp/x.sh", "check"]):
             self.assertIsNone(self.run_remote(cmd), cmd)
