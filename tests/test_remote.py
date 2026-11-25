@@ -117,6 +117,7 @@ class RemoteBase(unittest.TestCase):
 
 
 class Config(RemoteBase):
+    @POSIX_ONLY
     def test_overflow_limit_defaults_to_60_and_rejects_negative_or_boolean(self):
         self.configure(CONFIG)
         self.assertEqual(remote.config(self.lines.append)["overflow_after_s"], 60)
