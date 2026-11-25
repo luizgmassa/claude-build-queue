@@ -97,6 +97,58 @@ The global `PreToolUse` hook (`bq/hook.py`) denies every Bash call that runs the
 `gq status` prints the slots, memory, why the queue is stopped, and the open tickets; `(ended)` marks a ticket
 whose agent has died. `gq`, the hook and the server log speak English; only the page is translated.
 
+## Remote builds (`remote` in `config.json`)
+
+Off by default. With a `remote` key, an eligible Gradle command overflows to another machine that runs this same
+queue: it waits in the local queue first and goes there only after `overflow_after_s` without a local slot. That machine needs `gq` on the `PATH` of a non-interactive `ssh`
+(`/usr/local/bin`, not `~/.local/bin`) with its server running, `rsync`, and whatever the build reads from
+`local.properties` (the Android SDK through `ANDROID_HOME`, for example), because ignored files are not copied. Edit `config.json` by hand; the page does not show this key and keeps
+it on Save & Apply.
+
+```json
+{"remote": {"host": "me@build-vm", "root": "~/remote-builds",
+  "ssh_options": ["-i", "~/.ssh/google_compute_engine"],
+  "instance": "build-vm", "zone": "us-central1-a", "project": "my-project"}}
+```
+
+- `host` (required): the `ssh` target. `root` (required): where the checkouts live there; `~/x` is relative to
+  the remote home.
+- `ssh_options` (optional): extra `ssh` arguments, also used by `rsync`.
+- `instance`, `zone`, `project` (optional, all three or none): `gcloud compute instances start` before each
+  remote run, so a stopped Compute Engine VM comes up; then `gq` waits up to 180 s for `ssh … true`.
+- `overflow_after_s` (optional, seconds, default 60): how long a ticket waits locally before trying the other
+  machine. The wait is checked on each queue answer (up to 25 s apart), so 60 means 60 to 85 s. `0` overflows
+  every ticket that is not granted at once.
+- `local_tasks` (optional): a task containing one of these, case-insensitive, runs locally. Default:
+  `ktlintFormat` (it rewrites the sources here), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
+  and `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: they read keys, a database or a signing file
+  that exist only here (`~/.config`, the environment). `gq` sends no environment variable and no file outside
+  the checkout, so no secret leaves this machine.
+
+Eligible: `./gradlew …` or `perl -e '<code>' ./gradlew …` (passed whole, so the `alarm` applies remotely), run
+inside a git checkout, with no local task and no `-p`/`--project-dir` outside the checkout. Values of `-x`,
+`--tests`, `-p`, `-I`, `-c` and `--console` are not tasks. Everything else (`xcodebuild`, `pod`, `uv`, `node`,
+a script, a nested `gq`) stays local.
+
+A remote run keeps the local ticket waiting while the machine starts and the checkout is copied. If a local slot
+comes free meanwhile, the build runs here (`[gq] ticket #<n>: a local slot came free while the build machine
+started; running here`). Otherwise `gq` releases the ticket and:
+
+1. copies the checkout to `<root>/<main repository>/<worktree>` with `rsync --delete`, leaving out `/.git` and
+   every file `.gitignore` ignores (`local.properties` included); the remote `build/`, `.gradle/` and
+   `.kotlin/` survive, so the remote build stays incremental;
+2. prints `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && gq run -- <cmd>'`;
+3. copies `build/reports/`, `build/test-results/` and `build/outputs/` of every project back, even when the
+   build fails, and exits with the remote exit code.
+
+If the VM does not start, `ssh` does not answer or the first copy fails, `gq` prints
+`[gq] remote unavailable (<step>: <error>); running locally` and the ticket keeps waiting locally, in the same
+place; there is one try per run. Once the remote build has
+started it never runs locally: a dropped connection exits 255 with `[gq] remote connection lost`. SIGTERM,
+SIGINT, SIGHUP or SIGALRM on the local `gq` stop `ssh`; the pseudo-TTY makes the remote `gq` get SIGHUP and free
+its slot. An invalid key prints `[gq] remote config ignored (<field>)` and changes nothing. Not on Windows (no
+`flock`, no native `rsync`).
+
 ## Cleanup (`gq enforce on|off`)
 
 In `off` (dry run) the page only lists what it would kill. In `on`:

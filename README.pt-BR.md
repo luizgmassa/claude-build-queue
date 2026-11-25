@@ -96,6 +96,58 @@ e todo `gq run` sem `run_in_background`.
 `gq status` mostra as vagas, a memória, por que a fila está parada e os tickets abertos; `(ended)` marca o
 ticket cujo agente morreu. `gq`, o gancho e o log do servidor falam inglês; só a página é traduzida.
 
+## Builds remotas (`remote` no `config.json`)
+
+Desligado por padrão. Com a chave `remote`, um comando Gradle elegível transborda para outra máquina que roda esta
+mesma fila: espera primeiro na fila local e só vai para lá depois de `overflow_after_s` sem vaga local. Essa máquina precisa do `gq` no `PATH` de um `ssh` não interativo
+(`/usr/local/bin`, não `~/.local/bin`) com o servidor rodando, de `rsync` e do que a build lê do
+`local.properties` (o SDK do Android por `ANDROID_HOME`, por exemplo), porque arquivo ignorado não é copiado. Edite o `config.json` à mão; a página não mostra essa chave e a
+mantém no Salvar e aplicar.
+
+```json
+{"remote": {"host": "me@build-vm", "root": "~/remote-builds",
+  "ssh_options": ["-i", "~/.ssh/google_compute_engine"],
+  "instance": "build-vm", "zone": "us-central1-a", "project": "my-project"}}
+```
+
+- `host` (obrigatório): o alvo do `ssh`. `root` (obrigatório): onde ficam as cópias lá; `~/x` é relativo ao
+  home remoto.
+- `ssh_options` (opcional): argumentos a mais do `ssh`, usados também pelo `rsync`.
+- `instance`, `zone`, `project` (opcionais, os três ou nenhum): `gcloud compute instances start` antes de cada
+  build remota, para ligar uma VM parada do Compute Engine; depois o `gq` espera até 180 s por `ssh … true`.
+- `overflow_after_s` (opcional, segundos, padrão 60): quanto o ticket espera na fila local antes de tentar a outra
+  máquina. A espera é lida a cada resposta da fila (até 25 s entre elas), então 60 vira de 60 a 85 s. Com `0`,
+  todo ticket que não ganha vaga na hora transborda.
+- `local_tasks` (opcional): tarefa que contém um destes, sem diferenciar caixa, roda local. Padrão:
+  `ktlintFormat` (reescreve as fontes daqui), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
+  e `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: leem chave, banco ou arquivo de assinatura que
+  só existem aqui (`~/.config`, o ambiente). O `gq` não manda variável de ambiente nem arquivo fora do checkout,
+  então nenhum segredo sai desta máquina.
+
+Elegível: `./gradlew …` ou `perl -e '<código>' ./gradlew …` (repassado inteiro, para o `alarm` valer lá), rodado
+dentro de um checkout git, sem tarefa local e sem `-p`/`--project-dir` fora do checkout. Os valores de `-x`,
+`--tests`, `-p`, `-I`, `-c` e `--console` não são tarefas. Todo o resto (`xcodebuild`, `pod`, `uv`, `node`, um
+script, um `gq` aninhado) fica local.
+
+Uma build remota mantém o ticket local esperando enquanto a máquina liga e o checkout é copiado. Se uma vaga local
+sair nesse meio-tempo, a build roda aqui (`[gq] ticket #<n>: a local slot came free while the build machine
+started; running here`). Senão, o `gq` solta o ticket e:
+
+1. copia o checkout para `<root>/<repositório principal>/<worktree>` com `rsync --delete`, sem `/.git` e sem
+   todo arquivo que o `.gitignore` ignora (`local.properties` incluído); `build/`, `.gradle/` e `.kotlin/` remotos
+   sobrevivem, e a build remota continua incremental;
+2. imprime `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && gq run -- <cmd>'`;
+3. traz de volta `build/reports/`, `build/test-results/` e `build/outputs/` de todo projeto, mesmo quando a
+   build falha, e sai com o código de saída remoto.
+
+Se a VM não liga, o `ssh` não responde ou a primeira cópia falha, o `gq` imprime
+`[gq] remote unavailable (<passo>: <erro>); running locally` e o ticket continua na fila local, no mesmo lugar;
+é uma tentativa por build. Depois que a build remota
+começou ela nunca roda local: conexão perdida sai com 255 e `[gq] remote connection lost`. SIGTERM, SIGINT,
+SIGHUP ou SIGALRM no `gq` local derrubam o `ssh`; a pseudo-TTY faz o `gq` remoto receber SIGHUP e liberar a vaga.
+Chave inválida imprime `[gq] remote config ignored (<campo>)` e não muda nada. Não existe no Windows (sem
+`flock`, sem `rsync` nativo).
+
 ## Limpeza (`gq enforce on|off`)
 
 Em `off` (simulação) a página só lista o que mataria. Em `on`:
