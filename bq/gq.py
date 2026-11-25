@@ -73,26 +73,45 @@ def windows_program(cmd):
     return [shutil.which(name) or name] + cmd[1:]
 
 
+def run_nested(cmd):
+    """A call inside a granted run takes the same slot, with no new ticket; returns only when the parent is not granted."""
+    parent = os.environ.get("BQ_TICKET", "")
+    if not parent.isdigit():
+        return
+    try:
+        granted = call(f"/api/ticket?id={parent}", timeout=5).get("state") == "granted"
+    except (urllib.error.URLError, OSError, ValueError):
+        granted = False
+    if not granted:
+        return
+    if os.name == "nt":  # Windows exec spawns and exits at once, so the caller would stop waiting
+        sys.exit(subprocess.call(cmd))
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        say(f"cannot start {cmd[0]}: {e}")
+        sys.exit(127)
+
+
+def try_overflow(j, tid, release, arm):
+    """One try on the build machine: True when a local slot came free meanwhile; exits once the build ran there."""
+    if not remote.start(j, say):
+        return False
+    if call_retrying(f"/api/ticket?id={tid}").get("state") == "granted":
+        say(f"ticket #{tid}: a local slot came free while the build machine started; running here")
+        return True
+    code = remote.execute(j, say, SIGNALS, started=lambda: release(None))
+    if code is not None:  # ran on the build machine, which holds its own slot
+        sys.exit(code)
+    arm()  # ssh did not start: the ticket is still waiting here
+    return False
+
+
 def run(cmd):
     if os.name == "nt":
         cmd = windows_program(cmd)
-    parent = os.environ.get("BQ_TICKET", "")
-    if parent.isdigit():
-        try:
-            granted = call(f"/api/ticket?id={parent}", timeout=5).get("state") == "granted"
-        except (urllib.error.URLError, OSError, ValueError):
-            granted = False
-        if granted:  # nested call inside a granted run: same slot, no new ticket
-            if os.name == "nt":  # Windows exec spawns and exits at once, so the caller would stop waiting
-                sys.exit(subprocess.call(cmd))
-            try:
-                os.execvp(cmd[0], cmd)
-            except OSError as e:
-                say(f"cannot start {cmd[0]}: {e}")
-                sys.exit(127)
-    code = remote.run(cmd, say, SIGNALS)
-    if code is not None:  # ran on the build machine, which holds its own slot
-        sys.exit(code)
+    run_nested(cmd)
+    overflow = remote.plan(cmd, say)
     tid = call_retrying("/api/enqueue", {"pid": os.getpid(), "cwd": os.getcwd(), "cmd": " ".join(cmd),
                                          **agent_identity()})["id"]
     released = False
@@ -110,9 +129,11 @@ def run(cmd):
         release(128 + signum)
         sys.exit(128 + signum)
 
-    for s in SIGNALS:
-        signal.signal(s, abort)
+    def arm():
+        for s in SIGNALS:
+            signal.signal(s, abort)
 
+    arm()
     last, started = None, time.time()
     while True:
         st = call_retrying(f"/api/wait?id={tid}&timeout=25")
@@ -125,6 +146,11 @@ def run(cmd):
         if msg != last:
             say(msg + f" ({int(time.time() - started)}s)")
             last = msg
+        if overflow is not None and time.time() - started >= overflow.cfg["overflow_after_s"]:
+            j, overflow = overflow, None  # one try per run: an unavailable machine leaves the ticket waiting here
+            say(f"ticket #{tid}: waited {int(time.time() - started)}s; trying the build machine")
+            if try_overflow(j, tid, release, arm):
+                break
     say(f"ticket #{tid}: slot granted after {int(time.time() - started)}s; running")
 
     try:

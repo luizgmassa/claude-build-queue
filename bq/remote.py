@@ -1,8 +1,10 @@
-"""Remote builds: `gq run` sends an eligible Gradle command to a build machine over ssh.
+"""Remote builds: `gq run` overflows an eligible Gradle command to a build machine over ssh.
 
-Off unless config.json has a `remote` key. An eligible command copies the checkout there with rsync, runs
+Off unless config.json has a `remote` key. An eligible command waits in the local queue first; once it has waited
+`overflow_after_s` (60 s by default), gq starts the machine and copies the checkout there with rsync while the
+ticket keeps its place. If a local slot came free meanwhile the build runs here; otherwise gq drops the ticket, runs
 `gq run` on that machine (its own queue holds the slot), copies the reports back and exits with the remote code.
-Anything that keeps it from starting falls back to the local queue; a build that started remotely never runs
+Anything that keeps it from starting leaves the command in the local queue; a build that started remotely never runs
 locally. Standard library only, like gq.
 """
 
@@ -80,9 +82,15 @@ def _text_list(value):
     return isinstance(value, list) and all(map(_text, value))
 
 
+def _seconds(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
 START = ("instance", "zone", "project")
 REQUIRED = {"host": _text, "root": _text}
-OPTIONAL = {**{k: _text for k in START}, "ssh_options": _text_list, "local_tasks": _text_list}
+OPTIONAL = {**{k: _text for k in START}, "ssh_options": _text_list, "local_tasks": _text_list,
+            "overflow_after_s": _seconds}
+OVERFLOW_AFTER_S = 60
 
 
 def _invalid_field(r):
@@ -104,7 +112,8 @@ def config(say):
     r = raw["remote"]
     start = [r.get(k) for k in START]
     return {"host": r["host"], "root": r["root"], "ssh_options": r.get("ssh_options", []),
-            "local_tasks": r.get("local_tasks", LOCAL_TASKS), "start": start if all(start) else None}
+            "local_tasks": r.get("local_tasks", LOCAL_TASKS), "start": start if all(start) else None,
+            "overflow_after_s": r.get("overflow_after_s", OVERFLOW_AFTER_S)}
 
 
 def gradle_args(cmd):
@@ -241,7 +250,8 @@ def _default(signals):
         signal.signal(s, signal.SIG_DFL)
 
 
-def execute(j, say, signals):
+def execute(j, say, signals, started=lambda: None):
+    """The remote exit code, or None when ssh cannot start; `started` runs once the remote run exists."""
     cfg, line = j.cfg, shlex.join(j.cmd)
     caught, child = [], None
 
@@ -259,6 +269,7 @@ def execute(j, say, signals):
         _default(signals)
         say(f"remote unavailable (ssh: {e}); running locally")
         return None
+    started()
     if caught:  # a signal arrived before the child existed
         child.terminate()
     code = child.wait()
@@ -272,17 +283,17 @@ def execute(j, say, signals):
     return code
 
 
-def run(cmd, say, signals):
-    """The exit code of cmd run on the build machine, or None when gq must run it locally."""
+def plan(cmd, say):
+    """The remote run of cmd when the `remote` key is on and cmd is eligible, None otherwise."""
     cfg = config(say)
-    if cfg is None:
-        return None
-    j = job(cmd, cfg, os.getcwd())
-    if j is None:
-        return None
+    return None if cfg is None else job(cmd, cfg, os.getcwd())
+
+
+def start(j, say):
+    """Starts the machine and copies the checkout; False, with a line, when the remote path cannot start."""
     try:
         prepare(j)
     except Unavailable as e:
         say(f"remote unavailable ({e}); running locally")
-        return None
-    return execute(j, say, signals)
+        return False
+    return True
