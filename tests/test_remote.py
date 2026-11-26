@@ -48,7 +48,7 @@ class FakeShell:
     @staticmethod
     def step(argv):
         if argv[0] == "ssh":
-            return "probe" if argv[-1] == "true" else "mkdir"
+            return "probe" if argv[-1] == "true" else "mkdir" if argv[-1].startswith("mkdir") else "clear"
         if argv[0] == "rsync":
             return "rsync-out" if "--delete" in argv else "rsync-back"
         if argv[0] == "gcloud":
@@ -147,6 +147,17 @@ class Config(RemoteBase):
         self.assertEqual((cfg["slots"], cfg["cap_metadata_key"]), (3, "budget-exceeded"))
         self.assertNotIn("overflow_after_s", cfg)
 
+    @POSIX_ONLY
+    def test_fetch_back_is_an_optional_list_of_patterns(self):
+        self.configure(CONFIG)
+        self.assertEqual(remote.config(self.lines.append)["fetch_back"], [])
+        self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
+        self.assertEqual(remote.config(self.lines.append)["fetch_back"], ["build/generated/openapi/***"])
+        for bad in ("build/x", [""], [3]):
+            self.configure({**CONFIG, "fetch_back": bad})
+            self.assertIsNone(remote.config(self.lines.append))
+        self.assertEqual(self.lines[-1], "remote config ignored (fetch_back)")
+
     def test_without_the_key_nothing_runs(self):
         self.assertIsNone(self.run_remote(["./gradlew", "check"]))
         self.assertEqual((self.shell.calls, self.shell.popened, self.lines), ([], [], []))
@@ -218,7 +229,7 @@ class RemoteRun(RemoteBase):
         self.configure(CONFIG)
         self.shell.child = Child(3)
         self.assertEqual(self.run_remote(["./gradlew", ":shared:testAndroidHostTest"]), 3)
-        self.assertEqual(self.shell.names(), ["git", "probe", "mkdir", "rsync-out", "rsync-back"])
+        self.assertEqual(self.shell.names(), ["git", "probe", "mkdir", "rsync-out", "clear", "rsync-back"])
         dest = "remote-builds/evolvai/wt"
         self.assertEqual(self.shell.argv("mkdir"), ["ssh", *remote.FAIL_FAST, "-i", "~/.ssh/key", HOST,
                                                     f"mkdir -p {dest}"])
@@ -234,6 +245,15 @@ class RemoteRun(RemoteBase):
         self.assertEqual(self.shell.popened, [["ssh", "-tt", *remote.KEEPALIVE, "-i", "~/.ssh/key", HOST,
                                                f"cd {dest} && exec ./gradlew :shared:testAndroidHostTest"]])
         self.assertEqual(self.lines, [f"remote {HOST}: ./gradlew :shared:testAndroidHostTest"])
+
+    def test_fetch_back_patterns_join_the_copy_back(self):
+        self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
+        self.assertEqual(self.run_remote(["./gradlew", ":shared:testAndroidHostTest"]), 0)
+        back = self.shell.argv("rsync-back")
+        for pattern in (*remote.BACK, "build/generated/openapi/***"):
+            self.assertIn(f"--include={pattern}", back)
+        self.assertLess(back.index("--include=build/generated/openapi/***"), back.index("--exclude=*"))
+        self.assertIn("-path '*/build/generated/openapi'", self.shell.argv("clear")[-1])
 
     def test_probe_retries_until_the_vm_answers(self):
         self.configure(CONFIG)
@@ -631,6 +651,24 @@ class RealRsync(RemoteBase):
         self.assertTrue((self.top / "backend/build/test-results/t/TEST-x.xml").exists())
         self.assertFalse((self.top / ".gradle").exists())
         self.assertEqual((self.top / "local.properties").read_text(), "sdk.dir=/here")
+
+    def test_clear_removes_what_comes_back_and_keeps_the_rest(self):
+        remote_dir = self.tmp / "vm"
+        stale = ("build/reports/old", "backend/build/test-results/t", "build/outputs/apk",
+                 "contracts-kotlin/build/generated/openapi/c9")
+        kept = ("build/classes/k", "backend/build/generated/ksp/k", ".gradle/c", "src/build/reportsx")
+        for d in stale + kept:
+            (remote_dir / d).mkdir(parents=True)
+            (remote_dir / d / "f").write_text("x")
+        self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
+        self.run_remote(["./gradlew", "check"])
+        command = self.shell.argv("clear")[-1].split(" && ", 1)[1]
+        out = subprocess.run(["sh", "-c", command], cwd=remote_dir, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for d in stale:
+            self.assertFalse((remote_dir / d).exists(), d)
+        for d in kept:
+            self.assertTrue((remote_dir / d / "f").exists(), d)
 
 
 NOW = 1000.0
