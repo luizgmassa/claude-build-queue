@@ -93,27 +93,28 @@ def run_nested(cmd):
         sys.exit(127)
 
 
-def try_overflow(j, tid, release, arm):
-    """One try on the build machine: True when a local slot came free meanwhile; exits once the build ran there."""
-    if not remote.start(j, say):
-        return False
-    if call_retrying(f"/api/ticket?id={tid}").get("state") == "granted":
-        say(f"ticket #{tid}: a local slot came free while the build machine started; running here")
-        return True
-    code = remote.execute(j, say, SIGNALS, started=lambda: release(None))
-    if code is not None:  # ran on the build machine, which holds its own slot
-        sys.exit(code)
-    arm()  # ssh did not start: the ticket is still waiting here
-    return False
+def run_on_vm(j, tid, release, arm):
+    """Carries out a grant for the build machine: exits with the remote code once the build ran there; returns when it
+    could not start, after handing the ticket back to the queue (the server keeps its place)."""
+    reason = remote.start(j, say)
+    if reason is None:
+        call_retrying("/api/remote", {"id": tid, "phase": "running"})
+        code = remote.execute(j, say, SIGNALS)
+        if code is not None:
+            release(code)
+            sys.exit(code)
+        reason = "ssh"
+    arm()  # execute left the default actions in place when ssh did not start
+    call_retrying("/api/remote", {"id": tid, "phase": "failed", "reason": reason})
 
 
 def run(cmd):
     if os.name == "nt":
         cmd = windows_program(cmd)
     run_nested(cmd)
-    overflow = remote.plan(cmd, say)
+    job = remote.plan(cmd, say)
     tid = call_retrying("/api/enqueue", {"pid": os.getpid(), "cwd": os.getcwd(), "cmd": " ".join(cmd),
-                                         **agent_identity()})["id"]
+                                         "remote": job is not None, **agent_identity()})["id"]
     released = False
 
     def release(code):
@@ -137,6 +138,10 @@ def run(cmd):
     last, started = None, time.time()
     while True:
         st = call_retrying(f"/api/wait?id={tid}&timeout=25")
+        if st["state"] == "granted" and st.get("dest") == "vm" and job is not None:
+            say(f"ticket #{tid}: slot granted on the build machine after {int(time.time() - started)}s")
+            run_on_vm(job, tid, release, arm)
+            continue  # back to waiting, in the same place
         if st["state"] == "granted":
             break
         if st["state"] != "waiting":
@@ -146,11 +151,6 @@ def run(cmd):
         if msg != last:
             say(msg + f" ({int(time.time() - started)}s)")
             last = msg
-        if overflow is not None and time.time() - started >= overflow.cfg["overflow_after_s"]:
-            j, overflow = overflow, None  # one try per run: an unavailable machine leaves the ticket waiting here
-            say(f"ticket #{tid}: waited {int(time.time() - started)}s; trying the build machine")
-            if try_overflow(j, tid, release, arm):
-                break
     say(f"ticket #{tid}: slot granted after {int(time.time() - started)}s; running")
 
     try:

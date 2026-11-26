@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bq import core, service, settings, system  # noqa: E402
+from bq import remote as build_machine  # noqa: E402
 from bq.system import log  # noqa: E402
 
 PORT = int(os.environ.get("BQ_PORT") or core.SETTINGS["port"])  # BQ_PORT wins, so tests never take 8787
@@ -289,6 +290,9 @@ class Queue:
             self.db.execute("alter table tickets add column peak_gb real")
         if "subagent" not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
             self.db.execute("alter table tickets add column subagent text")
+        for col, kind in (("remote", "int"), ("dest", "text"), ("phase", "text")):
+            if col not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
+                self.db.execute(f"alter table tickets add column {col} {kind}")
         self.db.execute("create table if not exists peaks (ctype text, peak_gb real, ts real, ticket int)")
         self.db.execute("create table if not exists curves (repo text, cmd text, ts real, samples text, ctype text)")
         if "ctype" not in {r[1] for r in self.db.execute("pragma table_info(curves)")}:
@@ -308,6 +312,8 @@ class Queue:
         self.view = {}
         self.blocked = None  # message
         self.last_extra = None
+        self.remote_down_until = 0.0  # the build machine is out of the choice until then (a failed start)
+        self.remote_said = None
         self.swap_samples = deque()  # (ts, swap used GB) within core.SWAP_WINDOW_S
         self.peak = {}  # granted ticket id -> largest memory seen, GB
         self.curves = {}  # "t<ticket id>" / "p<root pid>" -> {"build": (repo, key, ctype), "lstart", "samples"}
@@ -344,9 +350,20 @@ class Queue:
         return max(core.SLOTS, n) if isinstance(n, int) and not isinstance(n, bool) else None
 
     def active_tickets(self):
-        rows = self.db.execute("select id, pid, state, created, granted, pid_start from tickets "
+        rows = self.db.execute("select id, pid, state, created, granted, pid_start, remote, dest from tickets "
                                "where state in ('waiting','granted') order by id").fetchall()
-        return [core.Ticket(*r) for r in rows]
+        return [core.Ticket(*r[:6], bool(r[6]), r[7]) for r in rows]
+
+    def remote_view(self, now):
+        """The build machine as the planner sees it, None when the `remote` key is off or invalid."""
+        cfg = build_machine.config(self.remote_log)
+        return None if cfg is None else {"slots": cfg["slots"], "available": now >= self.remote_down_until}
+
+    def remote_log(self, text):
+        """Logs an invalid `remote` key once, not on every tick."""
+        if text != self.remote_said:
+            self.remote_said = text
+            log(text)
 
     def finish(self, tid, reason, exit_code=None):
         peak, curve = self.peak.pop(tid, None), self.curves.pop(f"t{tid}", None)
@@ -442,7 +459,8 @@ class Queue:
                            busy_daemons=busy, idle_since=self.idle_since, last_grant_ts=self.last_grant,
                            live_claude_pids=live_claude, last_extra_ts=self.last_extra, avail_gb=avail,
                            estimates=self.estimates(peaks), ceiling=ceiling, swap_gb=swap_gb, rss_gb=rss,
-                           peaks=peaks, remaining={k: gb for k, gb in remaining.items() if gb is not None})
+                           peaks=peaks, remaining={k: gb for k, gb in remaining.items() if gb is not None},
+                           remote=self.remote_view(now))
             self.end_outside(pl.outside, roots, procs)
             self.loads = outside_and_runner(pl.outside, trees, procs, mem["total_gb"], jobs)
             self.runner_peak = {r["pid"]: max(r["rss_gb"], self.runner_peak.get(r["pid"], 0.0))
@@ -473,11 +491,8 @@ class Queue:
             for tid, reason in pl.reaps:
                 self.finish(tid, reason)
                 self.event("reap", core.msg("event.reap", id=tid, reason=core.msg("end." + reason)))
-            for tid in pl.grants:
-                self.db.execute("update tickets set state='granted', granted=? where id=?", (now, tid))
-                self.last_grant = now
-                self.event("grant", core.msg("event.grant", id=tid))
-            if pl.grants or pl.reaps:
+            self.grant(pl, now)
+            if pl.grants or pl.remote_grants or pl.reaps:
                 self.cond.notify_all()
             self.blocked = pl.blocked
             would_kill = []
@@ -489,6 +504,17 @@ class Queue:
             self.escalate(procs)
             self.procs, self.mem, self.serving, self.kotlin_of = procs, mem, serving, kotlin_of
             self.view = self.build_view(procs, roots, pl, mem, serving, enforce, would_kill, ceiling, swap_gb)
+
+    def grant(self, pl, now):
+        """Writes the destination of each ticket the plan granted: the only moment a ticket has one."""
+        for tid in pl.grants:
+            self.db.execute("update tickets set state='granted', granted=?, dest='mac' where id=?", (now, tid))
+            self.last_grant = now
+            self.event("grant", core.msg("event.grant", id=tid))
+        for tid in pl.remote_grants:
+            self.db.execute("update tickets set state='granted', granted=?, dest='vm', phase='starting' where id=?",
+                            (now, tid))
+            self.event("grant", core.msg("event.grant_vm", id=tid))
 
     def track_all(self, tickets, roots, procs, rss, now):
         """Samples every running build's memory; returns, by holder key, what its past runs still reached."""
@@ -528,7 +554,7 @@ class Queue:
         for t in (t for t in tickets if t.pid in procs):
             pids = ticket_pids(t.pid, t.id, procs, serving, kotlin_of)
             self.now_cpu[t.id] = cpu_pct(pids, procs)
-            if t.state == "granted":
+            if t.state == "granted" and t.dest != "vm":  # the ssh of a remote build says nothing of its memory
                 gb = rss[f"t{t.id}"] = self.now_gb[t.id] = rss_gb(pids, procs)
                 self.peak[t.id] = max(self.peak.get(t.id, 0.0), gb)
         return rss
@@ -590,7 +616,7 @@ class Queue:
 
     def ticket_rows(self, where, args):
         cols = ["id", "pid", "claude_pid", "ralphy", "cwd", "cmd", "state", "created", "granted", "ended",
-                "end_reason", "exit_code", "ctype", "peak_gb", "subagent"]
+                "end_reason", "exit_code", "ctype", "peak_gb", "subagent", "dest", "phase"]
         exprs = ["round(peak_gb, 1)" if c == "peak_gb" else c for c in cols]
         rows = self.db.execute(f"select {', '.join(exprs)} from tickets where {where} order by id", args)
         return [dict(zip(cols, r)) for r in rows.fetchall()]
@@ -726,23 +752,23 @@ class Queue:
                 self.taken_calls.add(call.get("id"))
             subagent = (call.get("agent_type") or call.get("agent_id")) if call.get("agent_id") else None
             cur = self.db.execute(
-                "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created, ctype, subagent) "
-                "values (?,?,?,?,?,?, 'waiting', ?, ?, ?)",
+                "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created, ctype, subagent, "
+                "remote) values (?,?,?,?,?,?, 'waiting', ?, ?, ?, ?)",
                 (int(body["pid"]), body.get("claude_pid"), body.get("ralphy"), body.get("session_id"),
                  str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], now,
-                 core.command_type(str(body.get("cmd", ""))), subagent))
+                 core.command_type(str(body.get("cmd", ""))), subagent, int(body.get("remote") is True)))
             tid = cur.lastrowid
         self.event("enqueue", core.msg("event.enqueue", id=tid, pid=body["pid"], cmd=str(body.get("cmd", ""))[:100]))
         self.wake.set()
         return {"id": tid}
 
     def status(self, tid):
-        row = self.db.execute("select state, end_reason from tickets where id=?", (tid,)).fetchone()
+        row = self.db.execute("select state, end_reason, dest from tickets where id=?", (tid,)).fetchone()
         if not row:
             return {"state": "unknown"}
         ahead = self.db.execute("select count(*) from tickets where state='waiting' and id<?", (tid,)).fetchone()
         waiting = self.db.execute("select count(*) from tickets where state='waiting'").fetchone()
-        return {"state": row[0], "reason": row[1], "position": ahead[0] + 1, "waiting": waiting[0],
+        return {"state": row[0], "reason": row[1], "dest": row[2], "position": ahead[0] + 1, "waiting": waiting[0],
                 "blocked": core.render(self.blocked)}  # English text: gq prints it
 
     def wait(self, tid, timeout):
@@ -754,6 +780,31 @@ class Queue:
                 if st["state"] != "waiting" or left <= 0:
                     return st
                 self.cond.wait(left)
+
+    def remote_phase(self, tid, phase, reason):
+        """The client of a ticket granted for the build machine reports it running, or that it could not start: the
+        ticket goes back to waiting with the same id (the same place) and the machine is out of the choice for a while."""
+        with self.lock:
+            if phase == "running":
+                cur = self.db.execute("update tickets set phase='running' where id=? and dest='vm' and state='granted'",
+                                      (tid,))
+                m = core.msg("event.remote_running", id=tid)
+            elif phase == "failed":
+                cur = self.db.execute("update tickets set state='waiting', granted=null, dest=null, phase=null "
+                                      "where id=? and dest='vm' and state='granted'", (tid,))
+                if cur.rowcount:
+                    self.peak.pop(tid, None)
+                    self.curves.pop(f"t{tid}", None)
+                    self.remote_down_until = time.time() + core.REMOTE_RETRY_S
+                m = core.msg("event.remote_failed", id=tid, reason=str(reason or "")[:300])
+            else:
+                raise ValueError(f"phase {phase!r}")
+            if cur.rowcount:  # a report for a ticket that is no longer on the machine changes nothing
+                self.cond.notify_all()
+        if cur.rowcount:
+            self.event("remote", m)
+            self.wake.set()
+        return {"ok": True}
 
     def release(self, tid, exit_code):
         with self.lock:
@@ -903,6 +954,7 @@ POST_ROUTES = {
     "/api/config": post_config,
     "/api/enqueue": lambda h, body: (Q.enqueue(body), 200),
     "/api/release": lambda h, body: (Q.release(int(body["id"]), body.get("exit_code")), 200),
+    "/api/remote": lambda h, body: (Q.remote_phase(int(body["id"]), body["phase"], body.get("reason")), 200),
 }
 
 

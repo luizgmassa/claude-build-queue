@@ -29,11 +29,11 @@ def world(*procs):
     return {p.pid: p for p in base + list(procs)}
 
 
-def tick(procs, tickets=(), *, pressure=1, busy=(), idle_since=None, now=1000.0, last_grant=None):
+def tick(procs, tickets=(), *, pressure=1, busy=(), idle_since=None, now=1000.0, last_grant=None, **kw):
     roots = core.classify(procs)
     return core.plan(procs, roots, list(tickets), snapshot_ts=now - 1, now=now, pressure=pressure,
                      busy_daemons=set(busy), idle_since=idle_since or {}, last_grant_ts=last_grant,
-                     live_claude_pids={p.pid for p in procs.values() if p.kind == "claude"})
+                     live_claude_pids={p.pid for p in procs.values() if p.kind == "claude"}, **kw)
 
 
 class Scheduling(unittest.TestCase):
@@ -74,6 +74,124 @@ class Scheduling(unittest.TestCase):
     def test_reused_pid_is_detected_by_start_time(self):
         t = core.Ticket(id=1, pid=201, state="granted", created=0, pid_start="OTHER")
         self.assertEqual(tick(world(*self.gqs(1)), [t]).reaps, [(1, "owner process gone")])
+
+
+VM = {"slots": 2, "available": True}
+
+
+class NeutralScheduling(unittest.TestCase):
+    """The Mac stays the default; a full Mac sends eligible waiting tickets to the build machine, within its slots."""
+
+    def ticket(self, i, state="waiting", remote=True, dest=None):
+        return core.Ticket(id=i, pid=200 + i, state=state, created=0, remote=remote, dest=dest)
+
+    def run_plan(self, tickets, remote=VM, **kw):
+        procs = world(*[P(200 + t.id, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)
+                        for t in tickets])
+        return tick(procs, tickets, remote=remote, **kw)
+
+    def full_mac(self):
+        return [self.ticket(1, "granted", dest="mac"), self.ticket(2, "granted", dest="mac")]
+
+    def test_a_free_mac_slot_wins_and_nothing_goes_to_the_machine(self):
+        pl = self.run_plan([self.ticket(1)])
+        self.assertEqual((pl.grants, pl.remote_grants), ([1], []))
+
+    def test_a_full_mac_sends_an_eligible_ticket_to_the_machine(self):
+        pl = self.run_plan(self.full_mac() + [self.ticket(3)])
+        self.assertEqual((pl.grants, pl.remote_grants), ([], [3]))
+
+    def test_a_ticket_without_the_remote_flag_never_goes(self):
+        pl = self.run_plan(self.full_mac() + [self.ticket(3, remote=False)])
+        self.assertEqual(pl.remote_grants, [])
+        self.assertEqual(self.run_plan(self.full_mac() + [self.ticket(3)], remote=None).remote_grants, [])
+
+    def test_the_head_that_only_runs_on_the_mac_keeps_its_place_while_a_later_one_goes(self):
+        tickets = self.full_mac() + [self.ticket(3, remote=False), self.ticket(4), self.ticket(5)]
+        pl = self.run_plan(tickets)
+        self.assertEqual(pl.remote_grants, [4, 5])
+        # the Mac frees a slot: the head, not a later ticket, takes it
+        later = [self.ticket(1, "granted", dest="mac"), self.ticket(3, remote=False), self.ticket(5)]
+        self.assertEqual(self.run_plan(later).grants, [3])
+
+    def test_the_machine_never_exceeds_its_slots(self):
+        tickets = self.full_mac() + [self.ticket(3), self.ticket(4), self.ticket(5)]
+        pl = self.run_plan(tickets)
+        self.assertEqual(pl.remote_grants, [3, 4])
+        running = self.full_mac() + [self.ticket(3, "granted", dest="vm"), self.ticket(4, "granted", dest="vm"),
+                                     self.ticket(5)]
+        self.assertEqual(self.run_plan(running).remote_grants, [])
+        done = running[:3] + [self.ticket(5)]  # one remote build ended
+        self.assertEqual(self.run_plan(done).remote_grants, [5])
+
+    def test_a_remote_ticket_holds_no_mac_slot_from_the_grant_on(self):
+        pl = self.run_plan([self.ticket(1, "granted", dest="vm"), self.ticket(2)])
+        self.assertEqual((pl.used, pl.grants), (1, [2]))  # the new ticket only
+        self.assertEqual(pl.counts["vm"], 1)
+
+    def test_the_gap_between_extras_alone_sends_nobody_to_the_machine(self):
+        pl = self.run_plan(self.full_mac() + [self.ticket(3)], last_extra_ts=999.0, avail_gb=64.0)
+        self.assertEqual((pl.grants, pl.remote_grants), ([], []))
+        self.assertIn("next extra slot", core.render(pl.blocked))
+
+    def test_a_gap_refusal_over_a_memory_refusal_is_a_full_mac(self):
+        pl = self.run_plan(self.full_mac() + [self.ticket(3)], last_extra_ts=999.0, avail_gb=0.0)
+        self.assertEqual((pl.grants, pl.remote_grants), ([], [3]))
+
+    def test_a_daemon_pause_sends_nobody_to_the_machine(self):
+        procs = world(*[P(200 + i, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for i in (3,)],
+                      P(700, 1, DAEMON, CLAUDE_PID=100))
+        pl = tick(procs, [self.ticket(3)], idle_since={700: 0}, remote=VM)
+        self.assertEqual((pl.grants, pl.remote_grants), ([], []))
+        self.assertIn("idle daemon", core.render(pl.blocked))
+
+    def test_critical_pressure_counts_as_a_full_mac(self):
+        pl = self.run_plan([self.ticket(1)], pressure=4)
+        self.assertEqual((pl.grants, pl.remote_grants), ([], [1]))
+
+    def test_an_unavailable_machine_is_out_of_the_choice(self):
+        pl = self.run_plan(self.full_mac() + [self.ticket(3)], remote={"slots": 2, "available": False})
+        self.assertEqual(pl.remote_grants, [])
+
+    def test_a_dead_remote_gq_frees_the_machine_slot_in_the_same_tick(self):
+        dead = self.ticket(3, "granted", dest="vm")
+        procs = world(*[P(200 + t, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100) for t in (1, 2, 4, 5)])
+        tickets = self.full_mac() + [dead, self.ticket(4), self.ticket(5)]
+        pl = tick(procs, tickets, remote={"slots": 1, "available": True})
+        self.assertEqual(pl.reaps, [(3, "owner process gone")])
+        self.assertEqual(pl.remote_grants, [4])
+
+
+class RunnerSlot(unittest.TestCase):
+    RUNNER = "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient"
+
+    def job_gq(self, dest):
+        runner = P(300, 1, self.RUNNER)
+        step = P(301, 300, "/bin/bash -e step.sh")
+        gq = P(302, 301, "python3 /u/.local/bin/gq run -- ./gradlew x", GITHUB_ACTIONS="true")
+        t = core.Ticket(id=1, pid=302, state="granted", created=0, remote=True, dest=dest)
+        return tick(world(runner, step, gq), [t])
+
+    def test_a_runner_job_with_a_ticket_counts_only_the_ticket(self):
+        self.assertEqual(self.job_gq("mac").used, 1)
+        pl = self.job_gq("vm")
+        self.assertEqual(pl.used, 0)
+        self.assertTrue(pl.runner_busy)  # still shown as busy
+
+    def test_a_runner_job_whose_ticket_waits_does_not_take_a_base_slot_from_it(self):
+        runner, step = P(300, 1, self.RUNNER), P(301, 300, "/bin/bash -e step.sh")
+        job = P(302, 301, "python3 /u/.local/bin/gq run -- ./gradlew x", GITHUB_ACTIONS="true")
+        agent = P(201, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)
+        tickets = [core.Ticket(id=1, pid=302, state="waiting", created=0),
+                   core.Ticket(id=2, pid=201, state="granted", created=0, dest="mac")]
+        self.assertEqual(tick(world(runner, step, job, agent), tickets).grants, [1])
+
+    def test_a_runner_job_without_a_ticket_counts_one(self):
+        runner = P(300, 1, self.RUNNER)
+        self.assertEqual(tick(world(runner)).used, 1)
+        other = P(302, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)  # an agent's, not the job's
+        remote_ticket = core.Ticket(id=1, pid=302, state="granted", created=0, remote=True, dest="vm")
+        self.assertEqual(tick(world(runner, other), [remote_ticket]).used, 1)
 
 
 class Cleanup(unittest.TestCase):
@@ -520,7 +638,7 @@ class TicketMemory(unittest.TestCase):
         from bq.server import Queue
         db = sqlite3.connect(":memory:")
         db.execute("create table tickets (id, pid, claude_pid, ralphy, cwd, cmd, state, created, granted, ended,"
-                   " end_reason, exit_code, ctype, peak_gb, subagent)")
+                   " end_reason, exit_code, ctype, peak_gb, subagent, dest, phase)")
         db.execute("insert into tickets (id, claude_pid, state, ctype, peak_gb) values (1, 5, 'done', 'other', 3.923477),"
                    " (2, 5, 'granted', 'other', null), (3, 5, 'waiting', 'other', null), (4, 7, 'waiting', 'other', null),"
                    " (5, 5, 'done', 'other', null)")

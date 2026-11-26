@@ -17,7 +17,8 @@ made in its selector. Command lines and agent names are masked in these screensh
 
 The numbers below are the defaults; every one of them is a setting (see [Settings](#settings)).
 
-- **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot). The runner never
+- **2 slots**, counting the GitHub self-hosted runner (a live `Runner.Worker` = 1 slot, unless its job holds a
+  ticket: then only the ticket counts, and it counts 0 on the Mac when the ticket is on the build machine). The runner never
   waits: if it arrives with 2 local builds running, the count goes to 3 until one ends, and nobody new gets in.
 - **Strict FIFO**: only the head of the queue may start.
 - **No fixed ceiling**: the first 2 slots enter freely. Every build above them enters one at a time, and
@@ -99,11 +100,15 @@ whose agent has died. `gq`, the hook and the server log speak English; only the 
 
 ## Remote builds (`remote` in `config.json`)
 
-Off by default. With a `remote` key, an eligible Gradle command overflows to another machine that runs this same
-queue: it waits in the local queue first and goes there only after `overflow_after_s` without a local slot. That machine needs `gq` on the `PATH` of a non-interactive `ssh`
-(`/usr/local/bin`, not `~/.local/bin`) with its server running, `rsync`, and whatever the build reads from
-`local.properties` (the Android SDK through `ANDROID_HOME`, for example), because ignored files are not copied. Edit `config.json` by hand; the page does not show this key and keeps
-it on Save & Apply.
+Off by default. With a `remote` key, the server of this queue is the only scheduler of two places: this machine and
+a build machine. The Mac is the default. When the head of the line cannot enter here (base slots full and the extra
+slot refused for memory, swap or the configured max, or memory pressure at or above `block_pressure`, critical by default), the eligible tickets waiting,
+in order, take the build machine's free slots (`slots`). A refusal only for the gap between extras (`extra_gap_s`)
+does not count: nobody goes remote for it. The destination is written once, when the ticket is granted, and never
+changes; a ticket that cannot run remotely keeps its place for the next local slot. The build machine needs only
+`ssh`, `rsync` and whatever the build reads from `local.properties` (the Android SDK through `ANDROID_HOME`, for
+example), because ignored files are not copied; it needs no `gq`. Edit `config.json` by hand; the page does not show
+this key and keeps it on Save & Apply.
 
 ```json
 {"remote": {"host": "me@build-vm", "root": "~/remote-builds",
@@ -116,9 +121,11 @@ it on Save & Apply.
 - `ssh_options` (optional): extra `ssh` arguments, also used by `rsync`.
 - `instance`, `zone`, `project` (optional, all three or none): `gcloud compute instances start` before each
   remote run, so a stopped Compute Engine VM comes up; then `gq` waits up to 180 s for `ssh … true`.
-- `overflow_after_s` (optional, seconds, default 60): how long a ticket waits locally before trying the other
-  machine. The wait is checked on each queue answer (up to 25 s apart), so 60 means 60 to 85 s. `0` overflows
-  every ticket that is not granted at once.
+- `slots` (optional, whole number from 1, default 2): how many builds the build machine runs at once. The server
+  counts them; a ticket holds one from its grant until its release (or until its `gq` dies).
+- `cap_metadata_key` (optional, needs `instance`, `zone` and `project`): before starting the machine, `gq` reads
+  its metadata (`gcloud compute instances describe`); a value `true` under this key (a budget function sets it) makes
+  the machine unavailable (`budget exceeded`).
 - `local_tasks` (optional): a task containing one of these, case-insensitive, runs locally. Default:
   `ktlintFormat` (it rewrites the sources here), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
   and `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: they read keys, a database or a signing file
@@ -130,24 +137,25 @@ inside a git checkout, with no local task and no `-p`/`--project-dir` outside th
 `--tests`, `-p`, `-I`, `-c` and `--console` are not tasks. Everything else (`xcodebuild`, `pod`, `uv`, `node`,
 a script, a nested `gq`) stays local.
 
-A remote run keeps the local ticket waiting while the machine starts and the checkout is copied. If a local slot
-comes free meanwhile, the build runs here (`[gq] ticket #<n>: a local slot came free while the build machine
-started; running here`). Otherwise `gq` releases the ticket and:
+The client only tells the server, when it enqueues, whether the command is eligible. When the ticket is granted for
+the build machine, `gq`:
 
-1. copies the checkout to `<root>/<main repository>/<worktree>` with `rsync --delete`, leaving out `/.git` and
-   every file `.gitignore` ignores (`local.properties` included); the remote `build/`, `.gradle/` and
-   `.kotlin/` survive, so the remote build stays incremental;
-2. prints `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && gq run -- <cmd>'`;
+1. starts the machine and copies the checkout to `<root>/<main repository>/<worktree>` with `rsync --delete`,
+   leaving out `/.git` and every file `.gitignore` ignores (`local.properties` included); the remote `build/`,
+   `.gradle/` and `.kotlin/` survive, so the remote build stays incremental. The ticket stays granted, on the
+   build machine's slot, from here to the end;
+2. prints `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && exec <cmd>'` (no `gq` there);
 3. copies `build/reports/`, `build/test-results/` and `build/outputs/` of every project back, even when the
    build fails, and exits with the remote exit code.
 
-If the VM does not start, `ssh` does not answer or the first copy fails, `gq` prints
-`[gq] remote unavailable (<step>: <error>); running locally` and the ticket keeps waiting locally, in the same
-place; there is one try per run. Once the remote build has
+If the budget is spent, the VM does not start, `ssh` does not answer or the first copy fails, `gq` prints
+`[gq] remote unavailable (<step>: <error>)`, hands the ticket back to the queue (same id, so the same place) and the
+build machine leaves the choice for 300 s. The build runs nowhere until the next grant. Once the remote build has
 started it never runs locally: a dropped connection exits 255 with `[gq] remote connection lost`. SIGTERM,
-SIGINT, SIGHUP or SIGALRM on the local `gq` stop `ssh`; the pseudo-TTY makes the remote `gq` get SIGHUP and free
-its slot. An invalid key prints `[gq] remote config ignored (<field>)` and changes nothing. Not on Windows (no
-`flock`, no native `rsync`).
+SIGINT, SIGHUP or SIGALRM on the local `gq` stop `ssh`; the pseudo-TTY makes sshd send SIGHUP to the remote build,
+and the ticket's release frees the build machine's slot. A client that does not report `remote` (an old `gq`) never
+gets the build machine. An invalid key prints `[gq] remote config ignored (<field>)` and changes nothing. Not on
+Windows (no `flock`, no native `rsync`).
 
 ## Cleanup (`gq enforce on|off`)
 
