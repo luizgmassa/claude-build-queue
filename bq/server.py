@@ -34,6 +34,35 @@ STARTED = time.time()  # the page waits for this to change after Save & Apply
 BIND_WAIT_S = 10  # a restart may find the old process still holding the port for a moment
 CURVE_RUNS = 3  # memory curves kept per repo and command
 CURVE_LATE_S = 2 * TICK_S + 5  # a curve whose first sample came later than this missed the start: never stored
+VM_POLL_S = 60  # how often the build machine's Compute Engine status is asked
+# Compute Engine status -> state of the machine; anything else (STOPPING, TERMINATED, SUSPENDED...) is off
+VM_STATUS = {"RUNNING": "on", "STAGING": "starting", "PROVISIONING": "starting"}
+# every state vm_state can return; the page needs a label for each
+VM_STATES = ("no_budget", "unavailable", "starting", "on", "off", "unknown")
+
+
+def vm_state(tickets, now, down_until, reason, polled, polling):
+    """(state, reason) of the build machine, first rule that applies: no_budget, unavailable, starting, on, then the
+    last Compute Engine answer `polled` = (ts, status or None, capped) or unknown; `polling` False means no
+    instance is configured, so the machine is taken as always on. A poll older than 3 polling periods (a hung gcloud,
+    a dead poller) counts as no poll, and so does any poll when no instance is configured."""
+    out = now < down_until
+    if not (polling and polled and now - polled[0] <= 3 * VM_POLL_S):
+        polled = None
+    if (polled and polled[2]) or (out and "budget exceeded" in reason):
+        return "no_budget", ""
+    if out:
+        return "unavailable", reason
+    phases = {t.get("phase") for t in tickets if t.get("dest") == "vm" and t.get("state") == "granted"}
+    if "starting" in phases:
+        return "starting", ""
+    if "running" in phases:
+        return "on", ""
+    if not polling:
+        return "on", ""
+    if polled is None or polled[1] is None:
+        return "unknown", ""
+    return VM_STATUS.get(polled[1], "off"), ""
 
 
 def busy_daemons(procs, listen, est):
@@ -313,7 +342,10 @@ class Queue:
         self.blocked = None  # message
         self.last_extra = None
         self.remote_down_until = 0.0  # the build machine is out of the choice until then (a failed start)
+        self.remote_reason = ""  # why the last start failed, for the view
+        self.vm_polled = None  # (ts, Compute Engine status or None when the describe failed, capped), see vm_poller
         self.remote_said = None
+        self.vm_wake = threading.Event()  # set to make the poller ask now
         self.swap_samples = deque()  # (ts, swap used GB) within core.SWAP_WINDOW_S
         self.peak = {}  # granted ticket id -> largest memory seen, GB
         self.curves = {}  # "t<ticket id>" / "p<root pid>" -> {"build": (repo, key, ctype), "lstart", "samples"}
@@ -358,6 +390,40 @@ class Queue:
         """The build machine as the planner sees it, None when the `remote` key is off or invalid."""
         cfg = build_machine.config(self.remote_log)
         return None if cfg is None else {"slots": cfg["slots"], "available": now >= self.remote_down_until}
+
+    def vm_poller(self):
+        """Asks Compute Engine about the machine every 60 s and keeps the last answer: the tick never waits for gcloud."""
+        said = None
+        while True:
+            said = self.poll_vm(said)
+            self.vm_wake.wait(VM_POLL_S)  # a released remote build cuts the wait: the machine may have changed
+            self.vm_wake.clear()
+
+    def poll_vm(self, said):
+        """One poll; `said` is the last error logged, so the same failure is logged once. Returns the new `said`."""
+        cfg = build_machine.config(lambda _: None)  # the tick already logs an invalid key; no race on remote_said here
+        if not (cfg and cfg["start"]):
+            return said
+        try:
+            status, capped = build_machine.instance_state(cfg, build_machine.find_gcloud())
+            polled, said = (time.time(), status, capped), None
+        except Exception as e:  # a failed describe means `unknown`, never a dead server
+            polled = (time.time(), None, False)
+            if str(e) != said:
+                said = str(e)
+                log(f"vm state unknown: {said}")
+        with self.lock:
+            self.vm_polled = polled
+        return said
+
+    def vm_block(self, pl, tickets, now):
+        """The `vm` block of the view: slots used and total, and the machine's state; None without the `remote` key."""
+        cfg = build_machine.config(self.remote_log)
+        if cfg is None:
+            return None
+        state, reason = vm_state(tickets, now, self.remote_down_until, self.remote_reason, self.vm_polled,
+                                 bool(cfg["start"]))
+        return {"used": pl.counts.get("vm", 0), "slots": cfg["slots"], "state": state, "reason": reason}
 
     def remote_log(self, text):
         """Logs an invalid `remote` key once, not on every tick."""
@@ -730,6 +796,7 @@ class Queue:
                                "procs": v["procs"], "alive": k in procs} for k, v in agents.items()),
                              key=lambda a: -a["rss_gb"]),
             "processes": relevant, "tickets": tickets, "events": list(self.events)[:80],
+            "vm": self.vm_block(pl, tickets, time.time()),
         }
 
     def loop(self):
@@ -796,6 +863,7 @@ class Queue:
                     self.peak.pop(tid, None)
                     self.curves.pop(f"t{tid}", None)
                     self.remote_down_until = time.time() + core.REMOTE_RETRY_S
+                    self.remote_reason = str(reason or "")[:300]
                 m = core.msg("event.remote_failed", id=tid, reason=str(reason or "")[:300])
             else:
                 raise ValueError(f"phase {phase!r}")
@@ -808,8 +876,11 @@ class Queue:
 
     def release(self, tid, exit_code):
         with self.lock:
+            row = self.db.execute("select dest from tickets where id=?", (tid,)).fetchone()
             self.finish(tid, "released", exit_code)
             self.cond.notify_all()
+        if row and row[0] == "vm":
+            self.vm_wake.set()
         self.event("release", core.msg("event.release", id=tid, exit=exit_code))
         self.wake.set()
         return {"ok": True}
@@ -967,6 +1038,7 @@ def main():
     if not CONFIG.exists():
         CONFIG.write_text(json.dumps({"enforce": False}, indent=1))
     threading.Thread(target=Q.loop, daemon=True, name="scheduler").start()
+    threading.Thread(target=Q.vm_poller, daemon=True, name="vm_poller").start()
     deadline = time.time() + BIND_WAIT_S
     while True:
         try:

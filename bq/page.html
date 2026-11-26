@@ -160,6 +160,18 @@
   "card.ram_val": "{used} GB builds / {free} GB free",
   "card.cpu_total": "Total CPU",
   "card.cpu_builds": "CPU of running builds",
+  "card.vm": "Build VM",
+  "card.vm_val": "{used}/{slots} in use · {state}",
+  "col.dest": "destination",
+  "dest.mac": "Mac",
+  "dest.vm": "VM",
+  "dest.vm_starting": "starting the VM",
+  "vm.off": "off",
+  "vm.starting": "starting",
+  "vm.on": "on",
+  "vm.unavailable": "unavailable",
+  "vm.no_budget": "out of budget",
+  "vm.unknown": "unknown",
   "tip.outside": "Builds outside the queue: {n}\nMemory: {gb} GB ({pct}% of RAM)\nCPU: {cpu}%",
   "tip.runner": "Memory: {gb} GB ({pct}% of RAM)\nCPU: {cpu}%",
   "col.type": "type",
@@ -381,6 +393,18 @@
   "card.ram_val": "{used} GB builds / {free} GB livres",
   "card.cpu_total": "CPU total",
   "card.cpu_builds": "CPU das builds rodando",
+  "card.vm": "VM de build",
+  "card.vm_val": "{used}/{slots} em uso · {state}",
+  "col.dest": "destino",
+  "dest.mac": "Mac",
+  "dest.vm": "VM",
+  "dest.vm_starting": "ligando a VM",
+  "vm.off": "desligada",
+  "vm.starting": "ligando",
+  "vm.on": "ligada",
+  "vm.unavailable": "indisponível",
+  "vm.no_budget": "sem orçamento",
+  "vm.unknown": "desconhecido",
   "tip.outside": "Builds fora da fila: {n}\nMemória: {gb} GB ({pct}% da RAM)\nCPU: {cpu}%",
   "tip.runner": "Memória: {gb} GB ({pct}% da RAM)\nCPU: {cpu}%",
   "col.type": "tipo",
@@ -600,6 +624,7 @@ const cmp = (a, b) => (typeof a === "number" && typeof b === "number") ? a - b
 const widthOf = (id, c) => (S.widths[id] || {})[c.k] || c.w || 110;
 
 function grid(id, cols, rows) {
+  cols = cols.filter(c => !c.when || c.when());
   tables[id] = { cols, rows };
   const el = document.getElementById(id);
   if (!el) return;
@@ -702,16 +727,19 @@ const T_CMD = { k: "cmd", t: "col.cmd", w: 520, f: t => `<code>${t.cwd ? esc(t.c
 const endReason = t => T("end." + t.end_reason, null, t.end_reason ?? "");
 const T_END = { k: "end_reason", t: "col.end", w: 160, v: endReason,
   f: t => esc(endReason(t)) + (t.exit_code != null ? " (exit " + t.exit_code + ")" : "") };
+// shown only while the server reports the build VM (the `remote` key is on); a waiting ticket has no destination yet
+const T_DEST = { k: "dest", t: "col.dest", w: 120, when: () => !!last?.vm,
+  f: t => esc(t.dest === "vm" && t.phase === "starting" ? T("dest.vm_starting") : t.dest ? T("dest." + t.dest) : "") };
 // one column set per ticket state, shared by the main page and the dialogs
 const TICKET_TABLES = [
-  ["running", "h.running", t => t.state === "granted", [T_ID, T_AGENT, T_PROJ, T_PID,
+  ["running", "h.running", t => t.state === "granted", [T_ID, T_AGENT, T_PROJ, T_PID, T_DEST,
     { k: "granted", t: "col.running_for", w: 90, v: t => secs(t.granted), f: t => dur(secs(t.granted)) },
     T_TYPE, T_RAM, T_CPU, T_EST, T_PEAK, T_CMD]],
   ["waiting", "h.waiting", t => t.state === "waiting", [{ k: "position", t: "col.position", num: true, w: 65 },
-    T_ID, T_AGENT, T_PROJ, T_PID,
+    T_ID, T_AGENT, T_PROJ, T_PID, T_DEST,
     { k: "created", t: "col.waiting_for", w: 100, v: t => secs(t.created), f: t => dur(secs(t.created)) },
     T_TYPE, T_CPU, T_EST, T_CMD]],
-  ["done", "h.done", t => t.state === "done", [T_ID, T_AGENT, T_PID, T_TYPE, T_PEAK,
+  ["done", "h.done", t => t.state === "done", [T_ID, T_AGENT, T_PID, T_DEST, T_TYPE, T_PEAK,
     { k: "ended", t: "col.ended_ago", w: 95, v: t => secs(t.ended), f: t => dur(secs(t.ended)) }, T_END, T_CMD]],
 ];
 // the dialog's tickets, one table per state that has any, with the main page's columns
@@ -758,6 +786,8 @@ function render(v) {
       v.counts.runner && v.runner_load ? tip("tip.runner", v.runner_load) : ""],
     ["card.cleanup", T(v.enforce ? "card.cleanup_on" : "card.cleanup_dry"), v.enforce ? "ok" : "warn"],
     ["card.pressure", T(pl), pc],
+    ...(v.vm ? [["card.vm", T("card.vm_val", { used: v.vm.used, slots: v.vm.slots, state: T("vm." + v.vm.state) }),
+      ["unavailable", "no_budget"].includes(v.vm.state) ? "bad" : v.vm.state === "on" ? "ok" : v.vm.state === "off" ? "" : "warn", "", v.vm.reason]] : []),
   ], [
     ["RAM", T("card.ram_val", { used: v.builds_gb, free: v.avail_gb }), "", out, "", true],
     ["card.free", m.free_pct + "%", m.free_pct < 20 ? "bad" : "ok"],

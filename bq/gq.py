@@ -184,18 +184,35 @@ def status():
         time.sleep(0.5)
     else:
         sys.exit("build-queue server is up but has not finished its first scan yet")
-    m = v["memory"]
-    print(f"slots {v['used']} in use (base {v.get('base_slots')}, max {v.get('max_slots') or 'off'}, "
-          f"avail {v.get('avail_gb')} GB, reserved {v.get('reserve_gb')} GB, "
-          f"swap +{v.get('swap_growth_gb')} GB/{v.get('swap_window_s')}s)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
-          f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
-          f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB")
+    print("\n".join(status_lines(v)))
+
+
+def destination(t):
+    """`mac`, `vm`, `vm (starting)` while the machine boots, empty for a ticket still waiting."""
+    if t.get("dest") == "vm" and t.get("phase") == "starting":
+        return "vm (starting)"
+    return t.get("dest") or ""
+
+
+def status_lines(v):
+    """The text of `gq status`. Without the `vm` block (no `remote` key) it is the plain queue, as ever."""
+    m, vm = v["memory"], v.get("vm")
+    lines = [f"slots {v['used']} in use (base {v.get('base_slots')}, max {v.get('max_slots') or 'off'}, "
+             f"avail {v.get('avail_gb')} GB, reserved {v.get('reserve_gb')} GB, "
+             f"swap +{v.get('swap_growth_gb')} GB/{v.get('swap_window_s')}s)  runner={'busy' if v['counts'].get('runner') else 'idle'}  "
+             f"enforce={'on' if v['enforce'] else 'off'}  pressure={m['pressure']}  free={m['free_pct']}%  "
+             f"swap={m['swap_used_gb']}/{m['swap_total_gb']} GB"]
+    if vm:
+        why = f" ({vm['reason']})" if vm.get("reason") else ""
+        lines.append(f"vm {vm['used']}/{vm['slots']} in use  state={vm['state']}{why}")
     if v["blocked"]:
-        print(f"blocked: {v['blocked']}")
+        lines.append(f"blocked: {v['blocked']}")
     for t in v["tickets"]:
         if t["state"] != "done":
             ended = " (ended)" if t.get("agent_alive") is False else ""
-            print(f"#{t['id']} {t['state']:8} {t['agent']}{ended}  {t['cmd'][:90]}")
+            where = f"{destination(t):14} " if vm else ""
+            lines.append(f"#{t['id']} {t['state']:8} {where}{t['agent']}{ended}  {t['cmd'][:90]}")
+    return lines
 
 
 def set_config(key, value):

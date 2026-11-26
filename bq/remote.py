@@ -12,6 +12,7 @@ import json
 import os
 import posixpath
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -224,21 +225,34 @@ def probe(cfg):
         SHELL.sleep(PROBE_PAUSE_S)
 
 
-def check_budget(cfg, instance, zone, project):
-    """Refuses a machine whose metadata `cap_metadata_key` is `true`: the budget function sets it to stop spending."""
-    key = cfg["cap_metadata_key"]
-    if not key:
-        return
-    code, out, err = SHELL.run(["gcloud", "compute", "instances", "describe", instance, f"--zone={zone}",
+def find_gcloud():
+    """launchd's PATH lacks Homebrew, where gcloud lives on the Mac: look there too. The client keeps the bare name."""
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]  # an empty entry would mean the cwd
+    path = os.pathsep.join([*dirs, "/opt/homebrew/bin", "/usr/local/bin"])
+    return shutil.which("gcloud", path=path) or "gcloud"
+
+
+def instance_state(cfg, gcloud="gcloud"):
+    """(status, capped) of the build machine from one `describe`: its Compute Engine status and whether the metadata
+    `cap_metadata_key` is `true`. Raises Unavailable when the answer cannot be had."""
+    instance, zone, project = cfg["start"]
+    code, out, err = SHELL.run([gcloud, "compute", "instances", "describe", instance, f"--zone={zone}",
                                 f"--project={project}", "--format=json"])
     if code != 0:
         raise Unavailable(_reason("budget", code, err))
+    key = cfg["cap_metadata_key"]
     try:
-        items = (json.loads(out).get("metadata") or {}).get("items") or []
-        capped = any(i.get("key") == key and str(i.get("value")).lower() == "true" for i in items)
+        info = json.loads(out)
+        items = (info.get("metadata") or {}).get("items") or []
+        capped = bool(key) and any(i.get("key") == key and str(i.get("value")).lower() == "true" for i in items)
+        return info.get("status"), capped
     except (ValueError, AttributeError, TypeError) as e:
         raise Unavailable(f"budget: unreadable describe output ({e})")
-    if capped:
+
+
+def check_budget(cfg):
+    """Refuses a machine whose metadata `cap_metadata_key` is `true`: the budget function sets it to stop spending."""
+    if cfg["cap_metadata_key"] and instance_state(cfg)[1]:
         raise Unavailable("budget exceeded")
 
 
@@ -246,7 +260,7 @@ def prepare(j):
     cfg, top, dest = j.cfg, j.top, j.dest
     if cfg["start"]:
         instance, zone, project = cfg["start"]
-        check_budget(cfg, instance, zone, project)
+        check_budget(cfg)
         step("start", ["gcloud", "compute", "instances", "start", instance, f"--zone={zone}",
                        f"--project={project}", "--quiet"])
     probe(cfg)

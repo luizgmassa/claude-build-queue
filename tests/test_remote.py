@@ -43,6 +43,7 @@ class FakeShell:
         self.child = child or Child(0)
         self.calls, self.popened, self.clock = [], [], 0.0
         self.budget = "false"
+        self.status = "RUNNING"
 
     @staticmethod
     def step(argv):
@@ -63,7 +64,8 @@ class FakeShell:
         if name == "git":
             return 0, f"{self.top}\n{self.common}\n", ""
         if name == "describe":
-            return 0, json.dumps({"metadata": {"items": [{"key": "budget-exceeded", "value": self.budget}]}}), ""
+            return 0, json.dumps({"status": self.status,
+                                    "metadata": {"items": [{"key": "budget-exceeded", "value": self.budget}]}}), ""
         return 0, "", ""
 
     def popen(self, argv):
@@ -629,6 +631,208 @@ class RealRsync(RemoteBase):
         self.assertTrue((self.top / "backend/build/test-results/t/TEST-x.xml").exists())
         self.assertFalse((self.top / ".gradle").exists())
         self.assertEqual((self.top / "local.properties").read_text(), "sdk.dir=/here")
+
+
+NOW = 1000.0
+VM = {"dest": "vm", "state": "granted"}
+
+
+class VmState(unittest.TestCase):
+    def state(self, tickets=(), down=0.0, reason="", polled=None, polling=True):
+        return server.vm_state(list(tickets), NOW, down, reason, polled, polling)
+
+    def test_budget_beats_everything_else(self):
+        self.assertEqual(self.state([{**VM, "phase": "running"}], NOW + 5, "start: x", (NOW, "RUNNING", True)),
+                         ("no_budget", ""))
+        self.assertEqual(self.state(down=NOW + 5, reason="budget exceeded"), ("no_budget", ""))
+        self.assertEqual(self.state(down=NOW - 5, reason="budget exceeded", polled=(NOW, "RUNNING", False)),
+                         ("on", ""))  # the failure is over: it no longer counts
+
+    def test_a_recent_failure_is_unavailable_with_its_reason(self):
+        self.assertEqual(self.state(down=NOW + 5, reason="start: boom"), ("unavailable", "start: boom"))
+
+    def test_tickets_beat_the_poll(self):
+        self.assertEqual(self.state([{**VM, "phase": "starting"}], polled=(NOW, "TERMINATED", False))[0], "starting")
+        self.assertEqual(self.state([{**VM, "phase": "running"}], polled=(NOW, "TERMINATED", False))[0], "on")
+
+    def test_a_ticket_that_is_not_on_the_machine_does_not_count(self):
+        self.assertEqual(self.state([{"dest": "mac", "state": "granted", "phase": None}],
+                                    polled=(NOW, "TERMINATED", False))[0], "off")
+
+    def test_an_idle_machine_follows_gcloud(self):
+        for status, want in [("RUNNING", "on"), ("STAGING", "starting"), ("PROVISIONING", "starting"),
+                             ("TERMINATED", "off"), ("STOPPING", "off")]:
+            self.assertEqual(self.state(polled=(NOW, status, False))[0], want, status)
+
+    def test_a_poll_older_than_three_periods_is_unknown_and_loses_its_budget_flag(self):
+        old = NOW - 3 * server.VM_POLL_S - 1
+        self.assertEqual(self.state(polled=(old, "RUNNING", False))[0], "unknown")
+        self.assertEqual(self.state(polled=(old, "RUNNING", True))[0], "unknown")
+        self.assertEqual(self.state(polled=(NOW - 3 * server.VM_POLL_S, "RUNNING", False))[0], "on")
+
+    def test_a_poll_means_nothing_without_an_instance(self):
+        self.assertEqual(self.state(polled=(NOW, "RUNNING", True), polling=False)[0], "on")
+
+    def test_no_valid_poll_is_unknown_and_no_instance_is_always_on(self):
+        self.assertEqual(self.state()[0], "unknown")
+        self.assertEqual(self.state(polled=(NOW, None, False))[0], "unknown")
+        self.assertEqual(self.state(polling=False)[0], "on")
+
+
+class StatusLines(unittest.TestCase):
+    MEM = {"pressure": 1, "free_pct": 40, "swap_used_gb": 0, "swap_total_gb": 0}
+
+    def view(self, vm, *tickets, blocked=""):
+        return {"used": 3, "base_slots": 3, "max_slots": None, "avail_gb": 12.5, "reserve_gb": 4.0,
+                "swap_growth_gb": 0.0, "swap_window_s": 60, "counts": {}, "enforce": True, "memory": self.MEM,
+                "blocked": blocked, "vm": vm,
+                "tickets": [{"agent": "ralphy #1", "cmd": "./gradlew check", "agent_alive": True, **t}
+                            for t in tickets]}
+
+    # the pre-change print of `gq status` (git show 42602e4:bq/gq.py), with these numbers
+    HEAD = ("slots 3 in use (base 3, max off, avail 12.5 GB, reserved 4.0 GB, swap +0.0 GB/60s)  runner=idle  "
+            "enforce=on  pressure=1  free=40%  swap=0/0 GB")
+
+    def test_without_the_vm_block_the_text_is_what_it_always_was(self):
+        lines = gq.status_lines(self.view(None, {"id": 7, "state": "granted", "dest": "mac"},
+                                          {"id": 8, "state": "waiting"}, {"id": 9, "state": "done"},
+                                          blocked="base slots full"))
+        self.assertEqual(lines, [self.HEAD, "blocked: base slots full",
+                                 "#7 granted  ralphy #1  ./gradlew check", "#8 waiting  ralphy #1  ./gradlew check"])
+
+    def test_with_the_vm_every_ticket_shows_its_destination_and_the_vm_line(self):
+        vm = {"used": 1, "slots": 2, "state": "unavailable", "reason": "start: boom"}
+        lines = gq.status_lines(self.view(vm, {"id": 1, "state": "granted", "dest": "mac"},
+                                          {"id": 2, "state": "granted", "dest": "vm", "phase": "starting"},
+                                          {"id": 3, "state": "granted", "dest": "vm", "phase": "running"},
+                                          {"id": 4, "state": "waiting"}, {"id": 5, "state": "done", "dest": "mac"},
+                                          blocked="base slots full"))
+        self.assertEqual(lines, [
+            self.HEAD, "vm 1/2 in use  state=unavailable (start: boom)", "blocked: base slots full",
+            "#1 granted  mac            ralphy #1  ./gradlew check",
+            "#2 granted  vm (starting)  ralphy #1  ./gradlew check",
+            "#3 granted  vm             ralphy #1  ./gradlew check",
+            "#4 waiting                 ralphy #1  ./gradlew check"])
+
+
+@POSIX_ONLY
+class VmView(RemoteBase):
+    """What /api/state tells of the machine, through the real tick."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(server, "DATA", self.tmp / "queue-data")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.q = server.Queue()
+        self.addCleanup(self.q.db.close)
+        self.configure({**CONFIG, "slots": 1})
+        self.procs = {1: core.Proc(pid=1, ppid=0, rss_kb=1, cpu=0, etime="", lstart="L", args="/sbin/launchd")}
+
+    def enqueue(self, i):
+        pid = 9000 + i
+        self.procs[pid] = core.Proc(pid=pid, ppid=1, rss_kb=1, cpu=0, etime="", lstart="L",
+                                    args="python3 /u/.local/bin/gq run -- ./gradlew x")
+        return self.q.enqueue({"pid": pid, "cwd": "/w", "cmd": "./gradlew check", "remote": True})["id"]
+
+    def tick(self):
+        mem = {"pressure": 4, "free_pct": 50, "total_gb": 0, "app_gb": 0, "wired_gb": 0, "compressed_gb": 0,
+               "cached_gb": 0, "free_gb": 0, "swap_used_gb": 0, "swap_total_gb": 0}
+        with mock.patch.object(server.system, "snapshot_procs", return_value=self.procs), \
+                mock.patch.object(server.system, "memory", return_value=mem), \
+                mock.patch.object(server.system, "tcp_links", return_value=({}, [])), \
+                mock.patch.object(server.system, "cpu_total", return_value=0.0):
+            self.q.tick()
+        return self.q.view
+
+    def test_no_remote_key_means_no_vm_block(self):
+        settings.CONFIG.unlink()
+        self.assertIsNone(self.tick()["vm"])
+
+    def test_a_remote_ticket_stays_listed_and_counted_until_the_release(self):
+        tid = self.enqueue(1)
+        v = self.tick()
+        self.assertEqual(v["vm"], {"used": 1, "slots": 1, "state": "starting", "reason": ""})
+        self.q.remote_phase(tid, "running", None)
+        v = self.tick()
+        self.assertEqual((v["vm"]["used"], v["vm"]["state"]), (1, "on"))
+        self.assertEqual([(t["id"], t["dest"], t["phase"]) for t in v["tickets"]], [(tid, "vm", "running")])
+        self.q.release(tid, 0)
+        self.assertEqual(self.tick()["vm"]["used"], 0)
+
+    def test_a_failed_start_shows_the_reason(self):
+        tid = self.enqueue(1)
+        self.tick()
+        self.q.remote_phase(tid, "failed", "start: boom")
+        v = self.tick()
+        self.assertEqual((v["vm"]["state"], v["vm"]["reason"]), ("unavailable", "start: boom"))
+
+    def test_the_last_poll_decides_an_idle_machine(self):
+        self.q.vm_polled = (time.time(), "TERMINATED", False)
+        self.assertEqual(self.tick()["vm"]["state"], "on")  # no instance configured: nothing to poll, always on
+        self.configure({**CONFIG, "slots": 1, "instance": "vm", "zone": "z", "project": "p"})
+        self.assertEqual(self.tick()["vm"]["state"], "off")
+        self.q.vm_polled = (time.time(), "RUNNING", True)
+        self.assertEqual(self.tick()["vm"]["state"], "no_budget")
+
+    def test_the_polled_status_drives_an_idle_machine_and_a_vm_release_asks_for_a_fresh_poll(self):
+        self.configure({**CONFIG, "slots": 1, "instance": "vm", "zone": "z", "project": "p"})
+        with mock.patch.object(remote, "find_gcloud", return_value="gcloud"):
+            self.q.poll_vm(None)
+            self.assertEqual(self.tick()["vm"]["state"], "on")
+            self.shell.status = "TERMINATED"
+            self.q.poll_vm(None)
+            self.assertEqual(self.tick()["vm"]["state"], "off")
+        tid = self.enqueue(1)
+        self.tick()
+        self.assertFalse(self.q.vm_wake.is_set())
+        self.q.release(tid, 0)
+        self.assertTrue(self.q.vm_wake.is_set())
+        self.q.vm_wake.clear()
+        mac = self.enqueue(2)
+        self.q.db.execute("update tickets set state='granted', dest='mac' where id=?", (mac,))
+        self.q.release(mac, 0)
+        self.assertFalse(self.q.vm_wake.is_set())  # a Mac release says nothing of the machine
+
+    def test_a_failing_poll_is_unknown_logged_once_and_the_tick_goes_on(self):
+        self.configure({**CONFIG, "slots": 1, "instance": "vm", "zone": "z", "project": "p"})
+        self.use_shell(fail={"describe": (1, "boom")})
+        with mock.patch.object(remote, "find_gcloud", return_value="gcloud"), \
+                mock.patch.object(server, "log") as logged:
+            said = self.q.poll_vm(None)
+            self.q.poll_vm(said)
+        self.assertEqual(logged.call_count, 1)
+        self.assertEqual(self.tick()["vm"]["state"], "unknown")
+        self.use_shell()
+        with mock.patch.object(remote, "find_gcloud", return_value="gcloud"):
+            self.assertIsNone(self.q.poll_vm(said))  # a good answer clears it: the next failure is logged again
+
+
+class InstanceState(RemoteBase):
+    @POSIX_ONLY
+    def test_status_and_cap_come_from_one_describe(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", "cap_metadata_key": "budget-exceeded"})
+        cfg = remote.config(self.lines.append)
+        self.shell.budget = "true"
+        self.assertEqual(remote.instance_state(cfg), ("RUNNING", True))
+        self.assertEqual(self.shell.names(), ["describe"])
+
+    @POSIX_ONLY
+    def test_find_gcloud_searches_the_homebrew_dirs_and_never_the_cwd(self):
+        seen = []
+        with mock.patch.dict(os.environ, {"PATH": f"/bin{os.pathsep}{os.pathsep}/usr/bin{os.pathsep}"}), \
+                mock.patch.object(remote.shutil, "which", side_effect=lambda n, path: seen.append(path) or "/x/gcloud"):
+            self.assertEqual(remote.find_gcloud(), "/x/gcloud")
+        self.assertEqual(seen[0].split(os.pathsep), ["/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"])
+        with mock.patch.dict(os.environ, {"PATH": ""}), mock.patch.object(remote.shutil, "which", return_value=None):
+            self.assertEqual(remote.find_gcloud(), "gcloud")  # nothing found: the bare name, as the client uses
+
+    @POSIX_ONLY
+    def test_a_failed_describe_is_unavailable(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p"})
+        self.use_shell(fail={"describe": (1, "boom")})
+        with self.assertRaises(remote.Unavailable):
+            remote.instance_state(remote.config(self.lines.append))
 
 
 if __name__ == "__main__":
