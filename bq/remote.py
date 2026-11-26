@@ -4,8 +4,8 @@ or on a build machine, and `gq run` carries out what it was given.
 Off unless config.json has a `remote` key. `job` tells the server on entry that the command may run there. Once the
 ticket is granted for the machine, gq starts it (when `instance`, `zone` and `project` are set), copies the checkout
 with rsync, runs the command through `ssh` (no `gq` on that side: the ticket here holds the machine's slot), copies the
-reports back and exits with the remote code. Anything that keeps it from starting hands the ticket back to the queue;
-a build that started remotely never runs locally. Standard library only, like gq.
+reports back (plus any `fetch_back` patterns of the config) and exits with the remote code. Anything that keeps it
+from starting hands the ticket back to the queue; a build that started remotely never runs locally. Standard library only, like gq.
 """
 
 import json
@@ -91,7 +91,7 @@ def _slots(value):
 START = ("instance", "zone", "project")
 REQUIRED = {"host": _text, "root": _text}
 OPTIONAL = {**{k: _text for k in START}, "ssh_options": _text_list, "local_tasks": _text_list,
-            "slots": _slots, "cap_metadata_key": _text}
+            "slots": _slots, "cap_metadata_key": _text, "fetch_back": _text_list}
 SLOTS = 2
 
 
@@ -117,7 +117,8 @@ def config(say):
     start = [r.get(k) for k in START]
     return {"host": r["host"], "root": r["root"], "ssh_options": r.get("ssh_options", []),
             "local_tasks": r.get("local_tasks", LOCAL_TASKS), "start": start if all(start) else None,
-            "slots": r.get("slots", SLOTS), "cap_metadata_key": r.get("cap_metadata_key")}
+            "slots": r.get("slots", SLOTS), "cap_metadata_key": r.get("cap_metadata_key"),
+            "fetch_back": r.get("fetch_back", [])}
 
 
 def gradle_args(cmd):
@@ -273,7 +274,7 @@ def prepare(j):
 
 
 def fetch_back(j, say):
-    includes = [f"--include={p}" for p in BACK]
+    includes = [f"--include={p}" for p in BACK + j.cfg["fetch_back"]]
     with lock(j.dest):
         code, _out, err = SHELL.run(rsync(j.cfg, "-m", "--include=*/", *includes, "--exclude=*",
                                           f"{j.cfg['host']}:{j.dest}/", f"{j.top}/"))

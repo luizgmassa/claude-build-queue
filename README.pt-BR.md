@@ -125,6 +125,9 @@ mantém no Salvar e aplicar.
 - `cap_metadata_key` (opcional, exige `instance`, `zone` e `project`): antes de ligar a máquina, o `gq` lê os
   metadados dela (`gcloud compute instances describe`); o valor `true` nessa chave (uma função de orçamento a grava)
   torna a máquina indisponível (`budget exceeded`).
+- `fetch_back` (opcional, lista de padrões do `rsync`): voltam da máquina de build além dos relatórios, resultados
+  de teste e saídas (`build/reports`, `build/test-results`, `build/outputs`), por exemplo
+  `build/generated/openapi/***`. Padrão: nenhum.
 - `local_tasks` (opcional): tarefa que contém um destes, sem diferenciar caixa, roda local. Padrão:
   `ktlintFormat` (reescreve as fontes daqui), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
   e `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: leem chave, banco ou arquivo de assinatura que

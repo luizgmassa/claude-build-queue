@@ -126,6 +126,9 @@ this key and keeps it on Save & Apply.
 - `cap_metadata_key` (optional, needs `instance`, `zone` and `project`): before starting the machine, `gq` reads
   its metadata (`gcloud compute instances describe`); a value `true` under this key (a budget function sets it) makes
   the machine unavailable (`budget exceeded`).
+- `fetch_back` (optional, list of `rsync` patterns): copied back from the build machine in addition to the reports,
+  test results and outputs (`build/reports`, `build/test-results`, `build/outputs`), for example
+  `build/generated/openapi/***`. Default: none.
 - `local_tasks` (optional): a task containing one of these, case-insensitive, runs locally. Default:
   `ktlintFormat` (it rewrites the sources here), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
   and `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: they read keys, a database or a signing file

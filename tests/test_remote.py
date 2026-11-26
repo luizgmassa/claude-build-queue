@@ -147,6 +147,17 @@ class Config(RemoteBase):
         self.assertEqual((cfg["slots"], cfg["cap_metadata_key"]), (3, "budget-exceeded"))
         self.assertNotIn("overflow_after_s", cfg)
 
+    @POSIX_ONLY
+    def test_fetch_back_is_an_optional_list_of_patterns(self):
+        self.configure(CONFIG)
+        self.assertEqual(remote.config(self.lines.append)["fetch_back"], [])
+        self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
+        self.assertEqual(remote.config(self.lines.append)["fetch_back"], ["build/generated/openapi/***"])
+        for bad in ("build/x", [""], [3]):
+            self.configure({**CONFIG, "fetch_back": bad})
+            self.assertIsNone(remote.config(self.lines.append))
+        self.assertEqual(self.lines[-1], "remote config ignored (fetch_back)")
+
     def test_without_the_key_nothing_runs(self):
         self.assertIsNone(self.run_remote(["./gradlew", "check"]))
         self.assertEqual((self.shell.calls, self.shell.popened, self.lines), ([], [], []))
@@ -234,6 +245,14 @@ class RemoteRun(RemoteBase):
         self.assertEqual(self.shell.popened, [["ssh", "-tt", *remote.KEEPALIVE, "-i", "~/.ssh/key", HOST,
                                                f"cd {dest} && exec ./gradlew :shared:testAndroidHostTest"]])
         self.assertEqual(self.lines, [f"remote {HOST}: ./gradlew :shared:testAndroidHostTest"])
+
+    def test_fetch_back_patterns_join_the_copy_back(self):
+        self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
+        self.assertEqual(self.run_remote(["./gradlew", ":shared:testAndroidHostTest"]), 0)
+        back = self.shell.argv("rsync-back")
+        for pattern in (*remote.BACK, "build/generated/openapi/***"):
+            self.assertIn(f"--include={pattern}", back)
+        self.assertLess(back.index("--include=build/generated/openapi/***"), back.index("--exclude=*"))
 
     def test_probe_retries_until_the_vm_answers(self):
         self.configure(CONFIG)
