@@ -1,13 +1,14 @@
-"""Remote builds: `gq run` overflows an eligible Gradle command to a build machine over ssh.
+"""Remote builds: the server of the local queue decides, at the grant, whether an eligible Gradle command runs here
+or on a build machine, and `gq run` carries out what it was given.
 
-Off unless config.json has a `remote` key. An eligible command waits in the local queue first; once it has waited
-`overflow_after_s` (60 s by default), gq starts the machine and copies the checkout there with rsync while the
-ticket keeps its place. If a local slot came free meanwhile the build runs here; otherwise gq drops the ticket, runs
-`gq run` on that machine (its own queue holds the slot), copies the reports back and exits with the remote code.
-Anything that keeps it from starting leaves the command in the local queue; a build that started remotely never runs
-locally. Standard library only, like gq.
+Off unless config.json has a `remote` key. `job` tells the server on entry that the command may run there. Once the
+ticket is granted for the machine, gq starts it (when `instance`, `zone` and `project` are set), copies the checkout
+with rsync, runs the command through `ssh` (no `gq` on that side: the ticket here holds the machine's slot), copies the
+reports back and exits with the remote code. Anything that keeps it from starting hands the ticket back to the queue;
+a build that started remotely never runs locally. Standard library only, like gq.
 """
 
+import json
 import os
 import posixpath
 import shlex
@@ -48,7 +49,7 @@ Job = namedtuple("Job", "cfg cmd top dest cwd")
 
 
 class Unavailable(Exception):
-    """The remote path cannot start; gq runs the command locally instead."""
+    """The remote path cannot start; the ticket goes back to the queue."""
 
 
 class Shell:
@@ -82,22 +83,24 @@ def _text_list(value):
     return isinstance(value, list) and all(map(_text, value))
 
 
-def _seconds(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+def _slots(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 START = ("instance", "zone", "project")
 REQUIRED = {"host": _text, "root": _text}
 OPTIONAL = {**{k: _text for k in START}, "ssh_options": _text_list, "local_tasks": _text_list,
-            "overflow_after_s": _seconds}
-OVERFLOW_AFTER_S = 60
+            "slots": _slots, "cap_metadata_key": _text}
+SLOTS = 2
 
 
 def _invalid_field(r):
     if not isinstance(r, dict):
         return "remote"
     checks = {**REQUIRED, **{k: ok for k, ok in OPTIONAL.items() if k in r}}
-    return next((k for k, ok in checks.items() if not ok(r.get(k))), None)
+    bad = next((k for k, ok in checks.items() if not ok(r.get(k))), None)
+    # the budget check runs with the start: a key without it would never be read
+    return bad or ("cap_metadata_key" if r.get("cap_metadata_key") and not all(r.get(k) for k in START) else None)
 
 
 def config(say):
@@ -113,7 +116,7 @@ def config(say):
     start = [r.get(k) for k in START]
     return {"host": r["host"], "root": r["root"], "ssh_options": r.get("ssh_options", []),
             "local_tasks": r.get("local_tasks", LOCAL_TASKS), "start": start if all(start) else None,
-            "overflow_after_s": r.get("overflow_after_s", OVERFLOW_AFTER_S)}
+            "slots": r.get("slots", SLOTS), "cap_metadata_key": r.get("cap_metadata_key")}
 
 
 def gradle_args(cmd):
@@ -221,10 +224,29 @@ def probe(cfg):
         SHELL.sleep(PROBE_PAUSE_S)
 
 
+def check_budget(cfg, instance, zone, project):
+    """Refuses a machine whose metadata `cap_metadata_key` is `true`: the budget function sets it to stop spending."""
+    key = cfg["cap_metadata_key"]
+    if not key:
+        return
+    code, out, err = SHELL.run(["gcloud", "compute", "instances", "describe", instance, f"--zone={zone}",
+                                f"--project={project}", "--format=json"])
+    if code != 0:
+        raise Unavailable(_reason("budget", code, err))
+    try:
+        items = (json.loads(out).get("metadata") or {}).get("items") or []
+        capped = any(i.get("key") == key and str(i.get("value")).lower() == "true" for i in items)
+    except (ValueError, AttributeError, TypeError) as e:
+        raise Unavailable(f"budget: unreadable describe output ({e})")
+    if capped:
+        raise Unavailable("budget exceeded")
+
+
 def prepare(j):
     cfg, top, dest = j.cfg, j.top, j.dest
     if cfg["start"]:
         instance, zone, project = cfg["start"]
+        check_budget(cfg, instance, zone, project)
         step("start", ["gcloud", "compute", "instances", "start", instance, f"--zone={zone}",
                        f"--project={project}", "--quiet"])
     probe(cfg)
@@ -250,26 +272,25 @@ def _default(signals):
         signal.signal(s, signal.SIG_DFL)
 
 
-def execute(j, say, signals, started=lambda: None):
-    """The remote exit code, or None when ssh cannot start; `started` runs once the remote run exists."""
+def execute(j, say, signals):
+    """The remote exit code, or None when ssh cannot start."""
     cfg, line = j.cfg, shlex.join(j.cmd)
     caught, child = [], None
 
     def stop(signum, _frame):
         caught.append(signum)
         if child is not None:
-            child.terminate()  # the pseudo-TTY makes sshd send SIGHUP to the remote gq, which frees its ticket
+            child.terminate()  # the pseudo-TTY makes sshd send SIGHUP to the remote build, which dies with it
 
     for s in signals:
         signal.signal(s, stop)
     say(f"remote {cfg['host']}: {line}")
     try:
-        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec gq run -- {line}", "-tt", *KEEPALIVE))
+        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec {line}", "-tt", *KEEPALIVE))
     except OSError as e:
         _default(signals)
-        say(f"remote unavailable (ssh: {e}); running locally")
+        say(f"remote unavailable (ssh: {e})")
         return None
-    started()
     if caught:  # a signal arrived before the child existed
         child.terminate()
     code = child.wait()
@@ -290,10 +311,10 @@ def plan(cmd, say):
 
 
 def start(j, say):
-    """Starts the machine and copies the checkout; False, with a line, when the remote path cannot start."""
+    """Starts the machine and copies the checkout; None, or the reason (also said) when the remote path cannot start."""
     try:
         prepare(j)
     except Unavailable as e:
-        say(f"remote unavailable ({e}); running locally")
-        return False
-    return True
+        say(f"remote unavailable ({e})")
+        return str(e)
+    return None

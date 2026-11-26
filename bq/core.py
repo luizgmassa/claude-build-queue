@@ -30,6 +30,8 @@ RUNNER_MARKERS = tuple(SETTINGS["runner_markers"])  # command-line fragments tha
 DATA = settings.DATA
 CALLS = DATA / "calls.jsonl"  # the hook's record of each `gq run` Bash call: session and subagent
 
+REMOTE_RETRY_S = 300  # the build machine stays out of the choice this long after a failed start
+
 PRESSURE_CRITICAL = 4  # the macOS kern.memorystatus_vm_pressure_level scale every system reports on
 BLOCK_PRESSURE = SETTINGS["block_pressure"]  # 4 (critical) by default; 2 also blocks on warn
 
@@ -57,6 +59,9 @@ EN = {
                      "− {est_gb} GB estimated ({ctype}) ≥ {headroom_gb} GB headroom",
     "event.enqueue": "ticket #{id} pid {pid}: {cmd}",
     "event.grant": "ticket #{id} got a slot",
+    "event.grant_vm": "ticket #{id} got a slot on the build machine",
+    "event.remote_running": "ticket #{id} is running on the build machine",
+    "event.remote_failed": "ticket #{id}: build machine unavailable ({reason}); back to waiting",
     "event.release": "ticket #{id} released its slot (exit {exit})",
     "event.reap": "ticket #{id}: {reason}",
     "event.sigterm": "SIGTERM {pid} ({kind}): {reason}",
@@ -364,11 +369,14 @@ class Ticket:
     created: float
     granted: float | None = None
     pid_start: str | None = None
+    remote: bool = False  # the client can run it on the build machine (an old client never sets this)
+    dest: str | None = None  # mac | vm, written at the grant only
 
 
 @dataclass
 class Plan:
     grants: list = field(default_factory=list)
+    remote_grants: list = field(default_factory=list)  # ticket ids sent to the build machine this tick
     kills: list = field(default_factory=list)  # (pid, reason)
     reaps: list = field(default_factory=list)  # (ticket id, reason)
     pid_starts: dict = field(default_factory=dict)  # ticket id -> lstart seen first
@@ -409,7 +417,7 @@ def extra_refusal(*, used, now, last_extra_ts, avail_gb, reserve_gb, est, ceilin
 
 def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idle_since, last_grant_ts,
          live_claude_pids, last_extra_ts=None, avail_gb=0.0, estimates=None, ceiling=None, swap_gb=0.0,
-         rss_gb=None, peaks=None, remaining=None):
+         rss_gb=None, peaks=None, remaining=None, remote=None):
     """One scheduling tick. Pure: the caller applies the result under its lock.
 
     The first SLOTS runs enter freely. Each one above them needs memory for its estimate after the peak
@@ -417,6 +425,10 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
     "runner"), swap that is not growing, EXTRA_GAP_S since the last extra entry and the configured max.
     A build with past runs of the same repo and command reserves what those runs still reached from its current
     age on (`remaining`, by holder key, see remaining_gb) instead of its type estimate.
+
+    `remote` ({"slots": n, "available": bool}, None when off) is the build machine. When the Mac is full (the head
+    refused for any reason but the gap between extras, or critical pressure), the waiting tickets whose client can run
+    remotely, in id order, take the machine's free slots (`remote_grants`); the head keeps its place for the Mac.
     """
     out = Plan()
     estimates, rss_gb, peaks, remaining = estimates or {}, rss_gb or {}, peaks or {}, remaining or {}
@@ -432,6 +444,8 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
                 out.pid_starts[t.id] = p.lstart
             live.append(t)
     granted = [t for t in live if t.state == "granted"]
+    vm_granted = [t for t in granted if t.dest == "vm"]
+    mac_granted = [t for t in granted if t.dest != "vm"]
     granted_ids = {t.id for t in granted}
     granted_pids = {t.pid for t in granted}
 
@@ -440,7 +454,10 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
             return True
         return any(a.pid in granted_pids for a in ancestors(r.pid, procs))
 
-    out.runner_busy = any(p.kind == "runner_worker" for p in procs.values())
+    workers = [p for p in procs.values() if p.kind == "runner_worker"]
+    out.runner_busy = bool(workers)
+    ticketed = {a.pid for t in live for a in ancestors(t.pid, procs)}  # a job's own ticket counts for it
+    runner_counted = any(w.pid not in ticketed for w in workers)
     nonagent = [r for r in roots if r.owner == "nonagent"]
     unqueued = []
     for r in roots:
@@ -469,7 +486,7 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
                 or p.kind == "compiler" and parent_gone(p, procs):
             out.kills.append((p.pid, msg("kill.loose_worker")))
 
-    local_active = len(granted) + len(nonagent) + len(unqueued)
+    local_active = len(mac_granted) + len(nonagent) + len(unqueued)
     recent_grant = last_grant_ts is not None and now - last_grant_ts < GRANT_QUIET_S
     killed_daemon = False
     for p in procs.values():
@@ -486,12 +503,12 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         out.kills.append((p.pid, msg("kill.idle_daemon")))
         killed_daemon = True
 
-    out.used = int(out.runner_busy) + local_active
+    out.used = int(runner_counted) + local_active
     default = ("other", DEFAULT_GB["other"])
-    runs = [(remaining.get(f"t{t.id}", estimates.get(t.id, default)[1]), rss_gb.get(f"t{t.id}", 0.0)) for t in granted]
+    runs = [(remaining.get(f"t{t.id}", estimates.get(t.id, default)[1]), rss_gb.get(f"t{t.id}", 0.0)) for t in mac_granted]
     runs += [(remaining.get(f"p{r.pid}", estimate_gb(command_type(r.args), peaks)), rss_gb.get(f"p{r.pid}", 0.0))
              for r in nonagent + unqueued]
-    if out.runner_busy:
+    if runner_counted:
         runs.append((estimate_gb(RUNNER_CTYPE, peaks), rss_gb.get("runner", 0.0)))
     reserve = peak_reserve_gb(runs)
     out.outside = [r.pid for r in nonagent + unqueued]
@@ -499,9 +516,11 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
                   "runner": int(out.runner_busy), "local_active": local_active}
     waiting = sorted((t for t in live if t.state == "waiting"), key=lambda t: t.id)
     used = out.used
-    for t in waiting:  # strict FIFO: only the head may enter, so stop at the first refusal
+    full_at = None  # index of the first waiting ticket the Mac cannot take
+    for i, t in enumerate(waiting):  # strict FIFO: only the head may enter, so stop at the first refusal
         if pressure >= BLOCK_PRESSURE:
             out.blocked = msg("blocked.pressure")
+            full_at = i
             break
         if killed_daemon:
             out.blocked = msg("blocked.daemon")
@@ -512,6 +531,10 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
                                 reserve_gb=reserve, est=est, ceiling=ceiling, swap_gb=swap_gb)
             if why:
                 out.blocked = msg("blocked.no_slot", used=used, base=SLOTS, why=why)
+                if why["key"] == "refusal.gap":  # the gap alone is a wait; memory or swap behind it is a full Mac
+                    why = extra_refusal(used=used, now=now, last_extra_ts=None, avail_gb=avail_gb,
+                                        reserve_gb=reserve, est=est, ceiling=ceiling, swap_gb=swap_gb)
+                full_at = i if why else None
                 break
             out.extra = msg("extra.granted", id=t.id, avail_gb=f"{avail_gb:.1f}", reserve_gb=f"{reserve:.1f}",
                             est_gb=f"{est[1]:.1f}", ctype=est[0], headroom_gb=f"{HEADROOM_GB:.0f}")
@@ -520,6 +543,15 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         reserve += est[1]  # it has not started yet: its whole estimate is still to come
         used += 1
         local_active += 1
+    if full_at is not None and remote and remote["available"]:
+        free = remote["slots"] - len(vm_granted)
+        for t in waiting[full_at:]:
+            if free <= 0:
+                break
+            if t.remote:
+                out.remote_grants.append(t.id)
+                free -= 1
+    out.counts["vm"] = len(vm_granted) + len(out.remote_grants)
     out.used = used  # after this tick's grants, the same count the blocked message shows
     out.counts["local_active"] = local_active
     out.reserve_gb = reserve

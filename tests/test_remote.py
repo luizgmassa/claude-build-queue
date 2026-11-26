@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # settings load at import: read them from an empty data dir, never this machine's config.json
 os.environ["BQ_DATA"] = os.environ.get("BQ_TEST_DATA") or tempfile.mkdtemp(prefix="bq-test-")
 os.environ["BQ_TEST_DATA"] = os.environ["BQ_DATA"]
-from bq import gq, remote, settings  # noqa: E402
+from bq import core, gq, remote, server, settings  # noqa: E402
 
 HOST = "me@build-vm"
 POSIX_ONLY = unittest.skipIf(remote.fcntl is None, "the remote path does not exist on Windows")
@@ -42,6 +42,7 @@ class FakeShell:
         self.top, self.common, self.fail = top, common, dict(fail)
         self.child = child or Child(0)
         self.calls, self.popened, self.clock = [], [], 0.0
+        self.budget = "false"
 
     @staticmethod
     def step(argv):
@@ -49,7 +50,9 @@ class FakeShell:
             return "probe" if argv[-1] == "true" else "mkdir"
         if argv[0] == "rsync":
             return "rsync-out" if "--delete" in argv else "rsync-back"
-        return {"git": "git", "gcloud": "start"}.get(argv[0], argv[0])
+        if argv[0] == "gcloud":
+            return "describe" if "describe" in argv else "start"
+        return {"git": "git"}.get(argv[0], argv[0])
 
     def run(self, argv, cwd=None):
         name = self.step(argv)
@@ -59,6 +62,8 @@ class FakeShell:
             return code, "", err
         if name == "git":
             return 0, f"{self.top}\n{self.common}\n", ""
+        if name == "describe":
+            return 0, json.dumps({"metadata": {"items": [{"key": "budget-exceeded", "value": self.budget}]}}), ""
         return 0, "", ""
 
     def popen(self, argv):
@@ -109,22 +114,36 @@ class RemoteBase(unittest.TestCase):
         settings.CONFIG.write_text(json.dumps({"remote": value}))
 
     def run_remote(self, cmd):
-        """plan, start and execute in a row, the path gq takes once a ticket has waited long enough."""
+        """plan, start and execute in a row, the path gq takes once the ticket is granted for the machine."""
         j = remote.plan(cmd, self.lines.append)
-        if j is None or not remote.start(j, self.lines.append):
+        if j is None or remote.start(j, self.lines.append):
             return None
         return remote.execute(j, self.lines.append, gq.SIGNALS)
 
 
 class Config(RemoteBase):
     @POSIX_ONLY
-    def test_overflow_limit_defaults_to_60_and_rejects_negative_or_boolean(self):
+    def test_a_budget_key_without_the_start_fields_is_refused(self):
+        self.configure({**CONFIG, "cap_metadata_key": "budget-exceeded"})
+        self.assertIsNone(remote.config(self.lines.append))
+        self.assertEqual(self.lines, ["remote config ignored (cap_metadata_key)"])
+
+    @POSIX_ONLY
+    def test_slots_default_to_2_and_must_be_a_positive_integer_and_the_old_key_is_ignored(self):
         self.configure(CONFIG)
-        self.assertEqual(remote.config(self.lines.append)["overflow_after_s"], 60)
-        for bad in (-1, True, "60"):
-            self.configure({**CONFIG, "overflow_after_s": bad})
+        cfg = remote.config(self.lines.append)
+        self.assertEqual((cfg["slots"], cfg["cap_metadata_key"]), (2, None))
+        for bad in (0, -1, True, "2", 1.5):
+            self.configure({**CONFIG, "slots": bad})
             self.assertIsNone(remote.config(self.lines.append))
-        self.assertEqual(self.lines[-1], "remote config ignored (overflow_after_s)")
+        self.assertEqual(self.lines[-1], "remote config ignored (slots)")
+        self.configure({**CONFIG, "cap_metadata_key": " "})
+        self.assertIsNone(remote.config(self.lines.append))
+        self.configure({**CONFIG, "instance": "i", "zone": "z", "project": "p", "slots": 3,
+                        "cap_metadata_key": "budget-exceeded", "overflow_after_s": "x"})
+        cfg = remote.config(self.lines.append)
+        self.assertEqual((cfg["slots"], cfg["cap_metadata_key"]), (3, "budget-exceeded"))
+        self.assertNotIn("overflow_after_s", cfg)
 
     def test_without_the_key_nothing_runs(self):
         self.assertIsNone(self.run_remote(["./gradlew", "check"]))
@@ -211,7 +230,7 @@ class RemoteRun(RemoteBase):
             self.assertIn(f"--include={pattern}", back)
         self.assertLess(back.index("--include=*/"), back.index("--exclude=*"))
         self.assertEqual(self.shell.popened, [["ssh", "-tt", *remote.KEEPALIVE, "-i", "~/.ssh/key", HOST,
-                                               f"cd {dest} && exec gq run -- ./gradlew :shared:testAndroidHostTest"]])
+                                               f"cd {dest} && exec ./gradlew :shared:testAndroidHostTest"]])
         self.assertEqual(self.lines, [f"remote {HOST}: ./gradlew :shared:testAndroidHostTest"])
 
     def test_probe_retries_until_the_vm_answers(self):
@@ -255,15 +274,15 @@ class RemoteRun(RemoteBase):
         cmd = ["perl", "-e", "alarm 3000; exec @ARGV", "./gradlew", "check", "-x", ":shared:iosSimulatorArm64Test"]
         self.assertEqual(self.run_remote(cmd), 0)
         remote_cmd = self.shell.popened[0][-1]
-        self.assertEqual(remote_cmd, "cd remote-builds/evolvai/wt && exec gq run -- "
+        self.assertEqual(remote_cmd, "cd remote-builds/evolvai/wt && exec "
                                      "perl -e 'alarm 3000; exec @ARGV' ./gradlew check -x :shared:iosSimulatorArm64Test")
-        self.assertEqual(shlex.split(remote_cmd)[7:], cmd)
+        self.assertEqual(shlex.split(remote_cmd)[4:], cmd)
 
     def test_project_dir_inside_runs_from_the_same_subdirectory(self):
         self.configure({**CONFIG, "root": "/srv/builds"})
         os.chdir(self.top / "backend")
         self.assertEqual(self.run_remote(["./gradlew", "-p", ".", "check"]), 0)
-        self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && exec gq run -- "
+        self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && exec "
                                                     "./gradlew -p . check")
         os.chdir(self.top)
         self.assertEqual(self.run_remote(["./gradlew", "-p", "backend", "check"]), 0)
@@ -309,7 +328,7 @@ class Fallback(RemoteBase):
         self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p"})
         self.use_shell(**kw)
         self.assertIsNone(self.run_remote(["./gradlew", "check"]))
-        self.assertEqual(self.lines, [f"remote unavailable ({reason}); running locally"])
+        self.assertEqual(self.lines, [f"remote unavailable ({reason})"])
         self.assertEqual(self.shell.popened, [])
 
     def test_vm_down_waits_180_seconds_then_falls_back(self):
@@ -323,6 +342,36 @@ class Fallback(RemoteBase):
                       fail={"start": (1, "ERROR: (gcloud.compute.instances.start) permission denied")})
         self.assertNotIn("probe", self.shell.names())
 
+    def test_a_capped_vm_is_unavailable_before_it_is_started(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", "cap_metadata_key": "budget-exceeded"})
+        self.use_shell()
+        self.shell.budget = "true"
+        self.assertIsNone(self.run_remote(["./gradlew", "check"]))
+        self.assertEqual(self.lines, ["remote unavailable (budget exceeded)"])
+        self.assertEqual(self.shell.names(), ["git", "describe"])
+        self.assertIn("--format=json", self.shell.argv("describe"))
+
+    def test_null_metadata_items_do_not_crash_the_budget_check(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", "cap_metadata_key": "budget-exceeded"})
+        for body in ({"metadata": {"items": None}}, {"metadata": None}):
+            self.use_shell()
+            real = self.shell.run
+            self.shell.run = lambda argv, cwd=None, b=body, r=real: (0, json.dumps(b), "") if "describe" in argv \
+                else r(argv, cwd)
+            self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
+
+    def test_an_uncapped_vm_starts_after_the_budget_check(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", "cap_metadata_key": "budget-exceeded"})
+        self.use_shell()
+        self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
+        self.assertEqual(self.shell.names()[:3], ["git", "describe", "start"])
+
+    def test_no_budget_key_never_describes_the_vm(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p"})
+        self.use_shell()
+        self.run_remote(["./gradlew", "check"])
+        self.assertNotIn("describe", self.shell.names())
+
     def test_rsync_failure_falls_back(self):
         self.fallback("rsync: exit 12", fail={"rsync-out": (12, "")})
 
@@ -330,23 +379,25 @@ class Fallback(RemoteBase):
         self.configure(CONFIG)
         self.use_shell(fail={"popen": "No such file or directory: 'ssh'"})
         self.assertIsNone(self.run_remote(["./gradlew", "check"]))
-        self.assertEqual(self.lines[-1], "remote unavailable (ssh: No such file or directory: 'ssh'); running locally")
+        self.assertEqual(self.lines[-1], "remote unavailable (ssh: No such file or directory: 'ssh')")
 
 
 class Queue:
-    """The local queue server as gq sees it: answers to enqueue, wait and ticket, and the releases it got."""
+    """The local queue server as gq sees it. `waits` are the answers of /api/wait, as a state or (state, dest)."""
 
-    def __init__(self, waits, ticket="waiting"):
-        self.waits, self.ticket, self.released, self.paths = list(waits), ticket, [], []
+    def __init__(self, waits):
+        self.waits, self.released, self.paths, self.remote_posts, self.enqueued = list(waits), [], [], [], []
 
     def call_retrying(self, path, body=None):
         self.paths.append(path)
         if path == "/api/enqueue":
+            self.enqueued.append(body)
             return {"id": 5}
-        if path.startswith("/api/ticket"):
-            return {"state": self.ticket}
-        state = self.waits.pop(0)
-        return {"state": state, "position": 1, "waiting": 1}
+        if path == "/api/remote":
+            self.remote_posts.append(body)
+            return {"ok": True}
+        state, dest = self.waits.pop(0) if isinstance(self.waits[0], tuple) else (self.waits.pop(0), None)
+        return {"state": state, "dest": dest, "position": 1, "waiting": 1}
 
     def call(self, path, body=None, timeout=None):
         self.released.append(body)
@@ -355,8 +406,8 @@ class Queue:
 
 @POSIX_ONLY
 class GqRun(RemoteBase):
-    def gq_run(self, queue, overflow_after_s=0, local_code=0):
-        self.configure({**CONFIG, "overflow_after_s": overflow_after_s})
+    def gq_run(self, queue, local_code=0):
+        self.configure(CONFIG)
         local = mock.Mock()
         local.wait.return_value = local_code
         with mock.patch.object(gq, "call_retrying", queue.call_retrying), mock.patch.object(gq, "call", queue.call), \
@@ -366,43 +417,75 @@ class GqRun(RemoteBase):
                 gq.run(["./gradlew", "check"])
         return exited.exception.code, popen
 
-    def test_a_free_local_slot_never_touches_the_build_machine(self):
-        code, popen = self.gq_run(Queue(["granted"]))
+    def test_the_enqueue_says_whether_the_command_may_run_remotely(self):
+        queue = Queue([("granted", "mac")])
+        self.gq_run(queue)
+        self.assertIs(queue.enqueued[0]["remote"], True)
+        queue = Queue([("granted", "mac")])
+        with mock.patch.object(gq, "call_retrying", queue.call_retrying), mock.patch.object(gq, "call", queue.call), \
+                mock.patch.object(gq.subprocess, "Popen", return_value=mock.Mock(wait=lambda: 0)), \
+                mock.patch.dict(os.environ, {"BQ_TICKET": ""}):
+            with self.assertRaises(SystemExit):
+                gq.run(["./gradlew", "ktlintFormat"])
+        self.assertIs(queue.enqueued[0]["remote"], False)
+
+    def test_a_mac_grant_never_touches_the_build_machine(self):
+        queue = Queue([("granted", "mac")])
+        code, popen = self.gq_run(queue)
         self.assertEqual(code, 0)
         popen.assert_called_once()
-        self.assertEqual((self.shell.calls[1:], self.shell.popened), ([], []))  # only the eligibility git call
+        self.assertEqual((self.shell.calls[1:], self.shell.popened, queue.remote_posts), ([], [], []))
 
-    def test_a_long_wait_overflows_releases_the_ticket_and_exits_with_the_remote_code(self):
+    def test_a_long_wait_alone_never_sends_the_build_to_the_machine(self):
+        code, popen = self.gq_run(Queue(["waiting", "waiting", ("granted", "mac")]))
+        self.assertEqual(code, 0)
+        popen.assert_called_once()
+        self.assertEqual(self.shell.popened, [])
+
+    def test_a_vm_grant_starts_runs_releases_with_the_remote_code_and_exits_with_it(self):
         self.shell.child = Child(7)
-        queue = Queue(["waiting"])
+        queue = Queue([("granted", "vm")])
         code, popen = self.gq_run(queue)
         self.assertEqual(code, 7)
         popen.assert_not_called()
-        self.assertEqual(queue.released, [{"id": 5, "exit_code": None}])
+        self.assertEqual(queue.remote_posts, [{"id": 5, "phase": "running"}])
+        self.assertEqual(queue.released, [{"id": 5, "exit_code": 7}])
         self.assertEqual(len(self.shell.popened), 1)
-        self.assertIn("ticket #5: waited 0s; trying the build machine", self.lines)
 
-    def test_a_wait_shorter_than_the_limit_stays_local(self):
-        code, popen = self.gq_run(Queue(["waiting", "granted"]), overflow_after_s=3600)
-        self.assertEqual(code, 0)
-        popen.assert_called_once()
-        self.assertNotIn("rsync-out", self.shell.names())
-
-    def test_a_slot_granted_while_the_machine_starts_runs_here(self):
-        code, popen = self.gq_run(Queue(["waiting"], ticket="granted"), local_code=3)
-        self.assertEqual(code, 3)
-        popen.assert_called_once()
-        self.assertIn("rsync-out", self.shell.names())
-        self.assertEqual(self.shell.popened, [])
-
-    def test_an_unavailable_machine_keeps_the_ticket_waiting_and_is_tried_once(self):
+    def test_a_failed_start_hands_the_ticket_back_and_runs_nowhere_until_the_next_grant(self):
         self.use_shell(fail={"rsync-out": (12, "")})
-        queue = Queue(["waiting", "waiting", "granted"])
+        queue = Queue([("granted", "vm"), "waiting", ("granted", "mac")])
         code, popen = self.gq_run(queue)
         self.assertEqual(code, 0)
-        popen.assert_called_once()
-        self.assertEqual(self.shell.names().count("rsync-out"), 1)
+        self.assertEqual(queue.remote_posts, [{"id": 5, "phase": "failed", "reason": "rsync: exit 12"}])
+        self.assertIn("remote unavailable (rsync: exit 12)", self.lines)
+        self.assertEqual(self.shell.popened, [])
+        popen.assert_called_once()  # the later Mac grant
         self.assertEqual(queue.released, [{"id": 5, "exit_code": 0}])
+
+    def test_ssh_that_cannot_start_hands_the_ticket_back(self):
+        self.use_shell(fail={"popen": "no ssh"})
+        queue = Queue([("granted", "vm"), ("granted", "mac")])
+        self.gq_run(queue)
+        self.assertEqual([p["phase"] for p in queue.remote_posts], ["running", "failed"])
+        self.assertEqual(queue.remote_posts[1]["reason"], "ssh")
+
+    def test_a_lost_connection_exits_255_and_is_not_repeated(self):
+        self.shell.child = Child(255)
+        queue = Queue([("granted", "vm")])
+        code, popen = self.gq_run(queue)
+        self.assertEqual(code, 255)
+        popen.assert_not_called()
+        self.assertEqual(len(self.shell.popened), 1)
+
+    def test_a_cancelled_remote_build_terminates_ssh_and_releases_the_ticket(self):
+        child = Child(255, on_wait=lambda: signal.getsignal(signal.SIGALRM)(signal.SIGALRM, None))
+        self.shell.child = child
+        queue = Queue([("granted", "vm")])
+        code, _popen = self.gq_run(queue)
+        self.assertEqual(code, 128 + signal.SIGALRM)
+        self.assertTrue(child.terminated)
+        self.assertEqual(queue.released, [{"id": 5, "exit_code": 128 + signal.SIGALRM}])
 
     def test_nested_run_inside_a_granted_slot_never_goes_remote(self):
         self.configure(CONFIG)
@@ -413,6 +496,95 @@ class GqRun(RemoteBase):
                 gq.run(["./gradlew", "check"])
         execvp.assert_called_once_with("./gradlew", ["./gradlew", "check"])
         self.assertEqual((self.shell.calls, self.shell.popened), ([], []))
+
+
+@POSIX_ONLY
+class ServerFlow(RemoteBase):
+    """The server's side of a grant for the build machine: write it, take it back on a failed start, wait 300 s."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(server, "DATA", self.tmp / "queue-data")  # a database of its own per test
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.q = server.Queue()
+        self.addCleanup(self.q.db.close)
+        self.configure({**CONFIG, "slots": 1})
+        self.procs = {p.pid: p for p in [core.Proc(pid=1, ppid=0, rss_kb=1, cpu=0, etime="", lstart="L",
+                                                   args="/sbin/launchd")]}
+
+    def enqueue(self, i, remote_ok=True):
+        pid = 9000 + i
+        self.procs[pid] = core.Proc(pid=pid, ppid=1, rss_kb=1, cpu=0, etime="", lstart="L",
+                                    args="python3 /u/.local/bin/gq run -- ./gradlew x")
+        return self.q.enqueue({"pid": pid, "cwd": "/w", "cmd": "./gradlew check", "remote": remote_ok})["id"]
+
+    def plan(self, now):
+        pl = core.plan(self.procs, [], self.q.active_tickets(), snapshot_ts=now, now=now, pressure=4,
+                       busy_daemons=set(), idle_since={}, last_grant_ts=None, live_claude_pids=set(),
+                       remote=self.q.remote_view(now))
+        self.q.grant(pl, now)
+        return pl
+
+    def row(self, tid):
+        return self.q.db.execute("select state, dest, phase from tickets where id=?", (tid,)).fetchone()
+
+    def test_failed_start_returns_the_ticket_in_place_and_the_machine_waits_300_s(self):
+        first, second = self.enqueue(1), self.enqueue(2)
+        now = time.time() + 10
+        self.assertEqual(self.plan(now).remote_grants, [first])
+        self.assertEqual(self.row(first), ("granted", "vm", "starting"))
+        self.assertEqual(self.q.status(first)["dest"], "vm")
+        self.assertEqual(self.q.wait(first, 0)["dest"], "vm")
+        self.assertEqual(self.row(second), ("waiting", None, None))  # one slot: the second waits
+        self.q.remote_phase(first, "running", None)
+        self.assertEqual(self.row(first), ("granted", "vm", "running"))
+        self.q.release(first, 0)  # the slot comes back with the release
+        self.assertEqual(self.plan(now).remote_grants, [second])
+        self.q.remote_phase(second, "failed", "rsync: exit 12")
+        self.assertEqual(self.row(second), ("waiting", None, None))
+        self.assertEqual(self.q.status(second)["position"], 1)  # same id, same place
+        self.assertEqual(self.plan(now + 1).remote_grants, [])  # the machine is out of the choice
+        down = self.q.remote_down_until
+        self.assertAlmostEqual(down, time.time() + core.REMOTE_RETRY_S, delta=5)
+        self.assertEqual(self.plan(down - 1).remote_grants, [])
+        self.assertEqual(self.plan(down + 1).remote_grants, [second])
+        self.assertIn("event.remote_failed", [e["msg"]["key"] for e in self.q.events])
+
+    def test_a_reaped_remote_gq_frees_the_machine_slot_in_the_same_tick(self):
+        first, second = self.enqueue(1), self.enqueue(2)
+        now = time.time() + 10
+        self.plan(now)
+        del self.procs[9001]  # the gq of the remote build died
+        pl = self.plan(now + 1)
+        self.assertEqual(pl.reaps, [(first, "owner process gone")])
+        self.assertEqual(pl.remote_grants, [second])
+
+    def test_a_client_that_does_not_say_remote_never_gets_the_machine(self):
+        old = self.enqueue(1, remote_ok=False)
+        self.assertEqual(self.plan(time.time() + 10).remote_grants, [])
+        self.assertEqual(self.row(old), ("waiting", None, None))
+
+    def test_a_report_for_a_ticket_not_on_the_machine_changes_nothing(self):
+        tid = self.enqueue(1)
+        self.q.remote_phase(tid, "failed", "x")
+        self.assertEqual(self.q.remote_down_until, 0.0)
+        self.assertNotIn("event.remote_failed", [e["msg"]["key"] for e in self.q.events])
+
+    def test_tick_hands_a_full_macs_eligible_ticket_to_the_machine(self):
+        tid = self.enqueue(1)
+        mem = {"pressure": 4, "free_pct": 50, "total_gb": 0, "app_gb": 0, "wired_gb": 0, "compressed_gb": 0,
+               "cached_gb": 0, "free_gb": 0, "swap_used_gb": 0, "swap_total_gb": 0}
+        with mock.patch.object(server.system, "snapshot_procs", return_value=self.procs), \
+                mock.patch.object(server.system, "memory", return_value=mem), \
+                mock.patch.object(server.system, "tcp_links", return_value=({}, [])), \
+                mock.patch.object(server.system, "cpu_total", return_value=0.0):
+            self.q.tick()
+        self.assertEqual(self.row(tid), ("granted", "vm", "starting"))
+
+    def test_an_unknown_phase_is_a_bad_request(self):
+        with self.assertRaises(ValueError):
+            self.q.remote_phase(1, "later", None)
 
 
 @POSIX_ONLY
