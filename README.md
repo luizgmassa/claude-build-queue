@@ -128,7 +128,9 @@ this key and keeps it on Save & Apply.
   the machine unavailable (`budget exceeded`).
 - `fetch_back` (optional, list of `rsync` patterns): copied back from the build machine in addition to the reports,
   test results and outputs (`build/reports`, `build/test-results`, `build/outputs`), for example
-  `build/generated/openapi/***`. Default: none.
+  `build/generated/openapi/***`. Default: none. Before each command the build machine deletes what comes back
+  (these patterns and the three above), so a report of an earlier run never reaches this machine; the Gradle build
+  cache restores the outputs of tasks that did not change.
 - `local_tasks` (optional): a task containing one of these, case-insensitive, runs locally. Default:
   `ktlintFormat` (it rewrites the sources here), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
   and `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: they read keys, a database or a signing file

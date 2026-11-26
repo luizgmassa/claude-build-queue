@@ -127,7 +127,9 @@ mantém no Salvar e aplicar.
   torna a máquina indisponível (`budget exceeded`).
 - `fetch_back` (opcional, lista de padrões do `rsync`): voltam da máquina de build além dos relatórios, resultados
   de teste e saídas (`build/reports`, `build/test-results`, `build/outputs`), por exemplo
-  `build/generated/openapi/***`. Padrão: nenhum.
+  `build/generated/openapi/***`. Padrão: nenhum. Antes de cada comando a máquina de build apaga o que vai voltar
+  (estes padrões e os três acima), para que relatório de execução anterior nunca chegue a esta máquina; o cache de
+  build do Gradle restaura a saída das tarefas que não mudaram.
 - `local_tasks` (opcional): tarefa que contém um destes, sem diferenciar caixa, roda local. Padrão:
   `ktlintFormat` (reescreve as fontes daqui), `ios`, `generateDummyFramework`, `installDebug`, `connected`,
   e `dependencyCheck`, `applyMigrations`, `assemble`, `bundle`: leem chave, banco ou arquivo de assinatura que

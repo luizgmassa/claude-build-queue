@@ -271,6 +271,15 @@ def prepare(j):
         # ignored files (local.properties included) stay here
         step("rsync", rsync(cfg, "--delete", "--exclude=/.git", *protect, "--filter=:- .gitignore", f"{top}/",
                             f"{cfg['host']}:{dest}/"))
+        step("clear", ssh(cfg, f"cd {shlex.quote(dest)} && {clear_command(BACK + cfg['fetch_back'])}", *FAIL_FAST))
+
+
+def clear_command(patterns):
+    """Removes, on the build machine, what the copy back would bring: `build/` survives between runs, and a report of a
+    deleted test or a dropped generated directory must not reach this machine. The build cache restores the rest."""
+    paths = ["." + p if p.startswith("/") else "*/" + p for p in (p.removesuffix("/***") for p in patterns)]
+    tests = [a for path in paths for a in ("-o", "-path", path)][1:]
+    return shlex.join(["find", ".", "(", *tests, ")", "-prune", "-exec", "rm", "-rf", "{}", "+"])
 
 
 def fetch_back(j, say):

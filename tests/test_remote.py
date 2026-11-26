@@ -48,7 +48,7 @@ class FakeShell:
     @staticmethod
     def step(argv):
         if argv[0] == "ssh":
-            return "probe" if argv[-1] == "true" else "mkdir"
+            return "probe" if argv[-1] == "true" else "mkdir" if argv[-1].startswith("mkdir") else "clear"
         if argv[0] == "rsync":
             return "rsync-out" if "--delete" in argv else "rsync-back"
         if argv[0] == "gcloud":
@@ -229,7 +229,7 @@ class RemoteRun(RemoteBase):
         self.configure(CONFIG)
         self.shell.child = Child(3)
         self.assertEqual(self.run_remote(["./gradlew", ":shared:testAndroidHostTest"]), 3)
-        self.assertEqual(self.shell.names(), ["git", "probe", "mkdir", "rsync-out", "rsync-back"])
+        self.assertEqual(self.shell.names(), ["git", "probe", "mkdir", "rsync-out", "clear", "rsync-back"])
         dest = "remote-builds/evolvai/wt"
         self.assertEqual(self.shell.argv("mkdir"), ["ssh", *remote.FAIL_FAST, "-i", "~/.ssh/key", HOST,
                                                     f"mkdir -p {dest}"])
@@ -253,6 +253,7 @@ class RemoteRun(RemoteBase):
         for pattern in (*remote.BACK, "build/generated/openapi/***"):
             self.assertIn(f"--include={pattern}", back)
         self.assertLess(back.index("--include=build/generated/openapi/***"), back.index("--exclude=*"))
+        self.assertIn("-path '*/build/generated/openapi'", self.shell.argv("clear")[-1])
 
     def test_probe_retries_until_the_vm_answers(self):
         self.configure(CONFIG)
@@ -650,6 +651,24 @@ class RealRsync(RemoteBase):
         self.assertTrue((self.top / "backend/build/test-results/t/TEST-x.xml").exists())
         self.assertFalse((self.top / ".gradle").exists())
         self.assertEqual((self.top / "local.properties").read_text(), "sdk.dir=/here")
+
+    def test_clear_removes_what_comes_back_and_keeps_the_rest(self):
+        remote_dir = self.tmp / "vm"
+        stale = ("build/reports/old", "backend/build/test-results/t", "build/outputs/apk",
+                 "contracts-kotlin/build/generated/openapi/c9")
+        kept = ("build/classes/k", "backend/build/generated/ksp/k", ".gradle/c", "src/build/reportsx")
+        for d in stale + kept:
+            (remote_dir / d).mkdir(parents=True)
+            (remote_dir / d / "f").write_text("x")
+        self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
+        self.run_remote(["./gradlew", "check"])
+        command = self.shell.argv("clear")[-1].split(" && ", 1)[1]
+        out = subprocess.run(["sh", "-c", command], cwd=remote_dir, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for d in stale:
+            self.assertFalse((remote_dir / d).exists(), d)
+        for d in kept:
+            self.assertTrue((remote_dir / d / "f").exists(), d)
 
 
 NOW = 1000.0
