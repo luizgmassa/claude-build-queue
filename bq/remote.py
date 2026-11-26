@@ -35,6 +35,8 @@ LOCAL_TASKS = ["ktlintFormat", "ios", "generateDummyFramework", "installDebug", 
                "applyMigrations", "assemble", "bundle"]
 PROBE_LIMIT_S = 180
 PROBE_PAUSE_S = 5
+# Compute Engine statuses of a machine on its way up: anything else after a start means the start did not take
+UP = {"PROVISIONING", "STAGING", "RUNNING"}
 SSH_LOST = 255
 # unanchored: `**/build/reports/***` would miss the root project's build/reports (the Kover XML)
 BACK = ["build/reports/***", "build/test-results/***", "build/outputs/***"]
@@ -233,14 +235,14 @@ def find_gcloud():
     return shutil.which("gcloud", path=path) or "gcloud"
 
 
-def instance_state(cfg, gcloud="gcloud"):
+def instance_state(cfg, gcloud="gcloud", name="budget"):
     """(status, capped) of the build machine from one `describe`: its Compute Engine status and whether the metadata
-    `cap_metadata_key` is `true`. Raises Unavailable when the answer cannot be had."""
+    `cap_metadata_key` is `true`. Raises Unavailable, its reason led by `name`, when the answer cannot be had."""
     instance, zone, project = cfg["start"]
     code, out, err = SHELL.run([gcloud, "compute", "instances", "describe", instance, f"--zone={zone}",
                                 f"--project={project}", "--format=json"])
     if code != 0:
-        raise Unavailable(_reason("budget", code, err))
+        raise Unavailable(_reason(name, code, err))
     key = cfg["cap_metadata_key"]
     try:
         info = json.loads(out)
@@ -248,7 +250,7 @@ def instance_state(cfg, gcloud="gcloud"):
         capped = bool(key) and any(i.get("key") == key and str(i.get("value")).lower() == "true" for i in items)
         return info.get("status"), capped
     except (ValueError, AttributeError, TypeError) as e:
-        raise Unavailable(f"budget: unreadable describe output ({e})")
+        raise Unavailable(f"{name}: unreadable describe output ({e})")
 
 
 def check_budget(cfg):
@@ -257,13 +259,29 @@ def check_budget(cfg):
         raise Unavailable("budget exceeded")
 
 
+def start_machine(cfg):
+    """Starts the machine and returns once Compute Engine reports it on its way up. A start that lands while the idle
+    shutdown is still stopping the machine ends DONE and leaves it TERMINATED, so a machine found STOPPING is waited
+    out and started again, within PROBE_LIMIT_S."""
+    instance, zone, project = cfg["start"]
+    started, status = SHELL.now(), None
+    while True:
+        if status != "STOPPING":  # a start sent to a stopping machine is the one that does not take
+            step("start", ["gcloud", "compute", "instances", "start", instance, f"--zone={zone}",
+                           f"--project={project}", "--quiet"])
+        status = instance_state(cfg, name="start")[0]
+        if status in UP:
+            return
+        if SHELL.now() - started >= PROBE_LIMIT_S:
+            raise Unavailable(f"start: the machine is still {status}")
+        SHELL.sleep(PROBE_PAUSE_S)
+
+
 def prepare(j):
     cfg, top, dest = j.cfg, j.top, j.dest
     if cfg["start"]:
-        instance, zone, project = cfg["start"]
         check_budget(cfg)
-        step("start", ["gcloud", "compute", "instances", "start", instance, f"--zone={zone}",
-                       f"--project={project}", "--quiet"])
+        start_machine(cfg)
     probe(cfg)
     step("rsync", ssh(cfg, "mkdir -p " + shlex.quote(dest), *FAIL_FAST))
     protect = [f"--filter=P {p}" for p in PROTECTED]

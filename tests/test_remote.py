@@ -44,6 +44,7 @@ class FakeShell:
         self.calls, self.popened, self.clock = [], [], 0.0
         self.budget = "false"
         self.status = "RUNNING"
+        self.statuses = []  # answered by the next describes, in order, before `status`
 
     @staticmethod
     def step(argv):
@@ -64,7 +65,7 @@ class FakeShell:
         if name == "git":
             return 0, f"{self.top}\n{self.common}\n", ""
         if name == "describe":
-            return 0, json.dumps({"status": self.status,
+            return 0, json.dumps({"status": self.statuses.pop(0) if self.statuses else self.status,
                                     "metadata": {"items": [{"key": "budget-exceeded", "value": self.budget}]}}), ""
         return 0, "", ""
 
@@ -378,8 +379,8 @@ class Fallback(RemoteBase):
         for body in ({"metadata": {"items": None}}, {"metadata": None}):
             self.use_shell()
             real = self.shell.run
-            self.shell.run = lambda argv, cwd=None, b=body, r=real: (0, json.dumps(b), "") if "describe" in argv \
-                else r(argv, cwd)
+            self.shell.run = lambda argv, cwd=None, b={**body, "status": "RUNNING"}, r=real: \
+                (0, json.dumps(b), "") if "describe" in argv else r(argv, cwd)
             self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
 
     def test_an_uncapped_vm_starts_after_the_budget_check(self):
@@ -388,11 +389,34 @@ class Fallback(RemoteBase):
         self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
         self.assertEqual(self.shell.names()[:3], ["git", "describe", "start"])
 
-    def test_no_budget_key_never_describes_the_vm(self):
+    def test_no_budget_key_describes_the_vm_only_after_the_start(self):
         self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p"})
         self.use_shell()
-        self.run_remote(["./gradlew", "check"])
-        self.assertNotIn("describe", self.shell.names())
+        self.shell.budget = "true"  # without the key the metadata is never read as a cap
+        self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
+        self.assertEqual(self.shell.names()[:4], ["git", "start", "describe", "probe"])
+
+    def test_a_start_racing_the_idle_shutdown_waits_and_starts_again(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p"})
+        self.use_shell()
+        self.shell.statuses = ["STOPPING", "STOPPING", "TERMINATED"]
+        self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
+        self.assertEqual(self.shell.names()[:8], ["git", "start", "describe", "describe", "describe", "start",
+                                                  "describe", "probe"])
+        self.assertEqual(self.shell.clock, 3 * remote.PROBE_PAUSE_S)
+
+    def test_a_machine_that_never_comes_up_falls_back_without_the_probe(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p"})
+        self.use_shell()
+        self.shell.status = "TERMINATED"
+        self.assertIsNone(self.run_remote(["./gradlew", "check"]))
+        self.assertEqual(self.lines, ["remote unavailable (start: the machine is still TERMINATED)"])
+        self.assertGreaterEqual(self.shell.clock, remote.PROBE_LIMIT_S)
+        self.assertNotIn("probe", self.shell.names())
+
+    def test_a_failed_describe_after_the_start_falls_back(self):
+        self.fallback("start: boom", fail={"describe": (1, "boom")})
+        self.assertEqual(self.shell.names(), ["git", "start", "describe"])
 
     def test_rsync_failure_falls_back(self):
         self.fallback("rsync: exit 12", fail={"rsync-out": (12, "")})
