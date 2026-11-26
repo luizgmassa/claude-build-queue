@@ -120,7 +120,9 @@ this key and keeps it on Save & Apply.
   the remote home.
 - `ssh_options` (optional): extra `ssh` arguments, also used by `rsync`.
 - `instance`, `zone`, `project` (optional, all three or none): `gcloud compute instances start` before each
-  remote run, so a stopped Compute Engine VM comes up; then `gq` waits up to 180 s for `ssh … true`.
+  remote run, so a stopped Compute Engine VM comes up. A `describe` then checks that it is on its way up: a start
+  sent while the VM is still stopping (its idle shutdown) ends DONE without starting it, so `gq` waits the stop
+  out and starts it again, for up to 180 s. Then `gq` waits up to 180 s for `ssh … true`.
 - `slots` (optional, whole number from 1, default 2): how many builds the build machine runs at once. The server
   counts them; a ticket holds one from its grant until its release (or until its `gq` dies).
 - `cap_metadata_key` (optional, needs `instance`, `zone` and `project`): before starting the machine, `gq` reads
