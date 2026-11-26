@@ -156,6 +156,21 @@ SIGHUP ou SIGALRM no `gq` local derrubam o `ssh`; a pseudo-TTY faz o sshd mandar
 recebe a máquina de build. Chave inválida imprime `[gq] remote config ignored (<campo>)` e não muda nada. Não existe
 no Windows (sem `flock`, sem `rsync` nativo).
 
+### A visão da fila geral
+
+Com a chave `remote`, `gq status` e a página listam cada ticket uma vez, Mac e máquina de build juntos. Cada ticket
+tem um destino: `mac`, `vm` (`vm (starting)` enquanto a máquina liga) ou vazio enquanto espera. O `gq status` acrescenta
+a linha `vm <usadas>/<vagas> in use  state=<estado>` depois da linha de vagas, e a página ganha um card e uma coluna
+de destino. Sem a chave nada disso aparece e a saída não muda. Um ticket remoto fica na lista até o `release`.
+
+O `state` é o primeiro que valer: `no_budget` (a metadata `cap_metadata_key` é `true`, ou a última partida falhou com
+`budget exceeded`); `unavailable (<motivo>)` (falha recente, por 300 s); `starting` ou `on` (um ticket na máquina está
+ligando ou rodando); senão o que o Compute Engine diz: `RUNNING` é `on`, `STAGING` e `PROVISIONING` são `starting`,
+o resto é `off`, e `unknown` antes da primeira resposta ou quando o `gcloud` falha. Uma thread do servidor roda
+`gcloud compute instances describe` a cada 60 s (o `tick` nunca espera por ela; procura no `PATH`,
+`/opt/homebrew/bin` e `/usr/local/bin`). Sem `instance`, `zone` e `project` nada é consultado e a máquina ociosa conta
+como `on`.
+
 ## Limpeza (`gq enforce on|off`)
 
 Em `off` (simulação) a página só lista o que mataria. Em `on`:

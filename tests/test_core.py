@@ -730,6 +730,16 @@ class Messages(unittest.TestCase):
             self.assertEqual(set(re.findall(r"\{(\w+)\}", i18n["pt-BR"][key])), placeholders, key)
 
 
+    def test_page_labels_every_vm_state_and_destination_in_both_languages(self):
+        from bq import server
+        i18n = self.page_i18n()
+        states = {*server.VM_STATES, *server.VM_STATUS.values()}
+        self.assertEqual(states, set(server.VM_STATES))
+        for lang in ("en-US", "pt-BR"):
+            for key in [*(f"vm.{s}" for s in server.VM_STATES), "dest.mac", "dest.vm", "dest.vm_starting"]:
+                self.assertTrue(i18n[lang].get(key), f"{lang} {key}")
+
+
 class Toolchains(unittest.TestCase):
     QUEUED = {"npm ci": "node", "npm install": "node", "npm run build": "node", "npm test": "node",
               "npm run test:unit": "node", "pnpm build": "node", "pnpm --filter=web test": "node", "yarn": "node",

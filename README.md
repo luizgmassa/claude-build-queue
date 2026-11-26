@@ -157,6 +157,22 @@ and the ticket's release frees the build machine's slot. A client that does not 
 gets the build machine. An invalid key prints `[gq] remote config ignored (<field>)` and changes nothing. Not on
 Windows (no `flock`, no native `rsync`).
 
+### The general queue view
+
+With the `remote` key, `gq status` and the page list every ticket once, Mac and build machine together. Each ticket
+has a destination: `mac`, `vm` (`vm (starting)` while the machine boots) or empty while it waits. `gq status` adds a
+line `vm <used>/<slots> in use  state=<state>` after the slots line, and the page adds a card and a destination
+column. Without the key none of this appears and the output is unchanged. A remote ticket stays listed until its
+`release`.
+
+`state` is the first that applies: `no_budget` (the metadata `cap_metadata_key` is `true`, or the last start failed
+with `budget exceeded`); `unavailable (<reason>)` (a recent failure, for 300 s); `starting` or `on` (a ticket on the
+machine is starting or running); otherwise what Compute Engine says: `RUNNING` is `on`, `STAGING` and `PROVISIONING`
+are `starting`, anything else is `off`, and `unknown` before the first answer or when `gcloud` fails. A server thread
+runs `gcloud compute instances describe` every 60 s (the tick never waits for it; it looks in `PATH`,
+`/opt/homebrew/bin` and `/usr/local/bin`). Without `instance`, `zone` and `project` nothing is asked and an idle
+machine counts as `on`.
+
 ## Cleanup (`gq enforce on|off`)
 
 In `off` (dry run) the page only lists what it would kill. In `on`:
