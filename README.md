@@ -151,9 +151,17 @@ the build machine, `gq`:
    leaving out `/.git` and every file `.gitignore` ignores (`local.properties` included); the remote `build/`,
    `.gradle/` and `.kotlin/` survive, so the remote build stays incremental. The ticket stays granted, on the
    build machine's slot, from here to the end;
-2. prints `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && exec <cmd>'` (no `gq` there);
+2. adds `--no-daemon` and `-Pkotlin.compiler.execution.strategy=in-process` after `./gradlew`, prints
+   `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && exec <cmd>'` (no `gq` there);
 3. copies `build/reports/`, `build/test-results/` and `build/outputs/` of every project back, even when the
    build fails, and exits with the remote exit code.
+
+No daemon outlives a remote build: the build machine has no `gq` to end an idle Gradle or Kotlin daemon, so every
+remote build runs without them. The price is a cold JVM each time: Gradle starts, loads the build and compiles with
+no warm daemon behind it, and the Kotlin compiler runs inside the Gradle JVM, on the heap of `org.gradle.jvmargs`
+instead of `kotlin.daemon.jvmargs`. When `org.gradle.jvmargs` asks for a JVM other than the client's, Gradle still
+forks a single-use daemon, which ends with the build. What is on disk still counts: `build/`, `.gradle/` (the
+configuration cache) and the Gradle build cache. A local build keeps its daemons; the cleanup below ends them.
 
 If the budget is spent, the VM does not start, `ssh` does not answer or the first copy fails, `gq` prints
 `[gq] remote unavailable (<step>: <error>)`, hands the ticket back to the queue (same id, so the same place) and the

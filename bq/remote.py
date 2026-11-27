@@ -33,6 +33,8 @@ VALUE_OPTIONS = {"-x", "--exclude-task", "--tests", "-p", "--project-dir", "-I",
 # the last four read keys, a database or a signing file that exist only on this machine (~/.config, the environment)
 LOCAL_TASKS = ["ktlintFormat", "ios", "generateDummyFramework", "installDebug", "connected", "dependencyCheck",
                "applyMigrations", "assemble", "bundle"]
+# nothing on the build machine ends an idle Gradle or Kotlin daemon (no gq there), so no remote build leaves one
+NO_DAEMONS = ["--no-daemon", "-Pkotlin.compiler.execution.strategy=in-process"]
 PROBE_LIMIT_S = 180
 PROBE_PAUSE_S = 5
 # Compute Engine statuses of a machine on its way up: anything else after a start means the start did not take
@@ -129,6 +131,12 @@ def gradle_args(cmd):
         return cmd[1:]
     perl_wrapped = cmd[:2] == ["perl", "-e"] and cmd[3:4] == ["./gradlew"]
     return cmd[4:] if perl_wrapped else None
+
+
+def daemonless(cmd):
+    """An eligible cmd with NO_DAEMONS right after `./gradlew`, minus the ones it already has."""
+    i = len(cmd) - len(gradle_args(cmd))
+    return cmd[:i] + [f for f in NO_DAEMONS if f not in cmd] + cmd[i:]
 
 
 def option_value(a, it):
@@ -316,7 +324,7 @@ def _default(signals):
 
 def execute(j, say, signals):
     """The remote exit code, or None when ssh cannot start."""
-    cfg, line = j.cfg, shlex.join(j.cmd)
+    cfg, line = j.cfg, shlex.join(daemonless(j.cmd))
     caught, child = [], None
 
     def stop(signum, _frame):

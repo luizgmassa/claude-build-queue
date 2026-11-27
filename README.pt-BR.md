@@ -150,9 +150,18 @@ máquina de build, o `gq`:
    `/.git` e sem todo arquivo que o `.gitignore` ignora (`local.properties` incluído); `build/`, `.gradle/` e
    `.kotlin/` remotos sobrevivem, e a build remota continua incremental. O ticket fica concedido, na vaga da
    máquina de build, daqui até o fim;
-2. imprime `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && exec <cmd>'` (sem `gq` lá);
+2. põe `--no-daemon` e `-Pkotlin.compiler.execution.strategy=in-process` depois de `./gradlew`, imprime
+   `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && exec <cmd>'` (sem `gq` lá);
 3. traz de volta `build/reports/`, `build/test-results/` e `build/outputs/` de todo projeto, mesmo quando a
    build falha, e sai com o código de saída remoto.
+
+Nenhum daemon sobrevive a uma build remota: a máquina de build não tem `gq` para encerrar daemon ocioso do Gradle
+ou do Kotlin, então toda build remota roda sem eles. O preço é uma JVM fria a cada vez: o Gradle sobe, carrega a
+build e compila sem daemon aquecido por trás, e o compilador Kotlin roda dentro da JVM do Gradle, no heap de
+`org.gradle.jvmargs` em vez de `kotlin.daemon.jvmargs`. Quando `org.gradle.jvmargs` pede uma JVM diferente da do
+cliente, o Gradle ainda cria um daemon de uso único, que termina com a build. O que está em disco continua
+valendo: `build/`, `.gradle/` (o cache de configuração) e o build cache do Gradle. A build local mantém os
+daemons; a limpeza abaixo os encerra.
 
 Se o orçamento acabou, a VM não liga, o `ssh` não responde ou a primeira cópia falha, o `gq` imprime
 `[gq] remote unavailable (<passo>: <erro>)`, devolve o ticket à fila (mesmo id, portanto o mesmo lugar) e a máquina

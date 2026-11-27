@@ -20,6 +20,7 @@ from bq import core, gq, remote, server, settings  # noqa: E402
 HOST = "me@build-vm"
 POSIX_ONLY = unittest.skipIf(remote.fcntl is None, "the remote path does not exist on Windows")
 CONFIG = {"host": HOST, "root": "~/remote-builds", "ssh_options": ["-i", "~/.ssh/key"]}
+GRADLEW = "./gradlew " + " ".join(remote.NO_DAEMONS)  # what every remote build starts with
 
 
 class Child:
@@ -244,8 +245,8 @@ class RemoteRun(RemoteBase):
             self.assertIn(f"--include={pattern}", back)
         self.assertLess(back.index("--include=*/"), back.index("--exclude=*"))
         self.assertEqual(self.shell.popened, [["ssh", "-tt", *remote.KEEPALIVE, "-i", "~/.ssh/key", HOST,
-                                               f"cd {dest} && exec ./gradlew :shared:testAndroidHostTest"]])
-        self.assertEqual(self.lines, [f"remote {HOST}: ./gradlew :shared:testAndroidHostTest"])
+                                               f"cd {dest} && exec {GRADLEW} :shared:testAndroidHostTest"]])
+        self.assertEqual(self.lines, [f"remote {HOST}: {GRADLEW} :shared:testAndroidHostTest"])
 
     def test_fetch_back_patterns_join_the_copy_back(self):
         self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
@@ -298,18 +299,31 @@ class RemoteRun(RemoteBase):
         self.assertEqual(self.run_remote(cmd), 0)
         remote_cmd = self.shell.popened[0][-1]
         self.assertEqual(remote_cmd, "cd remote-builds/evolvai/wt && exec "
-                                     "perl -e 'alarm 3000; exec @ARGV' ./gradlew check -x :shared:iosSimulatorArm64Test")
-        self.assertEqual(shlex.split(remote_cmd)[4:], cmd)
+                                     f"perl -e 'alarm 3000; exec @ARGV' {GRADLEW} check -x :shared:iosSimulatorArm64Test")
+        self.assertEqual(shlex.split(remote_cmd)[4:], cmd[:4] + remote.NO_DAEMONS + cmd[4:])
+
+    def test_every_remote_build_runs_without_a_gradle_or_kotlin_daemon(self):
+        self.configure(CONFIG)
+        no_daemon, in_process = remote.NO_DAEMONS
+        self.assertEqual((no_daemon, in_process), ("--no-daemon", "-Pkotlin.compiler.execution.strategy=in-process"))
+        for cmd, want in [(["./gradlew", "check"], ["./gradlew", no_daemon, in_process, "check"]),
+                          (["perl", "-e", "alarm 3; exec @ARGV", "./gradlew", "-p", "backend", "test"],
+                           ["perl", "-e", "alarm 3; exec @ARGV", "./gradlew", no_daemon, in_process, "-p", "backend",
+                            "test"]),
+                          (["./gradlew", "check", no_daemon], ["./gradlew", in_process, "check", no_daemon])]:
+            self.use_shell()
+            self.assertEqual(self.run_remote(cmd), 0)
+            self.assertEqual(shlex.split(self.shell.popened[0][-1])[4:], want)
 
     def test_project_dir_inside_runs_from_the_same_subdirectory(self):
         self.configure({**CONFIG, "root": "/srv/builds"})
         os.chdir(self.top / "backend")
         self.assertEqual(self.run_remote(["./gradlew", "-p", ".", "check"]), 0)
         self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && exec "
-                                                    "./gradlew -p . check")
+                                                    f"{GRADLEW} -p . check")
         os.chdir(self.top)
         self.assertEqual(self.run_remote(["./gradlew", "-p", "backend", "check"]), 0)
-        self.assertIn("./gradlew -p backend check", self.shell.popened[1][-1])
+        self.assertIn(f"{GRADLEW} -p backend check", self.shell.popened[1][-1])
 
     def test_start_runs_only_with_instance_zone_and_project(self):
         self.configure({**CONFIG, "instance": "vm", "zone": "us-central1-a"})
