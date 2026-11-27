@@ -40,6 +40,9 @@ PROBE_PAUSE_S = 5
 # Compute Engine statuses of a machine on its way up: anything else after a start means the start did not take
 UP = {"PROVISIONING", "STAGING", "RUNNING"}
 SSH_LOST = 255
+# a gcloud that never answers would keep the ticket on the machine's slot, starting, for as long as its gq lives
+GCLOUD_LIMIT_S = 120
+TIMED_OUT = 124
 # unanchored: `**/build/reports/***` would miss the root project's build/reports (the Kover XML)
 BACK = ["build/reports/***", "build/test-results/***", "build/outputs/***"]
 # openrsync (macOS) does not let `:- .gitignore` shield the receiver from --delete, so the build state that has
@@ -60,9 +63,11 @@ class Unavailable(Exception):
 class Shell:
     """Every process the remote path starts goes through here, so the tests swap it for a fake."""
 
-    def run(self, argv, cwd=None):
+    def run(self, argv, cwd=None, timeout=None):
         try:
-            p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:  # run() has already killed it
+            return TIMED_OUT, "", f"timed out after {timeout}s"
         except OSError as e:
             return 127, "", str(e)
         return p.returncode, p.stdout, p.stderr
@@ -210,8 +215,8 @@ def _reason(step, code, err):
     return f"{step}: {lines[-1] if lines else f'exit {code}'}"
 
 
-def step(name, argv):
-    code, _out, err = SHELL.run(argv)
+def step(name, argv, timeout=None):
+    code, _out, err = SHELL.run(argv, timeout=timeout)
     if code != 0:
         raise Unavailable(_reason(name, code, err))
 
@@ -248,7 +253,7 @@ def instance_state(cfg, gcloud="gcloud", name="budget"):
     `cap_metadata_key` is `true`. Raises Unavailable, its reason led by `name`, when the answer cannot be had."""
     instance, zone, project = cfg["start"]
     code, out, err = SHELL.run([gcloud, "compute", "instances", "describe", instance, f"--zone={zone}",
-                                f"--project={project}", "--format=json"])
+                                f"--project={project}", "--format=json"], timeout=GCLOUD_LIMIT_S)
     if code != 0:
         raise Unavailable(_reason(name, code, err))
     key = cfg["cap_metadata_key"]
@@ -276,7 +281,7 @@ def start_machine(cfg):
     while True:
         if status != "STOPPING":  # a start sent to a stopping machine is the one that does not take
             step("start", ["gcloud", "compute", "instances", "start", instance, f"--zone={zone}",
-                           f"--project={project}", "--quiet"])
+                           f"--project={project}", "--quiet"], timeout=GCLOUD_LIMIT_S)
         status = instance_state(cfg, name="start")[0]
         if status in UP:
             return

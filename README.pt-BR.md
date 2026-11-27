@@ -121,7 +121,9 @@ mantém no Salvar e aplicar.
 - `instance`, `zone`, `project` (opcionais, os três ou nenhum): `gcloud compute instances start` antes de cada
   build remota, para ligar uma VM parada do Compute Engine. Um `describe` confere em seguida que ela está subindo:
   um start enviado enquanto a VM ainda se desliga (por ociosidade) termina DONE sem ligá-la, então o `gq` espera o
-  desligamento acabar e liga de novo, por até 180 s. Depois o `gq` espera até 180 s por `ssh … true`.
+  desligamento acabar e liga de novo, por até 180 s. Depois o `gq` espera até 180 s por `ssh … true`. Cada
+  chamada ao `gcloud` tem 120 s para responder: a que trava é morta e conta como start que falhou
+  (`start: timed out after 120s`), e o ticket volta à fila em vez de segurar a vaga da máquina de build.
 - `slots` (opcional, inteiro a partir de 1, padrão 2): quantas builds a máquina de build roda ao mesmo tempo. O
   servidor as conta; um ticket ocupa uma da concessão até o `release` (ou até o `gq` dele morrer).
 - `cap_metadata_key` (opcional, exige `instance`, `zone` e `project`): antes de ligar a máquina, o `gq` lê os

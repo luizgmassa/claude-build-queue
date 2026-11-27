@@ -59,7 +59,7 @@ class FakeShell:
             return "describe" if "describe" in argv else "start"
         return {"git": "git"}.get(argv[0], argv[0])
 
-    def run(self, argv, cwd=None):
+    def run(self, argv, cwd=None, timeout=None):
         name = self.step(argv)
         self.calls.append((name, argv))
         if name in self.fail:
@@ -263,8 +263,8 @@ class RemoteRun(RemoteBase):
         self.configure(CONFIG)
         answers = iter([255, 255, 0])
         real_run = self.shell.run
-        self.shell.run = lambda argv, cwd=None: ((next(answers), "", "") if argv[-1] == "true"
-                                                 else real_run(argv, cwd))
+        self.shell.run = lambda argv, cwd=None, timeout=None: ((next(answers), "", "") if argv[-1] == "true"
+                                                               else real_run(argv, cwd))
         self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
         self.assertEqual(self.shell.clock, 2 * remote.PROBE_PAUSE_S)
         self.assertEqual(len(self.shell.popened), 1)
@@ -286,7 +286,7 @@ class RemoteRun(RemoteBase):
         self.configure(CONFIG)
         real_run, seen = self.shell.run, []
 
-        def run(argv, cwd=None):
+        def run(argv, cwd=None, timeout=None):
             if FakeShell.step(argv) == "rsync-back":
                 seen.append(signal.getsignal(signal.SIGTERM))
             return real_run(argv, cwd)
@@ -395,7 +395,7 @@ class Fallback(RemoteBase):
         for body in ({"metadata": {"items": None}}, {"metadata": None}):
             self.use_shell()
             real = self.shell.run
-            self.shell.run = lambda argv, cwd=None, b={**body, "status": "RUNNING"}, r=real: \
+            self.shell.run = lambda argv, cwd=None, timeout=None, b={**body, "status": "RUNNING"}, r=real: \
                 (0, json.dumps(b), "") if "describe" in argv else r(argv, cwd)
             self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
 
@@ -442,6 +442,45 @@ class Fallback(RemoteBase):
         self.use_shell(fail={"popen": "No such file or directory: 'ssh'"})
         self.assertIsNone(self.run_remote(["./gradlew", "check"]))
         self.assertEqual(self.lines[-1], "remote unavailable (ssh: No such file or directory: 'ssh')")
+
+
+@POSIX_ONLY
+class GcloudTimeout(RemoteBase):
+    """The real Shell against a `gcloud` that never answers."""
+
+    def start(self, **extra):
+        self.use_shell()  # git answers the plan; gcloud is the silent one, run for real
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", **extra})
+        j = remote.plan(["./gradlew", "check"], self.lines.append)
+        remote.SHELL = remote.Shell()
+        return remote.start(j, self.lines.append)
+
+    def test_a_silent_gcloud_is_killed_and_the_machine_is_unavailable(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "gcloud").write_text("#!/bin/sh\nexec sleep 30\n")
+        (bin_dir / "gcloud").chmod(0o755)
+        began = time.monotonic()
+        with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}), \
+                mock.patch.object(remote, "GCLOUD_LIMIT_S", 0.2):
+            self.assertEqual(self.start(), "start: timed out after 0.2s")
+            self.assertEqual(self.start(cap_metadata_key="budget-exceeded"), "budget: timed out after 0.2s")
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual(self.lines, ["remote unavailable (start: timed out after 0.2s)",
+                                      "remote unavailable (budget: timed out after 0.2s)"])
+
+    def test_only_gcloud_runs_under_the_limit(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", "cap_metadata_key": "budget-exceeded"})
+        real, limited = self.shell.run, {}
+
+        def run(argv, cwd=None, timeout=None):
+            if timeout is not None:
+                limited[FakeShell.step(argv)] = timeout
+            return real(argv, cwd)
+
+        self.shell.run = run
+        self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
+        self.assertEqual(limited, {"describe": 120, "start": 120})
 
 
 class Queue:
