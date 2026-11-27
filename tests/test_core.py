@@ -672,6 +672,16 @@ class TicketMemory(unittest.TestCase):
         self.assertEqual(len(q.history(build)), 3)
         self.assertEqual(max(gb for _t, gb in q.history(build)[0]), 1.0)  # the newest run, its two samples
 
+    def test_a_runner_job_ticket_is_named_by_its_runner(self):
+        from bq import server
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "a").mkdir()
+            Path(tmp, "a", ".runner").write_text('{"agentName": "mac-a"}', encoding="utf-8")
+            self.assertEqual(server.ticket_runner(f"{tmp}/a/_work/repo/repo"), "mac-a")
+            self.assertIsNone(server.ticket_runner(f"{tmp}/b/_work/repo"))  # a `_work` folder of no runner
+            self.assertIsNone(server.ticket_runner(f"{tmp}/a"))
+            self.assertIsNone(server.ticket_runner(None))
+
     def test_tickets_carry_the_main_page_values_and_a_rounded_peak(self):
         import sqlite3
         from types import MethodType, SimpleNamespace

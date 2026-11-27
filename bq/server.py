@@ -180,6 +180,13 @@ def worker_name(w):
     return runner_name(root.group(1)) if root else ""
 
 
+def ticket_runner(cwd):
+    """Registered name of the runner whose work folder holds cwd; None for a ticket that is not a runner job's."""
+    # shortcut: knows only the default work folder `_work`, read the runner's workFolder if one ever changes it
+    root, sep, _ = (cwd or "").partition("/_work/")
+    return runner_name(root) if sep and Path(root, ".runner").is_file() else None
+
+
 @functools.lru_cache(maxsize=64)
 def sim_info(device_dir, lstart):  # lstart keys the cache, so a renamed device is read again at its next boot
     """(name, runtime) of a simulator device from its device.plist: ("iPhone 16", "iOS 18.5")."""
@@ -692,7 +699,10 @@ class Queue:
         tickets, peaks = self.ticket_rows(where, args), self.peaks()
         line = [tid for (tid,) in self.db.execute("select id from tickets where state='waiting' order by id")]
         for t in tickets:
-            t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] else "?"
+            # a runner job has no Claude session: its ticket is named by the runner, like the job's own row
+            t["runner_name"] = None if t["claude_pid"] else ticket_runner(t["cwd"])
+            t["agent"] = self.agent_label(t["claude_pid"], procs, t["subagent"]) if t["claude_pid"] \
+                else "?" if t["runner_name"] is None else f"runner · {t['runner_name']}"
             t["agent_alive"] = t["claude_pid"] in procs if t["claude_pid"] else None
             t["project"] = project_of(t["cwd"])
             t["estimate_gb"] = round(core.estimate_gb(t["ctype"] or "other", peaks), 1)

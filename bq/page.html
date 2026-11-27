@@ -803,13 +803,14 @@ function render(v) {
   document.getElementById("blocked").textContent = blocked ? T("queue_stopped", { why: tr(blocked) }) : "";
 
   const outsideRows = (v.outside.builds || []).map(b => ({ ...b, outside: true }));
-  const runnerRows = (v.runners || []).map(r =>
-    ({ ...r, runner: true, agent: [T("card.runner"), r.runner_name].filter(Boolean).join(" · ") }));
-  // an emulator or simulator: who uses it is a session (agent link) or a runner job (its name)
-  const deviceRows = (v.devices || []).map(d => d.runner_name == null ? d
-    : { ...d, agent: [T("card.runner"), d.runner_name].filter(Boolean).join(" · ") });
+  // a ticket, an emulator or a simulator: who uses it is a session (agent link) or a runner job (its name)
+  const byRunner = r => r.runner_name == null ? r
+    : { ...r, agent: [T("card.runner"), r.runner_name].filter(Boolean).join(" · ") };
+  const runnerRows = (v.runners || []).map(r => ({ ...byRunner(r), runner: true }));
+  const deviceRows = (v.devices || []).map(byRunner);
+  const tickets = v.tickets.map(byRunner);
   TICKET_TABLES.forEach(([id, , has, cols]) =>
-    grid(id, cols, [...v.tickets.filter(has), ...(id === "running" ? [...runnerRows, ...deviceRows, ...outsideRows] : [])]));
+    grid(id, cols, [...tickets.filter(has), ...(id === "running" ? [...runnerRows, ...deviceRows, ...outsideRows] : [])]));
   grid("agents", [
     { k: "label", t: "col.agent", w: 280, f: a => agentLink(a.pid, a.label) },
     { k: "pid", t: "col.claude_pid", num: true, w: 90, f: a => procLink(a.pid) + (a.alive ? "" : " " + esc(T("dead"))) },
