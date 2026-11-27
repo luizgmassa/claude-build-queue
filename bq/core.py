@@ -47,6 +47,7 @@ EN = {
     "kill.orphan": "orphan: agent {pid} ended",
     "kill.loose_worker": "loose worker (parent died)",
     "kill.idle_daemon": "idle daemon",
+    "kill.remote_orphan": "remote build of ticket #{id}, whose gq is gone",
     "refusal.ceiling": "configured max of {ceiling} slots",
     "refusal.gap": "next extra slot in {s}s",
     "refusal.swap": "swap grew {gb} GB in the last {s}s (limit {limit_gb} GB)",
@@ -283,6 +284,13 @@ def descendants(pid, procs):
     return out
 
 
+def remote_ssh(tid, procs):
+    """Pids of the `ssh` running ticket tid's build on the build machine, by its command line (`… exec env
+    BQ_TICKET=<id> …`, see remote.execute): macOS hides the environment of Apple's own tools, ssh among them."""
+    mark = f" env BQ_TICKET={tid} "
+    return [p.pid for p in procs.values() if exe_name(p.args.split(" ", 1)[0]) == "ssh" and mark in p.args]
+
+
 def started_by_claude_itself(anc):
     """Hook and MCP processes reach their claude process without passing a Bash-tool shell."""
     for a in anc:
@@ -439,6 +447,8 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
             live.append(t)  # enqueued after the snapshot; its pid cannot be judged yet
         elif p is None or (t.pid_start and p.lstart != t.pid_start):
             out.reaps.append((t.id, "owner process gone"))
+            if t.dest == "vm":  # a gq killed outright leaves its ssh, and the remote build, on a slot now free
+                out.kills += [(pid, msg("kill.remote_orphan", id=t.id)) for pid in remote_ssh(t.id, procs)]
         else:
             if not t.pid_start:
                 out.pid_starts[t.id] = p.lstart

@@ -152,7 +152,7 @@ the build machine, `gq`:
    `.gradle/` and `.kotlin/` survive, so the remote build stays incremental. The ticket stays granted, on the
    build machine's slot, from here to the end;
 2. adds `--no-daemon` and `-Pkotlin.compiler.execution.strategy=in-process` after `./gradlew`, prints
-   `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && exec <cmd>'` (no `gq` there);
+   `[gq] remote <host>: <cmd>` and runs `ssh -tt <host> 'cd … && exec env BQ_TICKET=<id> <cmd>'` (no `gq` there);
 3. copies `build/reports/`, `build/test-results/` and `build/outputs/` of every project back, even when the
    build fails, and exits with the remote exit code.
 
@@ -168,7 +168,9 @@ If the budget is spent, the VM does not start, `ssh` does not answer or the firs
 build machine leaves the choice for 300 s. The build runs nowhere until the next grant. Once the remote build has
 started it never runs locally: a dropped connection exits 255 with `[gq] remote connection lost`. SIGTERM,
 SIGINT, SIGHUP or SIGALRM on the local `gq` stop `ssh`; the pseudo-TTY makes sshd send SIGHUP to the remote build,
-and the ticket's release frees the build machine's slot. A client that does not report `remote` (an old `gq`) never
+and the ticket's release frees the build machine's slot. A `gq` killed outright (SIGKILL, out of memory) stops
+nothing: the server reaps its ticket and, with `gq enforce on`, ends the `ssh` it left, found by the
+`BQ_TICKET=<id>` of its command line, so the remote build does not go on in a slot already free. A client that does not report `remote` (an old `gq`) never
 gets the build machine. An invalid key prints `[gq] remote config ignored (<field>)` and changes nothing. Not on
 Windows (no `flock`, no native `rsync`).
 
@@ -194,6 +196,7 @@ In `off` (dry run) the page only lists what it would kill. In `on`:
 
 - agent process whose `claude` session has already died: SIGTERM on the tree, SIGKILL after 10 s (Windows has
   no graceful stop: it dies at once);
+- `ssh` of a remote build whose ticket was reaped because its `gq` is gone;
 - agent Gradle daemon idle for 20 s (no client connected) and no grant in the last 20 s;
 - agent Kotlin daemon idle for 60 s, even with builds running (KGP falls back to the compiler inside Gradle);
 - Gradle worker whose parent daemon died (its parent is no longer a Gradle process: init, a Linux subreaper,

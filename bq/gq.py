@@ -99,7 +99,7 @@ def run_on_vm(j, tid, release, arm):
     reason = remote.start(j, say)
     if reason is None:
         call_retrying("/api/remote", {"id": tid, "phase": "running"})
-        code = remote.execute(j, say, SIGNALS)
+        code = remote.execute(j, say, SIGNALS, tid)
         if code is not None:
             release(code)
             sys.exit(code)

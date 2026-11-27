@@ -151,7 +151,7 @@ máquina de build, o `gq`:
    `.kotlin/` remotos sobrevivem, e a build remota continua incremental. O ticket fica concedido, na vaga da
    máquina de build, daqui até o fim;
 2. põe `--no-daemon` e `-Pkotlin.compiler.execution.strategy=in-process` depois de `./gradlew`, imprime
-   `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && exec <cmd>'` (sem `gq` lá);
+   `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && exec env BQ_TICKET=<id> <cmd>'` (sem `gq` lá);
 3. traz de volta `build/reports/`, `build/test-results/` e `build/outputs/` de todo projeto, mesmo quando a
    build falha, e sai com o código de saída remoto.
 
@@ -168,7 +168,9 @@ Se o orçamento acabou, a VM não liga, o `ssh` não responde ou a primeira cóp
 de build sai da escolha por 300 s. A build não roda em lugar nenhum até a próxima concessão. Depois que a build
 remota começou ela nunca roda local: conexão perdida sai com 255 e `[gq] remote connection lost`. SIGTERM, SIGINT,
 SIGHUP ou SIGALRM no `gq` local derrubam o `ssh`; a pseudo-TTY faz o sshd mandar SIGHUP à build remota, e o
-`release` do ticket libera a vaga da máquina de build. Cliente que não informa `remote` (um `gq` antigo) nunca
+`release` do ticket libera a vaga da máquina de build. Um `gq` morto de uma vez (SIGKILL, falta de memória) não
+derruba nada: o servidor recolhe o ticket e, com `gq enforce on`, encerra o `ssh` que ficou, achado pelo
+`BQ_TICKET=<id>` da linha de comando, para a build remota não seguir numa vaga já livre. Cliente que não informa `remote` (um `gq` antigo) nunca
 recebe a máquina de build. Chave inválida imprime `[gq] remote config ignored (<campo>)` e não muda nada. Não existe
 no Windows (sem `flock`, sem `rsync` nativo).
 
@@ -193,6 +195,7 @@ Em `off` (simulação) a página só lista o que mataria. Em `on`:
 
 - processo de agente cuja sessão `claude` já morreu: SIGTERM na árvore, SIGKILL após 10 s (o Windows não tem
   término gracioso: morre na hora);
+- `ssh` de build remota cujo ticket foi recolhido porque o `gq` sumiu;
 - daemon Gradle de agente ocioso há 20 s (sem cliente conectado) e sem concessão nos últimos 20 s;
 - daemon Kotlin de agente ocioso há 60 s, mesmo com builds rodando (o KGP cai no compilador dentro do Gradle);
 - worker Gradle cujo daemon pai morreu (o pai deixou de ser um processo Gradle: init, subreaper do Linux ou

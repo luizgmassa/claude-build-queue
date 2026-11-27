@@ -322,8 +322,9 @@ def _default(signals):
         signal.signal(s, signal.SIG_DFL)
 
 
-def execute(j, say, signals):
-    """The remote exit code, or None when ssh cannot start."""
+def execute(j, say, signals, ticket):
+    """The remote exit code, or None when ssh cannot start. The remote command names its ticket (`env BQ_TICKET=<id>`):
+    the server finds this ssh by it and ends it when it reaps the ticket of a gq that was killed outright."""
     cfg, line = j.cfg, shlex.join(daemonless(j.cmd))
     caught, child = [], None
 
@@ -336,7 +337,7 @@ def execute(j, say, signals):
         signal.signal(s, stop)
     say(f"remote {cfg['host']}: {line}")
     try:
-        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec {line}", "-tt", *KEEPALIVE))
+        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec env BQ_TICKET={ticket} {line}", "-tt", *KEEPALIVE))
     except OSError as e:
         _default(signals)
         say(f"remote unavailable (ssh: {e})")

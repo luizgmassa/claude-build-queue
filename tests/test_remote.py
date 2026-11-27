@@ -21,6 +21,8 @@ HOST = "me@build-vm"
 POSIX_ONLY = unittest.skipIf(remote.fcntl is None, "the remote path does not exist on Windows")
 CONFIG = {"host": HOST, "root": "~/remote-builds", "ssh_options": ["-i", "~/.ssh/key"]}
 GRADLEW = "./gradlew " + " ".join(remote.NO_DAEMONS)  # what every remote build starts with
+TICKET = 5
+EXEC = f"exec env BQ_TICKET={TICKET}"
 
 
 class Child:
@@ -122,7 +124,7 @@ class RemoteBase(unittest.TestCase):
         j = remote.plan(cmd, self.lines.append)
         if j is None or remote.start(j, self.lines.append):
             return None
-        return remote.execute(j, self.lines.append, gq.SIGNALS)
+        return remote.execute(j, self.lines.append, gq.SIGNALS, TICKET)
 
 
 class Config(RemoteBase):
@@ -245,7 +247,7 @@ class RemoteRun(RemoteBase):
             self.assertIn(f"--include={pattern}", back)
         self.assertLess(back.index("--include=*/"), back.index("--exclude=*"))
         self.assertEqual(self.shell.popened, [["ssh", "-tt", *remote.KEEPALIVE, "-i", "~/.ssh/key", HOST,
-                                               f"cd {dest} && exec {GRADLEW} :shared:testAndroidHostTest"]])
+                                               f"cd {dest} && {EXEC} {GRADLEW} :shared:testAndroidHostTest"]])
         self.assertEqual(self.lines, [f"remote {HOST}: {GRADLEW} :shared:testAndroidHostTest"])
 
     def test_fetch_back_patterns_join_the_copy_back(self):
@@ -298,9 +300,9 @@ class RemoteRun(RemoteBase):
         cmd = ["perl", "-e", "alarm 3000; exec @ARGV", "./gradlew", "check", "-x", ":shared:iosSimulatorArm64Test"]
         self.assertEqual(self.run_remote(cmd), 0)
         remote_cmd = self.shell.popened[0][-1]
-        self.assertEqual(remote_cmd, "cd remote-builds/evolvai/wt && exec "
+        self.assertEqual(remote_cmd, f"cd remote-builds/evolvai/wt && {EXEC} "
                                      f"perl -e 'alarm 3000; exec @ARGV' {GRADLEW} check -x :shared:iosSimulatorArm64Test")
-        self.assertEqual(shlex.split(remote_cmd)[4:], cmd[:4] + remote.NO_DAEMONS + cmd[4:])
+        self.assertEqual(shlex.split(remote_cmd)[6:], cmd[:4] + remote.NO_DAEMONS + cmd[4:])
 
     def test_every_remote_build_runs_without_a_gradle_or_kotlin_daemon(self):
         self.configure(CONFIG)
@@ -313,14 +315,14 @@ class RemoteRun(RemoteBase):
                           (["./gradlew", "check", no_daemon], ["./gradlew", in_process, "check", no_daemon])]:
             self.use_shell()
             self.assertEqual(self.run_remote(cmd), 0)
-            self.assertEqual(shlex.split(self.shell.popened[0][-1])[4:], want)
+            self.assertEqual(shlex.split(self.shell.popened[0][-1])[6:], want)
 
     def test_project_dir_inside_runs_from_the_same_subdirectory(self):
         self.configure({**CONFIG, "root": "/srv/builds"})
         os.chdir(self.top / "backend")
         self.assertEqual(self.run_remote(["./gradlew", "-p", ".", "check"]), 0)
-        self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && exec "
-                                                    f"{GRADLEW} -p . check")
+        self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && "
+                                                    f"{EXEC} {GRADLEW} -p . check")
         os.chdir(self.top)
         self.assertEqual(self.run_remote(["./gradlew", "-p", "backend", "check"]), 0)
         self.assertIn(f"{GRADLEW} -p backend check", self.shell.popened[1][-1])
@@ -511,6 +513,12 @@ class GqRun(RemoteBase):
         self.assertEqual(queue.remote_posts, [{"id": 5, "phase": "running"}])
         self.assertEqual(queue.released, [{"id": 5, "exit_code": 7}])
         self.assertEqual(len(self.shell.popened), 1)
+
+    def test_the_server_finds_the_ssh_of_a_remote_build_by_its_ticket(self):
+        self.gq_run(Queue([("granted", "vm")]))  # the queue gave it ticket 5
+        ssh = core.Proc(pid=77, ppid=1, rss_kb=1, cpu=0, etime="", lstart="L", args=" ".join(self.shell.popened[0]))
+        self.assertEqual(core.remote_ssh(5, {77: ssh}), [77])
+        self.assertEqual(core.remote_ssh(50, {77: ssh}), [])
 
     def test_a_failed_start_hands_the_ticket_back_and_runs_nowhere_until_the_next_grant(self):
         self.use_shell(fail={"rsync-out": (12, "")})

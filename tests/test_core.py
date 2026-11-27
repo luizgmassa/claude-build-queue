@@ -162,6 +162,34 @@ class NeutralScheduling(unittest.TestCase):
         self.assertEqual(pl.remote_grants, [4])
 
 
+class RemoteOrphan(unittest.TestCase):
+    """A gq killed outright (SIGKILL, out of memory) leaves the ssh of its remote build behind; the reap ends it."""
+
+    SSH = "/usr/bin/ssh -tt -o ServerAliveInterval=15 me@vm cd b/repo/wt && exec env BQ_TICKET={} ./gradlew check"
+
+    def dead(self, dest):
+        return core.Ticket(id=3, pid=999, state="granted", created=0, remote=True, dest=dest)
+
+    def procs(self):
+        return world(P(900, 1, self.SSH.format(3)), P(901, 1, self.SSH.format(30)),
+                     P(902, 101, "/bin/zsh -c echo ssh exec env BQ_TICKET=3 ./gradlew check"))
+
+    def test_reaping_a_remote_ticket_ends_its_ssh_and_no_other(self):
+        pl = tick(self.procs(), [self.dead("vm")], remote=VM)
+        self.assertEqual(pl.reaps, [(3, "owner process gone")])
+        self.assertEqual(pl.kills, [(900, core.msg("kill.remote_orphan", id=3))])
+        self.assertEqual(core.render(pl.kills[0][1]), "remote build of ticket #3, whose gq is gone")
+
+    def test_reaping_a_mac_ticket_kills_nothing(self):
+        self.assertEqual(tick(self.procs(), [self.dead("mac")], remote=VM).kills, [])
+
+    def test_a_live_remote_ticket_keeps_its_ssh(self):
+        live = core.Ticket(id=3, pid=203, state="granted", created=0, remote=True, dest="vm")
+        procs = self.procs()
+        procs[203] = P(203, 101, "python3 /u/.local/bin/gq run -- ./gradlew check", CLAUDE_PID=100)
+        self.assertEqual(tick(procs, [live], remote=VM).kills, [])
+
+
 class RunnerSlot(unittest.TestCase):
     RUNNER = "/Users/u/actions-runner/myrepo/bin/Runner.Worker spawnclient"
 
