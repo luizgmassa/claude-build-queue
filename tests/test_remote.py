@@ -20,6 +20,9 @@ from bq import core, gq, remote, server, settings  # noqa: E402
 HOST = "me@build-vm"
 POSIX_ONLY = unittest.skipIf(remote.fcntl is None, "the remote path does not exist on Windows")
 CONFIG = {"host": HOST, "root": "~/remote-builds", "ssh_options": ["-i", "~/.ssh/key"]}
+GRADLEW = "./gradlew " + " ".join(remote.NO_DAEMONS)  # what every remote build starts with
+TICKET = 5
+EXEC = f"exec env BQ_TICKET={TICKET}"
 
 
 class Child:
@@ -56,7 +59,7 @@ class FakeShell:
             return "describe" if "describe" in argv else "start"
         return {"git": "git"}.get(argv[0], argv[0])
 
-    def run(self, argv, cwd=None):
+    def run(self, argv, cwd=None, timeout=None):
         name = self.step(argv)
         self.calls.append((name, argv))
         if name in self.fail:
@@ -121,7 +124,7 @@ class RemoteBase(unittest.TestCase):
         j = remote.plan(cmd, self.lines.append)
         if j is None or remote.start(j, self.lines.append):
             return None
-        return remote.execute(j, self.lines.append, gq.SIGNALS)
+        return remote.execute(j, self.lines.append, gq.SIGNALS, TICKET)
 
 
 class Config(RemoteBase):
@@ -244,8 +247,8 @@ class RemoteRun(RemoteBase):
             self.assertIn(f"--include={pattern}", back)
         self.assertLess(back.index("--include=*/"), back.index("--exclude=*"))
         self.assertEqual(self.shell.popened, [["ssh", "-tt", *remote.KEEPALIVE, "-i", "~/.ssh/key", HOST,
-                                               f"cd {dest} && exec ./gradlew :shared:testAndroidHostTest"]])
-        self.assertEqual(self.lines, [f"remote {HOST}: ./gradlew :shared:testAndroidHostTest"])
+                                               f"cd {dest} && {EXEC} {GRADLEW} :shared:testAndroidHostTest"]])
+        self.assertEqual(self.lines, [f"remote {HOST}: {GRADLEW} :shared:testAndroidHostTest"])
 
     def test_fetch_back_patterns_join_the_copy_back(self):
         self.configure({**CONFIG, "fetch_back": ["build/generated/openapi/***"]})
@@ -260,8 +263,8 @@ class RemoteRun(RemoteBase):
         self.configure(CONFIG)
         answers = iter([255, 255, 0])
         real_run = self.shell.run
-        self.shell.run = lambda argv, cwd=None: ((next(answers), "", "") if argv[-1] == "true"
-                                                 else real_run(argv, cwd))
+        self.shell.run = lambda argv, cwd=None, timeout=None: ((next(answers), "", "") if argv[-1] == "true"
+                                                               else real_run(argv, cwd))
         self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
         self.assertEqual(self.shell.clock, 2 * remote.PROBE_PAUSE_S)
         self.assertEqual(len(self.shell.popened), 1)
@@ -283,7 +286,7 @@ class RemoteRun(RemoteBase):
         self.configure(CONFIG)
         real_run, seen = self.shell.run, []
 
-        def run(argv, cwd=None):
+        def run(argv, cwd=None, timeout=None):
             if FakeShell.step(argv) == "rsync-back":
                 seen.append(signal.getsignal(signal.SIGTERM))
             return real_run(argv, cwd)
@@ -297,19 +300,32 @@ class RemoteRun(RemoteBase):
         cmd = ["perl", "-e", "alarm 3000; exec @ARGV", "./gradlew", "check", "-x", ":shared:iosSimulatorArm64Test"]
         self.assertEqual(self.run_remote(cmd), 0)
         remote_cmd = self.shell.popened[0][-1]
-        self.assertEqual(remote_cmd, "cd remote-builds/evolvai/wt && exec "
-                                     "perl -e 'alarm 3000; exec @ARGV' ./gradlew check -x :shared:iosSimulatorArm64Test")
-        self.assertEqual(shlex.split(remote_cmd)[4:], cmd)
+        self.assertEqual(remote_cmd, f"cd remote-builds/evolvai/wt && {EXEC} "
+                                     f"perl -e 'alarm 3000; exec @ARGV' {GRADLEW} check -x :shared:iosSimulatorArm64Test")
+        self.assertEqual(shlex.split(remote_cmd)[6:], cmd[:4] + remote.NO_DAEMONS + cmd[4:])
+
+    def test_every_remote_build_runs_without_a_gradle_or_kotlin_daemon(self):
+        self.configure(CONFIG)
+        no_daemon, in_process = remote.NO_DAEMONS
+        self.assertEqual((no_daemon, in_process), ("--no-daemon", "-Pkotlin.compiler.execution.strategy=in-process"))
+        for cmd, want in [(["./gradlew", "check"], ["./gradlew", no_daemon, in_process, "check"]),
+                          (["perl", "-e", "alarm 3; exec @ARGV", "./gradlew", "-p", "backend", "test"],
+                           ["perl", "-e", "alarm 3; exec @ARGV", "./gradlew", no_daemon, in_process, "-p", "backend",
+                            "test"]),
+                          (["./gradlew", "check", no_daemon], ["./gradlew", in_process, "check", no_daemon])]:
+            self.use_shell()
+            self.assertEqual(self.run_remote(cmd), 0)
+            self.assertEqual(shlex.split(self.shell.popened[0][-1])[6:], want)
 
     def test_project_dir_inside_runs_from_the_same_subdirectory(self):
         self.configure({**CONFIG, "root": "/srv/builds"})
         os.chdir(self.top / "backend")
         self.assertEqual(self.run_remote(["./gradlew", "-p", ".", "check"]), 0)
-        self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && exec "
-                                                    "./gradlew -p . check")
+        self.assertEqual(self.shell.popened[0][-1], "cd /srv/builds/evolvai/wt/backend && "
+                                                    f"{EXEC} {GRADLEW} -p . check")
         os.chdir(self.top)
         self.assertEqual(self.run_remote(["./gradlew", "-p", "backend", "check"]), 0)
-        self.assertIn("./gradlew -p backend check", self.shell.popened[1][-1])
+        self.assertIn(f"{GRADLEW} -p backend check", self.shell.popened[1][-1])
 
     def test_start_runs_only_with_instance_zone_and_project(self):
         self.configure({**CONFIG, "instance": "vm", "zone": "us-central1-a"})
@@ -379,7 +395,7 @@ class Fallback(RemoteBase):
         for body in ({"metadata": {"items": None}}, {"metadata": None}):
             self.use_shell()
             real = self.shell.run
-            self.shell.run = lambda argv, cwd=None, b={**body, "status": "RUNNING"}, r=real: \
+            self.shell.run = lambda argv, cwd=None, timeout=None, b={**body, "status": "RUNNING"}, r=real: \
                 (0, json.dumps(b), "") if "describe" in argv else r(argv, cwd)
             self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
 
@@ -428,6 +444,45 @@ class Fallback(RemoteBase):
         self.assertEqual(self.lines[-1], "remote unavailable (ssh: No such file or directory: 'ssh')")
 
 
+@POSIX_ONLY
+class GcloudTimeout(RemoteBase):
+    """The real Shell against a `gcloud` that never answers."""
+
+    def start(self, **extra):
+        self.use_shell()  # git answers the plan; gcloud is the silent one, run for real
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", **extra})
+        j = remote.plan(["./gradlew", "check"], self.lines.append)
+        remote.SHELL = remote.Shell()
+        return remote.start(j, self.lines.append)
+
+    def test_a_silent_gcloud_is_killed_and_the_machine_is_unavailable(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "gcloud").write_text("#!/bin/sh\nexec sleep 30\n")
+        (bin_dir / "gcloud").chmod(0o755)
+        began = time.monotonic()
+        with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}), \
+                mock.patch.object(remote, "GCLOUD_LIMIT_S", 0.2):
+            self.assertEqual(self.start(), "start: timed out after 0.2s")
+            self.assertEqual(self.start(cap_metadata_key="budget-exceeded"), "budget: timed out after 0.2s")
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual(self.lines, ["remote unavailable (start: timed out after 0.2s)",
+                                      "remote unavailable (budget: timed out after 0.2s)"])
+
+    def test_only_gcloud_runs_under_the_limit(self):
+        self.configure({**CONFIG, "instance": "vm", "zone": "z", "project": "p", "cap_metadata_key": "budget-exceeded"})
+        real, limited = self.shell.run, {}
+
+        def run(argv, cwd=None, timeout=None):
+            if timeout is not None:
+                limited[FakeShell.step(argv)] = timeout
+            return real(argv, cwd)
+
+        self.shell.run = run
+        self.assertEqual(self.run_remote(["./gradlew", "check"]), 0)
+        self.assertEqual(limited, {"describe": 120, "start": 120})
+
+
 class Queue:
     """The local queue server as gq sees it. `waits` are the answers of /api/wait, as a state or (state, dest)."""
 
@@ -467,6 +522,7 @@ class GqRun(RemoteBase):
         queue = Queue([("granted", "mac")])
         self.gq_run(queue)
         self.assertIs(queue.enqueued[0]["remote"], True)
+        self.assertEqual(queue.enqueued[0]["checkout"], "remote-builds/evolvai/wt")
         queue = Queue([("granted", "mac")])
         with mock.patch.object(gq, "call_retrying", queue.call_retrying), mock.patch.object(gq, "call", queue.call), \
                 mock.patch.object(gq.subprocess, "Popen", return_value=mock.Mock(wait=lambda: 0)), \
@@ -474,6 +530,7 @@ class GqRun(RemoteBase):
             with self.assertRaises(SystemExit):
                 gq.run(["./gradlew", "ktlintFormat"])
         self.assertIs(queue.enqueued[0]["remote"], False)
+        self.assertIsNone(queue.enqueued[0]["checkout"])
 
     def test_a_mac_grant_never_touches_the_build_machine(self):
         queue = Queue([("granted", "mac")])
@@ -497,6 +554,12 @@ class GqRun(RemoteBase):
         self.assertEqual(queue.remote_posts, [{"id": 5, "phase": "running"}])
         self.assertEqual(queue.released, [{"id": 5, "exit_code": 7}])
         self.assertEqual(len(self.shell.popened), 1)
+
+    def test_the_server_finds_the_ssh_of_a_remote_build_by_its_ticket(self):
+        self.gq_run(Queue([("granted", "vm")]))  # the queue gave it ticket 5
+        ssh = core.Proc(pid=77, ppid=1, rss_kb=1, cpu=0, etime="", lstart="L", args=" ".join(self.shell.popened[0]))
+        self.assertEqual(core.remote_ssh(5, {77: ssh}), [77])
+        self.assertEqual(core.remote_ssh(50, {77: ssh}), [])
 
     def test_a_failed_start_hands_the_ticket_back_and_runs_nowhere_until_the_next_grant(self):
         self.use_shell(fail={"rsync-out": (12, "")})
@@ -559,11 +622,11 @@ class ServerFlow(RemoteBase):
         self.procs = {p.pid: p for p in [core.Proc(pid=1, ppid=0, rss_kb=1, cpu=0, etime="", lstart="L",
                                                    args="/sbin/launchd")]}
 
-    def enqueue(self, i, remote_ok=True):
+    def enqueue(self, i, remote_ok=True, **body):
         pid = 9000 + i
         self.procs[pid] = core.Proc(pid=pid, ppid=1, rss_kb=1, cpu=0, etime="", lstart="L",
                                     args="python3 /u/.local/bin/gq run -- ./gradlew x")
-        return self.q.enqueue({"pid": pid, "cwd": "/w", "cmd": "./gradlew check", "remote": remote_ok})["id"]
+        return self.q.enqueue({"pid": pid, "cwd": "/w", "cmd": "./gradlew check", "remote": remote_ok, **body})["id"]
 
     def plan(self, now):
         pl = core.plan(self.procs, [], self.q.active_tickets(), snapshot_ts=now, now=now, pressure=4,
@@ -605,6 +668,17 @@ class ServerFlow(RemoteBase):
         pl = self.plan(now + 1)
         self.assertEqual(pl.reaps, [(first, "owner process gone")])
         self.assertEqual(pl.remote_grants, [second])
+
+    def test_two_tickets_of_one_checkout_take_the_machine_one_after_the_other(self):
+        self.configure({**CONFIG, "slots": 2})
+        first, second = (self.enqueue(i, checkout="remote-builds/evolvai/wt") for i in (1, 2))
+        plain = self.enqueue(3, checkout=7)  # not a path: stored as none, like an old client
+        self.assertEqual([t.checkout for t in self.q.active_tickets()], ["remote-builds/evolvai/wt"] * 2 + [None])
+        now = time.time() + 10
+        self.assertEqual(self.plan(now).remote_grants, [first, plain])
+        self.assertEqual(self.row(second), ("waiting", None, None))
+        self.q.release(first, 0)
+        self.assertEqual(self.plan(now).remote_grants, [second])
 
     def test_a_client_that_does_not_say_remote_never_gets_the_machine(self):
         old = self.enqueue(1, remote_ok=False)

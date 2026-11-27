@@ -82,8 +82,8 @@ VM = {"slots": 2, "available": True}
 class NeutralScheduling(unittest.TestCase):
     """The Mac stays the default; a full Mac sends eligible waiting tickets to the build machine, within its slots."""
 
-    def ticket(self, i, state="waiting", remote=True, dest=None):
-        return core.Ticket(id=i, pid=200 + i, state=state, created=0, remote=remote, dest=dest)
+    def ticket(self, i, state="waiting", remote=True, dest=None, checkout=None):
+        return core.Ticket(id=i, pid=200 + i, state=state, created=0, remote=remote, dest=dest, checkout=checkout)
 
     def run_plan(self, tickets, remote=VM, **kw):
         procs = world(*[P(200 + t.id, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)
@@ -124,6 +124,18 @@ class NeutralScheduling(unittest.TestCase):
         done = running[:3] + [self.ticket(5)]  # one remote build ended
         self.assertEqual(self.run_plan(done).remote_grants, [5])
 
+    def test_a_checkout_has_one_build_on_the_machine_at_a_time(self):
+        wt, other = "builds/repo/wt", "builds/repo/other"
+        tickets = self.full_mac() + [self.ticket(3, checkout=wt), self.ticket(4, checkout=wt),
+                                     self.ticket(5, checkout=other)]
+        self.assertEqual(self.run_plan(tickets).remote_grants, [3, 5])  # same tick: #4 would copy over #3
+        running = self.full_mac() + [self.ticket(3, "granted", dest="vm", checkout=wt), self.ticket(4, checkout=wt)]
+        self.assertEqual(self.run_plan(running).remote_grants, [])
+        self.assertEqual(self.run_plan(self.full_mac() + running[3:]).remote_grants, [4])  # #3 ended
+        # the build of that checkout on the Mac does not hold the machine
+        local = self.full_mac()[:1] + [self.ticket(2, "granted", dest="mac", checkout=wt), self.ticket(4, checkout=wt)]
+        self.assertEqual(self.run_plan(local).remote_grants, [4])
+
     def test_a_remote_ticket_holds_no_mac_slot_from_the_grant_on(self):
         pl = self.run_plan([self.ticket(1, "granted", dest="vm"), self.ticket(2)])
         self.assertEqual((pl.used, pl.grants), (1, [2]))  # the new ticket only
@@ -160,6 +172,34 @@ class NeutralScheduling(unittest.TestCase):
         pl = tick(procs, tickets, remote={"slots": 1, "available": True})
         self.assertEqual(pl.reaps, [(3, "owner process gone")])
         self.assertEqual(pl.remote_grants, [4])
+
+
+class RemoteOrphan(unittest.TestCase):
+    """A gq killed outright (SIGKILL, out of memory) leaves the ssh of its remote build behind; the reap ends it."""
+
+    SSH = "/usr/bin/ssh -tt -o ServerAliveInterval=15 me@vm cd b/repo/wt && exec env BQ_TICKET={} ./gradlew check"
+
+    def dead(self, dest):
+        return core.Ticket(id=3, pid=999, state="granted", created=0, remote=True, dest=dest)
+
+    def procs(self):
+        return world(P(900, 1, self.SSH.format(3)), P(901, 1, self.SSH.format(30)),
+                     P(902, 101, "/bin/zsh -c echo ssh exec env BQ_TICKET=3 ./gradlew check"))
+
+    def test_reaping_a_remote_ticket_ends_its_ssh_and_no_other(self):
+        pl = tick(self.procs(), [self.dead("vm")], remote=VM)
+        self.assertEqual(pl.reaps, [(3, "owner process gone")])
+        self.assertEqual(pl.kills, [(900, core.msg("kill.remote_orphan", id=3))])
+        self.assertEqual(core.render(pl.kills[0][1]), "remote build of ticket #3, whose gq is gone")
+
+    def test_reaping_a_mac_ticket_kills_nothing(self):
+        self.assertEqual(tick(self.procs(), [self.dead("mac")], remote=VM).kills, [])
+
+    def test_a_live_remote_ticket_keeps_its_ssh(self):
+        live = core.Ticket(id=3, pid=203, state="granted", created=0, remote=True, dest="vm")
+        procs = self.procs()
+        procs[203] = P(203, 101, "python3 /u/.local/bin/gq run -- ./gradlew check", CLAUDE_PID=100)
+        self.assertEqual(tick(procs, [live], remote=VM).kills, [])
 
 
 class RunnerSlot(unittest.TestCase):

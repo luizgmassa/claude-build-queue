@@ -121,9 +121,13 @@ mantém no Salvar e aplicar.
 - `instance`, `zone`, `project` (opcionais, os três ou nenhum): `gcloud compute instances start` antes de cada
   build remota, para ligar uma VM parada do Compute Engine. Um `describe` confere em seguida que ela está subindo:
   um start enviado enquanto a VM ainda se desliga (por ociosidade) termina DONE sem ligá-la, então o `gq` espera o
-  desligamento acabar e liga de novo, por até 180 s. Depois o `gq` espera até 180 s por `ssh … true`.
+  desligamento acabar e liga de novo, por até 180 s. Depois o `gq` espera até 180 s por `ssh … true`. Cada
+  chamada ao `gcloud` tem 120 s para responder: a que trava é morta e conta como start que falhou
+  (`start: timed out after 120s`), e o ticket volta à fila em vez de segurar a vaga da máquina de build.
 - `slots` (opcional, inteiro a partir de 1, padrão 2): quantas builds a máquina de build roda ao mesmo tempo. O
-  servidor as conta; um ticket ocupa uma da concessão até o `release` (ou até o `gq` dele morrer).
+  servidor as conta; um ticket ocupa uma da concessão até o `release` (ou até o `gq` dele morrer). Um checkout
+  tem uma build lá por vez: a cópia de uma segunda reescreveria as fontes sob a primeira, então o ticket cujo
+  checkout já tem build na máquina de build espera, por uma vaga local ou pelo fim daquela build.
 - `cap_metadata_key` (opcional, exige `instance`, `zone` e `project`): antes de ligar a máquina, o `gq` lê os
   metadados dela (`gcloud compute instances describe`); o valor `true` nessa chave (uma função de orçamento a grava)
   torna a máquina indisponível (`budget exceeded`).
@@ -150,16 +154,27 @@ máquina de build, o `gq`:
    `/.git` e sem todo arquivo que o `.gitignore` ignora (`local.properties` incluído); `build/`, `.gradle/` e
    `.kotlin/` remotos sobrevivem, e a build remota continua incremental. O ticket fica concedido, na vaga da
    máquina de build, daqui até o fim;
-2. imprime `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && exec <cmd>'` (sem `gq` lá);
+2. põe `--no-daemon` e `-Pkotlin.compiler.execution.strategy=in-process` depois de `./gradlew`, imprime
+   `[gq] remote <host>: <cmd>` e roda `ssh -tt <host> 'cd … && exec env BQ_TICKET=<id> <cmd>'` (sem `gq` lá);
 3. traz de volta `build/reports/`, `build/test-results/` e `build/outputs/` de todo projeto, mesmo quando a
    build falha, e sai com o código de saída remoto.
+
+Nenhum daemon sobrevive a uma build remota: a máquina de build não tem `gq` para encerrar daemon ocioso do Gradle
+ou do Kotlin, então toda build remota roda sem eles. O preço é uma JVM fria a cada vez: o Gradle sobe, carrega a
+build e compila sem daemon aquecido por trás, e o compilador Kotlin roda dentro da JVM do Gradle, no heap de
+`org.gradle.jvmargs` em vez de `kotlin.daemon.jvmargs`. Quando `org.gradle.jvmargs` pede uma JVM diferente da do
+cliente, o Gradle ainda cria um daemon de uso único, que termina com a build. O que está em disco continua
+valendo: `build/`, `.gradle/` (o cache de configuração) e o build cache do Gradle. A build local mantém os
+daemons; a limpeza abaixo os encerra.
 
 Se o orçamento acabou, a VM não liga, o `ssh` não responde ou a primeira cópia falha, o `gq` imprime
 `[gq] remote unavailable (<passo>: <erro>)`, devolve o ticket à fila (mesmo id, portanto o mesmo lugar) e a máquina
 de build sai da escolha por 300 s. A build não roda em lugar nenhum até a próxima concessão. Depois que a build
 remota começou ela nunca roda local: conexão perdida sai com 255 e `[gq] remote connection lost`. SIGTERM, SIGINT,
 SIGHUP ou SIGALRM no `gq` local derrubam o `ssh`; a pseudo-TTY faz o sshd mandar SIGHUP à build remota, e o
-`release` do ticket libera a vaga da máquina de build. Cliente que não informa `remote` (um `gq` antigo) nunca
+`release` do ticket libera a vaga da máquina de build. Um `gq` morto de uma vez (SIGKILL, falta de memória) não
+derruba nada: o servidor recolhe o ticket e, com `gq enforce on`, encerra o `ssh` que ficou, achado pelo
+`BQ_TICKET=<id>` da linha de comando, para a build remota não seguir numa vaga já livre. Cliente que não informa `remote` (um `gq` antigo) nunca
 recebe a máquina de build. Chave inválida imprime `[gq] remote config ignored (<campo>)` e não muda nada. Não existe
 no Windows (sem `flock`, sem `rsync` nativo).
 
@@ -184,6 +199,7 @@ Em `off` (simulação) a página só lista o que mataria. Em `on`:
 
 - processo de agente cuja sessão `claude` já morreu: SIGTERM na árvore, SIGKILL após 10 s (o Windows não tem
   término gracioso: morre na hora);
+- `ssh` de build remota cujo ticket foi recolhido porque o `gq` sumiu;
 - daemon Gradle de agente ocioso há 20 s (sem cliente conectado) e sem concessão nos últimos 20 s;
 - daemon Kotlin de agente ocioso há 60 s, mesmo com builds rodando (o KGP cai no compilador dentro do Gradle);
 - worker Gradle cujo daemon pai morreu (o pai deixou de ser um processo Gradle: init, subreaper do Linux ou

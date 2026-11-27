@@ -33,11 +33,16 @@ VALUE_OPTIONS = {"-x", "--exclude-task", "--tests", "-p", "--project-dir", "-I",
 # the last four read keys, a database or a signing file that exist only on this machine (~/.config, the environment)
 LOCAL_TASKS = ["ktlintFormat", "ios", "generateDummyFramework", "installDebug", "connected", "dependencyCheck",
                "applyMigrations", "assemble", "bundle"]
+# nothing on the build machine ends an idle Gradle or Kotlin daemon (no gq there), so no remote build leaves one
+NO_DAEMONS = ["--no-daemon", "-Pkotlin.compiler.execution.strategy=in-process"]
 PROBE_LIMIT_S = 180
 PROBE_PAUSE_S = 5
 # Compute Engine statuses of a machine on its way up: anything else after a start means the start did not take
 UP = {"PROVISIONING", "STAGING", "RUNNING"}
 SSH_LOST = 255
+# a gcloud that never answers would keep the ticket on the machine's slot, starting, for as long as its gq lives
+GCLOUD_LIMIT_S = 120
+TIMED_OUT = 124
 # unanchored: `**/build/reports/***` would miss the root project's build/reports (the Kover XML)
 BACK = ["build/reports/***", "build/test-results/***", "build/outputs/***"]
 # openrsync (macOS) does not let `:- .gitignore` shield the receiver from --delete, so the build state that has
@@ -58,9 +63,11 @@ class Unavailable(Exception):
 class Shell:
     """Every process the remote path starts goes through here, so the tests swap it for a fake."""
 
-    def run(self, argv, cwd=None):
+    def run(self, argv, cwd=None, timeout=None):
         try:
-            p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+            p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:  # run() has already killed it
+            return TIMED_OUT, "", f"timed out after {timeout}s"
         except OSError as e:
             return 127, "", str(e)
         return p.returncode, p.stdout, p.stderr
@@ -129,6 +136,12 @@ def gradle_args(cmd):
         return cmd[1:]
     perl_wrapped = cmd[:2] == ["perl", "-e"] and cmd[3:4] == ["./gradlew"]
     return cmd[4:] if perl_wrapped else None
+
+
+def daemonless(cmd):
+    """An eligible cmd with NO_DAEMONS right after `./gradlew`, minus the ones it already has."""
+    i = len(cmd) - len(gradle_args(cmd))
+    return cmd[:i] + [f for f in NO_DAEMONS if f not in cmd] + cmd[i:]
 
 
 def option_value(a, it):
@@ -202,8 +215,8 @@ def _reason(step, code, err):
     return f"{step}: {lines[-1] if lines else f'exit {code}'}"
 
 
-def step(name, argv):
-    code, _out, err = SHELL.run(argv)
+def step(name, argv, timeout=None):
+    code, _out, err = SHELL.run(argv, timeout=timeout)
     if code != 0:
         raise Unavailable(_reason(name, code, err))
 
@@ -240,7 +253,7 @@ def instance_state(cfg, gcloud="gcloud", name="budget"):
     `cap_metadata_key` is `true`. Raises Unavailable, its reason led by `name`, when the answer cannot be had."""
     instance, zone, project = cfg["start"]
     code, out, err = SHELL.run([gcloud, "compute", "instances", "describe", instance, f"--zone={zone}",
-                                f"--project={project}", "--format=json"])
+                                f"--project={project}", "--format=json"], timeout=GCLOUD_LIMIT_S)
     if code != 0:
         raise Unavailable(_reason(name, code, err))
     key = cfg["cap_metadata_key"]
@@ -268,7 +281,7 @@ def start_machine(cfg):
     while True:
         if status != "STOPPING":  # a start sent to a stopping machine is the one that does not take
             step("start", ["gcloud", "compute", "instances", "start", instance, f"--zone={zone}",
-                           f"--project={project}", "--quiet"])
+                           f"--project={project}", "--quiet"], timeout=GCLOUD_LIMIT_S)
         status = instance_state(cfg, name="start")[0]
         if status in UP:
             return
@@ -314,9 +327,10 @@ def _default(signals):
         signal.signal(s, signal.SIG_DFL)
 
 
-def execute(j, say, signals):
-    """The remote exit code, or None when ssh cannot start."""
-    cfg, line = j.cfg, shlex.join(j.cmd)
+def execute(j, say, signals, ticket):
+    """The remote exit code, or None when ssh cannot start. The remote command names its ticket (`env BQ_TICKET=<id>`):
+    the server finds this ssh by it and ends it when it reaps the ticket of a gq that was killed outright."""
+    cfg, line = j.cfg, shlex.join(daemonless(j.cmd))
     caught, child = [], None
 
     def stop(signum, _frame):
@@ -328,7 +342,8 @@ def execute(j, say, signals):
         signal.signal(s, stop)
     say(f"remote {cfg['host']}: {line}")
     try:
-        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec {line}", "-tt", *KEEPALIVE))
+        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec env BQ_TICKET={ticket} {line}", "-tt",
+                                *KEEPALIVE))
     except OSError as e:
         _default(signals)
         say(f"remote unavailable (ssh: {e})")
