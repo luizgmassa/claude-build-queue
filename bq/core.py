@@ -379,6 +379,7 @@ class Ticket:
     pid_start: str | None = None
     remote: bool = False  # the client can run it on the build machine (an old client never sets this)
     dest: str | None = None  # mac | vm, written at the grant only
+    checkout: str | None = None  # where its checkout is copied on the build machine (an old client never sets this)
 
 
 @dataclass
@@ -437,6 +438,8 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
     `remote` ({"slots": n, "available": bool}, None when off) is the build machine. When the Mac is full (the head
     refused for any reason but the gap between extras, or critical pressure), the waiting tickets whose client can run
     remotely, in id order, take the machine's free slots (`remote_grants`); the head keeps its place for the Mac.
+    A checkout has one build there at a time: the copy of a second one (`rsync --delete`) would rewrite the sources
+    under the first, so a ticket whose checkout is on the machine waits, for a local slot or for that build to end.
     """
     out = Plan()
     estimates, rss_gb, peaks, remaining = estimates or {}, rss_gb or {}, peaks or {}, remaining or {}
@@ -555,12 +558,14 @@ def plan(procs, roots, tickets, *, snapshot_ts, now, pressure, busy_daemons, idl
         local_active += 1
     if full_at is not None and remote and remote["available"]:
         free = remote["slots"] - len(vm_granted)
+        there = {t.checkout for t in vm_granted} - {None}  # checkouts with a build on the machine
         for t in waiting[full_at:]:
             if free <= 0:
                 break
-            if t.remote:
+            if t.remote and t.checkout not in there:
                 out.remote_grants.append(t.id)
                 free -= 1
+                there |= {t.checkout} - {None}
     out.counts["vm"] = len(vm_granted) + len(out.remote_grants)
     out.used = used  # after this tick's grants, the same count the blocked message shows
     out.counts["local_active"] = local_active

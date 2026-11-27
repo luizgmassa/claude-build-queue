@@ -126,7 +126,9 @@ this key and keeps it on Save & Apply.
   120 s to answer: one that hangs is killed and counts as a failed start (`start: timed out after 120s`), so
   the ticket goes back to the queue instead of holding the build machine's slot.
 - `slots` (optional, whole number from 1, default 2): how many builds the build machine runs at once. The server
-  counts them; a ticket holds one from its grant until its release (or until its `gq` dies).
+  counts them; a ticket holds one from its grant until its release (or until its `gq` dies). A checkout has one
+  build there at a time: the copy of a second one would rewrite the sources under the first, so a ticket whose
+  checkout already has a build on the build machine waits, for a local slot or for that build to end.
 - `cap_metadata_key` (optional, needs `instance`, `zone` and `project`): before starting the machine, `gq` reads
   its metadata (`gcloud compute instances describe`); a value `true` under this key (a budget function sets it) makes
   the machine unavailable (`budget exceeded`).

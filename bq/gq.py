@@ -114,7 +114,8 @@ def run(cmd):
     run_nested(cmd)
     job = remote.plan(cmd, say)
     tid = call_retrying("/api/enqueue", {"pid": os.getpid(), "cwd": os.getcwd(), "cmd": " ".join(cmd),
-                                         "remote": job is not None, **agent_identity()})["id"]
+                                         "remote": job is not None, "checkout": job.dest if job else None,
+                                         **agent_identity()})["id"]
     released = False
 
     def release(code):

@@ -319,7 +319,7 @@ class Queue:
             self.db.execute("alter table tickets add column peak_gb real")
         if "subagent" not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
             self.db.execute("alter table tickets add column subagent text")
-        for col, kind in (("remote", "int"), ("dest", "text"), ("phase", "text")):
+        for col, kind in (("remote", "int"), ("dest", "text"), ("phase", "text"), ("checkout", "text")):
             if col not in {r[1] for r in self.db.execute("pragma table_info(tickets)")}:
                 self.db.execute(f"alter table tickets add column {col} {kind}")
         self.db.execute("create table if not exists peaks (ctype text, peak_gb real, ts real, ticket int)")
@@ -382,9 +382,9 @@ class Queue:
         return max(core.SLOTS, n) if isinstance(n, int) and not isinstance(n, bool) else None
 
     def active_tickets(self):
-        rows = self.db.execute("select id, pid, state, created, granted, pid_start, remote, dest from tickets "
-                               "where state in ('waiting','granted') order by id").fetchall()
-        return [core.Ticket(*r[:6], bool(r[6]), r[7]) for r in rows]
+        rows = self.db.execute("select id, pid, state, created, granted, pid_start, remote, dest, checkout "
+                               "from tickets where state in ('waiting','granted') order by id").fetchall()
+        return [core.Ticket(*r[:6], bool(r[6]), *r[7:]) for r in rows]
 
     def remote_view(self, now):
         """The build machine as the planner sees it, None when the `remote` key is off or invalid."""
@@ -818,12 +818,14 @@ class Queue:
             if call:
                 self.taken_calls.add(call.get("id"))
             subagent = (call.get("agent_type") or call.get("agent_id")) if call.get("agent_id") else None
+            checkout = body.get("checkout")
             cur = self.db.execute(
                 "insert into tickets (pid, claude_pid, ralphy, session_id, cwd, cmd, state, created, ctype, subagent, "
-                "remote) values (?,?,?,?,?,?, 'waiting', ?, ?, ?, ?)",
+                "remote, checkout) values (?,?,?,?,?,?, 'waiting', ?, ?, ?, ?, ?)",
                 (int(body["pid"]), body.get("claude_pid"), body.get("ralphy"), body.get("session_id"),
                  str(body.get("cwd", ""))[:300], str(body.get("cmd", ""))[:1000], now,
-                 core.command_type(str(body.get("cmd", ""))), subagent, int(body.get("remote") is True)))
+                 core.command_type(str(body.get("cmd", ""))), subagent, int(body.get("remote") is True),
+                 checkout[:300] if isinstance(checkout, str) else None))
             tid = cur.lastrowid
         self.event("enqueue", core.msg("event.enqueue", id=tid, pid=body["pid"], cmd=str(body.get("cmd", ""))[:100]))
         self.wake.set()

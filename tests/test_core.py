@@ -82,8 +82,8 @@ VM = {"slots": 2, "available": True}
 class NeutralScheduling(unittest.TestCase):
     """The Mac stays the default; a full Mac sends eligible waiting tickets to the build machine, within its slots."""
 
-    def ticket(self, i, state="waiting", remote=True, dest=None):
-        return core.Ticket(id=i, pid=200 + i, state=state, created=0, remote=remote, dest=dest)
+    def ticket(self, i, state="waiting", remote=True, dest=None, checkout=None):
+        return core.Ticket(id=i, pid=200 + i, state=state, created=0, remote=remote, dest=dest, checkout=checkout)
 
     def run_plan(self, tickets, remote=VM, **kw):
         procs = world(*[P(200 + t.id, 101, "python3 /u/.local/bin/gq run -- ./gradlew x", CLAUDE_PID=100)
@@ -123,6 +123,18 @@ class NeutralScheduling(unittest.TestCase):
         self.assertEqual(self.run_plan(running).remote_grants, [])
         done = running[:3] + [self.ticket(5)]  # one remote build ended
         self.assertEqual(self.run_plan(done).remote_grants, [5])
+
+    def test_a_checkout_has_one_build_on_the_machine_at_a_time(self):
+        wt, other = "builds/repo/wt", "builds/repo/other"
+        tickets = self.full_mac() + [self.ticket(3, checkout=wt), self.ticket(4, checkout=wt),
+                                     self.ticket(5, checkout=other)]
+        self.assertEqual(self.run_plan(tickets).remote_grants, [3, 5])  # same tick: #4 would copy over #3
+        running = self.full_mac() + [self.ticket(3, "granted", dest="vm", checkout=wt), self.ticket(4, checkout=wt)]
+        self.assertEqual(self.run_plan(running).remote_grants, [])
+        self.assertEqual(self.run_plan(self.full_mac() + running[3:]).remote_grants, [4])  # #3 ended
+        # the build of that checkout on the Mac does not hold the machine
+        local = self.full_mac()[:1] + [self.ticket(2, "granted", dest="mac", checkout=wt), self.ticket(4, checkout=wt)]
+        self.assertEqual(self.run_plan(local).remote_grants, [4])
 
     def test_a_remote_ticket_holds_no_mac_slot_from_the_grant_on(self):
         pl = self.run_plan([self.ticket(1, "granted", dest="vm"), self.ticket(2)])

@@ -522,6 +522,7 @@ class GqRun(RemoteBase):
         queue = Queue([("granted", "mac")])
         self.gq_run(queue)
         self.assertIs(queue.enqueued[0]["remote"], True)
+        self.assertEqual(queue.enqueued[0]["checkout"], "remote-builds/evolvai/wt")
         queue = Queue([("granted", "mac")])
         with mock.patch.object(gq, "call_retrying", queue.call_retrying), mock.patch.object(gq, "call", queue.call), \
                 mock.patch.object(gq.subprocess, "Popen", return_value=mock.Mock(wait=lambda: 0)), \
@@ -529,6 +530,7 @@ class GqRun(RemoteBase):
             with self.assertRaises(SystemExit):
                 gq.run(["./gradlew", "ktlintFormat"])
         self.assertIs(queue.enqueued[0]["remote"], False)
+        self.assertIsNone(queue.enqueued[0]["checkout"])
 
     def test_a_mac_grant_never_touches_the_build_machine(self):
         queue = Queue([("granted", "mac")])
@@ -620,11 +622,11 @@ class ServerFlow(RemoteBase):
         self.procs = {p.pid: p for p in [core.Proc(pid=1, ppid=0, rss_kb=1, cpu=0, etime="", lstart="L",
                                                    args="/sbin/launchd")]}
 
-    def enqueue(self, i, remote_ok=True):
+    def enqueue(self, i, remote_ok=True, **body):
         pid = 9000 + i
         self.procs[pid] = core.Proc(pid=pid, ppid=1, rss_kb=1, cpu=0, etime="", lstart="L",
                                     args="python3 /u/.local/bin/gq run -- ./gradlew x")
-        return self.q.enqueue({"pid": pid, "cwd": "/w", "cmd": "./gradlew check", "remote": remote_ok})["id"]
+        return self.q.enqueue({"pid": pid, "cwd": "/w", "cmd": "./gradlew check", "remote": remote_ok, **body})["id"]
 
     def plan(self, now):
         pl = core.plan(self.procs, [], self.q.active_tickets(), snapshot_ts=now, now=now, pressure=4,
@@ -666,6 +668,17 @@ class ServerFlow(RemoteBase):
         pl = self.plan(now + 1)
         self.assertEqual(pl.reaps, [(first, "owner process gone")])
         self.assertEqual(pl.remote_grants, [second])
+
+    def test_two_tickets_of_one_checkout_take_the_machine_one_after_the_other(self):
+        self.configure({**CONFIG, "slots": 2})
+        first, second = (self.enqueue(i, checkout="remote-builds/evolvai/wt") for i in (1, 2))
+        plain = self.enqueue(3, checkout=7)  # not a path: stored as none, like an old client
+        self.assertEqual([t.checkout for t in self.q.active_tickets()], ["remote-builds/evolvai/wt"] * 2 + [None])
+        now = time.time() + 10
+        self.assertEqual(self.plan(now).remote_grants, [first, plain])
+        self.assertEqual(self.row(second), ("waiting", None, None))
+        self.q.release(first, 0)
+        self.assertEqual(self.plan(now).remote_grants, [second])
 
     def test_a_client_that_does_not_say_remote_never_gets_the_machine(self):
         old = self.enqueue(1, remote_ok=False)

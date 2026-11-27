@@ -125,7 +125,9 @@ mantém no Salvar e aplicar.
   chamada ao `gcloud` tem 120 s para responder: a que trava é morta e conta como start que falhou
   (`start: timed out after 120s`), e o ticket volta à fila em vez de segurar a vaga da máquina de build.
 - `slots` (opcional, inteiro a partir de 1, padrão 2): quantas builds a máquina de build roda ao mesmo tempo. O
-  servidor as conta; um ticket ocupa uma da concessão até o `release` (ou até o `gq` dele morrer).
+  servidor as conta; um ticket ocupa uma da concessão até o `release` (ou até o `gq` dele morrer). Um checkout
+  tem uma build lá por vez: a cópia de uma segunda reescreveria as fontes sob a primeira, então o ticket cujo
+  checkout já tem build na máquina de build espera, por uma vaga local ou pelo fim daquela build.
 - `cap_metadata_key` (opcional, exige `instance`, `zone` e `project`): antes de ligar a máquina, o `gq` lê os
   metadados dela (`gcloud compute instances describe`); o valor `true` nessa chave (uma função de orçamento a grava)
   torna a máquina indisponível (`budget exceeded`).
