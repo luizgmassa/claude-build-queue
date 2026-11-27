@@ -342,7 +342,8 @@ def execute(j, say, signals, ticket):
         signal.signal(s, stop)
     say(f"remote {cfg['host']}: {line}")
     try:
-        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec env BQ_TICKET={ticket} {line}", "-tt", *KEEPALIVE))
+        child = SHELL.popen(ssh(cfg, f"cd {shlex.quote(j.cwd)} && exec env BQ_TICKET={ticket} {line}", "-tt",
+                                *KEEPALIVE))
     except OSError as e:
         _default(signals)
         say(f"remote unavailable (ssh: {e})")
